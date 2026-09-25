@@ -1,0 +1,353 @@
+<!-- Synapse Build Flow -->
+<title>Synapse Build Flow</title>
+<style>
+  :root{
+    --bg:#f2f4f8;
+    --surface:#ffffff;
+    --fg:#161b26;
+    --muted:#5b6472;
+    --border:#d7dce3;
+    --accent:#5b4fdb;
+    --accent-tint:#ece9fb;
+    --be:#2f6fed;
+    --be-tint:#e7f0fe;
+    --fe:#0e9f8e;
+    --fe-tint:#e2f7f4;
+    --qc:#c9740a;
+    --qc-tint:#faedd9;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#10141c; --surface:#171d29; --fg:#e7ecf5; --muted:#98a2b3; --border:#2b3342;
+      --accent:#8b85ff; --accent-tint:#241f45;
+      --be:#6ea8ff; --be-tint:#1b2740;
+      --fe:#52d9c7; --fe-tint:#12312c;
+      --qc:#f2ab55; --qc-tint:#3a2a13;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#10141c; --surface:#171d29; --fg:#e7ecf5; --muted:#98a2b3; --border:#2b3342;
+    --accent:#8b85ff; --accent-tint:#241f45;
+    --be:#6ea8ff; --be-tint:#1b2740;
+    --fe:#52d9c7; --fe-tint:#12312c;
+    --qc:#f2ab55; --qc-tint:#3a2a13;
+  }
+
+  body{ background:var(--bg); color:var(--fg); }
+  * { box-sizing:border-box; }
+  body{
+    font-family:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    padding-inline:16px;
+    padding-block:32px;
+  }
+  .wrap{ max-width:1180px; margin:0 auto; display:flex; flex-direction:column; gap:28px; }
+
+  .eyebrow{
+    font-family:"IBM Plex Mono", ui-monospace, monospace;
+    font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--accent); font-weight:600;
+  }
+  h1{
+    font-family:"IBM Plex Mono", ui-monospace, monospace;
+    font-size:clamp(24px,4vw,34px); line-height:1.1; margin:6px 0 0; text-wrap:balance;
+  }
+  .lede{ max-width:62ch; color:var(--muted); font-size:15px; line-height:1.55; margin-top:10px; }
+
+  .legend{
+    display:flex; flex-wrap:wrap; gap:10px;
+  }
+  .chip{
+    display:flex; align-items:center; gap:8px;
+    border:1px solid var(--border); background:var(--surface);
+    border-radius:999px; padding:6px 14px; font-size:13px;
+  }
+  .dot{ width:10px; height:10px; border-radius:50%; flex:none; }
+  .chip .desc{ color:var(--muted); }
+  .arrow-key{ display:flex; flex-wrap:wrap; gap:16px; font-size:12.5px; color:var(--muted); }
+  .arrow-key span{ display:inline-flex; align-items:center; gap:6px; }
+  .arrow-key svg{ width:28px; height:10px; flex:none; }
+
+  figure{ margin:0; }
+  .diagram-scroll{
+    overflow-x:auto; border:1px solid var(--border); border-radius:14px;
+    background:var(--surface); padding:6px;
+  }
+  .diagram-scroll svg{ width:1650px; max-width:none; height:auto; display:block; }
+  figcaption{ margin-top:10px; font-size:13px; color:var(--muted); }
+
+  .table-scroll{ overflow-x:auto; border:1px solid var(--border); border-radius:14px; }
+  table{ border-collapse:collapse; width:100%; min-width:900px; font-size:13px; background:var(--surface); }
+  th,td{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:top; }
+  thead th{
+    font-family:"IBM Plex Mono", ui-monospace, monospace;
+    font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted);
+    background:var(--bg); position:sticky; top:0;
+  }
+  tbody th{ font-weight:600; white-space:nowrap; }
+  tr:last-child td, tr:last-child th{ border-bottom:none; }
+  .role-be{ border-left:3px solid var(--be); }
+  .role-fe{ border-left:3px solid var(--fe); }
+  .role-qc{ border-left:3px solid var(--qc); }
+
+  .checkpoints{
+    background:var(--surface); border:1px solid var(--border); border-radius:14px;
+    padding:18px 20px;
+  }
+  .checkpoints h2{ font-size:15px; margin:0 0 12px; font-family:"IBM Plex Mono", ui-monospace, monospace; }
+  .checkpoints ol{ margin:0; padding-left:20px; display:flex; flex-direction:column; gap:8px; font-size:14px; }
+  .checkpoints b{ font-variant-numeric:tabular-nums; }
+
+  footer{ font-size:12.5px; color:var(--muted); }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">IBM Bob 2.0 Hackathon &middot; 25&ndash;27 Sept 2026</div>
+    <h1>Synapse Build Flow</h1>
+    <p class="lede">Alur kerja 48 jam untuk tim 6 orang &mdash; 2 backend, 2 frontend, 2 security &amp; QC &mdash; membangun Synapse: layer pemahaman &amp; proteksi yang reversible dan sadar-konflik untuk agent coding. Diturunkan dari SYNAPSE.md.</p>
+  </header>
+
+  <section class="legend" aria-label="Legenda peran dan jenis panah">
+    <span class="chip"><span class="dot" style="background:var(--be)"></span>Backend <span class="desc">&mdash; Guardian + Cortex ingest</span></span>
+    <span class="chip"><span class="dot" style="background:var(--fe)"></span>Frontend <span class="desc">&mdash; graph hidup + dashboard</span></span>
+    <span class="chip"><span class="dot" style="background:var(--qc)"></span>Security &amp; QC <span class="desc">&mdash; uji rule engine + reliabilitas demo</span></span>
+  </section>
+
+  <section class="arrow-key" aria-label="Arti garis panah">
+    <span><svg viewBox="0 0 28 10"><line x1="1" y1="5" x2="24" y2="5" stroke="currentColor" stroke-width="2" opacity=".35" marker-end="url(#k1)"/><defs><marker id="k1" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0L8,4L0,8Z" fill="currentColor" opacity=".5"/></marker></defs></svg>urutan kerja tiap orang</span>
+    <span><svg viewBox="0 0 28 10"><line x1="1" y1="5" x2="24" y2="5" stroke="var(--be)" stroke-width="2.5" marker-end="url(#k2)"/><defs><marker id="k2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0L8,4L0,8Z" style="fill:var(--be)"/></marker></defs></svg>backend membuka jalan (API/SSE siap)</span>
+    <span><svg viewBox="0 0 28 10"><line x1="1" y1="5" x2="24" y2="5" stroke="var(--qc)" stroke-width="2.5" stroke-dasharray="4 3" marker-end="url(#k3)"/><defs><marker id="k3" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0L8,4L0,8Z" style="fill:var(--qc)"/></marker></defs></svg>QC lempar balik temuan bug</span>
+    <span><svg viewBox="0 0 28 10"><line x1="1" y1="5" x2="24" y2="5" stroke="var(--accent)" stroke-width="2.5" marker-end="url(#k4)"/><defs><marker id="k4" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0L8,4L0,8Z" style="fill:var(--accent)"/></marker></defs></svg>semua orang funnel ke submission</span>
+  </section>
+
+  <figure>
+    <div class="diagram-scroll">
+      <svg viewBox="0 0 1650 850" role="img" aria-label="Diagram alur 6 orang tim Synapse melintasi enam fase 48 jam: setup, build paralel, integrasi, pengerasan, rehearsal, dan submit, dengan panah backend membuka jalan untuk frontend dan security, dan panah umpan balik dari QC kembali ke backend/frontend saat pengerasan, funnel semua ke submission.">
+        <defs>
+          <marker id="arr-neutral" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0L8,4L0,8Z" fill="currentColor" opacity=".4"/></marker>
+          <marker id="arr-be" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L8,4L0,8Z" style="fill:var(--be)"/></marker>
+          <marker id="arr-qc" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L8,4L0,8Z" style="fill:var(--qc)"/></marker>
+          <marker id="arr-accent" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L8,4L0,8Z" style="fill:var(--accent)"/></marker>
+        </defs>
+
+        <!-- band backgrounds -->
+        <rect x="0" y="85" width="1650" height="200" fill="var(--be-tint)"/>
+        <rect x="0" y="345" width="1650" height="200" fill="var(--fe-tint)"/>
+        <rect x="0" y="605" width="1650" height="200" fill="var(--qc-tint)"/>
+
+        <!-- column dividers -->
+        <g stroke="var(--border)" stroke-width="1">
+          <line x1="180" y1="85" x2="180" y2="805"/>
+          <line x1="385" y1="85" x2="385" y2="805"/>
+          <line x1="590" y1="85" x2="590" y2="805"/>
+          <line x1="795" y1="85" x2="795" y2="805"/>
+          <line x1="1000" y1="85" x2="1000" y2="805"/>
+          <line x1="1205" y1="85" x2="1205" y2="805"/>
+          <line x1="1410" y1="85" x2="1410" y2="805"/>
+        </g>
+
+        <!-- phase headers -->
+        <g font-family="IBM Plex Mono, monospace" text-anchor="middle">
+          <text x="282" y="40" font-size="13" font-weight="600" fill="currentColor">SETUP</text>
+          <text x="282" y="58" font-size="11" fill="var(--muted)">Jam 0&ndash;2</text>
+          <text x="487" y="40" font-size="13" font-weight="600" fill="currentColor">BUILD PARALEL</text>
+          <text x="487" y="58" font-size="11" fill="var(--muted)">Jam 2&ndash;16</text>
+          <text x="692" y="40" font-size="13" font-weight="600" fill="currentColor">INTEGRASI</text>
+          <text x="692" y="58" font-size="11" fill="var(--muted)">Jam 16&ndash;30</text>
+          <text x="897" y="40" font-size="13" font-weight="600" fill="currentColor">PENGERASAN</text>
+          <text x="897" y="58" font-size="11" fill="var(--muted)">Jam 30&ndash;40</text>
+          <text x="1102" y="40" font-size="13" font-weight="600" fill="currentColor">REHEARSAL</text>
+          <text x="1102" y="58" font-size="11" fill="var(--muted)">Jam 40&ndash;46</text>
+          <text x="1307" y="40" font-size="13" font-weight="600" fill="currentColor">SUBMIT</text>
+          <text x="1307" y="58" font-size="11" fill="var(--muted)">Jam 46&ndash;48</text>
+        </g>
+
+        <!-- row / band labels -->
+        <g font-family="IBM Plex Mono, monospace">
+          <text x="14" y="103" font-size="12" font-weight="700" fill="var(--be)" letter-spacing=".04em">BACKEND</text>
+          <text x="14" y="134" font-size="12" fill="currentColor">BE-1 &middot; Guardian</text>
+          <text x="14" y="244" font-size="12" fill="currentColor">BE-2 &middot; Cortex</text>
+
+          <text x="14" y="363" font-size="12" font-weight="700" fill="var(--fe)" letter-spacing=".04em">FRONTEND</text>
+          <text x="14" y="394" font-size="12" fill="currentColor">FE-1 &middot; Graph</text>
+          <text x="14" y="504" font-size="12" fill="currentColor">FE-2 &middot; Dashboard</text>
+
+          <text x="14" y="623" font-size="12" font-weight="700" fill="var(--qc)" letter-spacing=".04em">SECURITY &amp; QC</text>
+          <text x="14" y="654" font-size="12" fill="currentColor">QC-1 &middot; Rule engine</text>
+          <text x="14" y="764" font-size="12" fill="currentColor">QC-2 &middot; Demo/Integrasi</text>
+        </g>
+
+        <!-- task boxes: helper grid, 6 rows x 6 cols -->
+        <!-- row y-centers: 130,240 | 390,500 | 650,760 ; col x-starts: 190,395,600,805,1010,1215 (box width 185) -->
+        <g font-family="IBM Plex Sans, sans-serif" font-size="12.5" text-anchor="middle">
+
+          <!-- BE-1 row -->
+          <g fill="none" stroke="var(--border)"><rect x="190" y="95" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="395" y="95" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="600" y="95" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="805" y="95" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1010" y="95" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1215" y="95" width="185" height="70" rx="10" fill="var(--surface)"/></g>
+          <text x="282" y="127"><tspan x="282">Setup skema</tspan><tspan x="282" dy="16">SQLite + MCP</tspan></text>
+          <text x="487" y="127"><tspan x="487">Guardian core</tspan><tspan x="487" dy="16">propose/execute</tspan></text>
+          <text x="692" y="127"><tspan x="692">Wire rollback</tspan><tspan x="692" dy="16">+ verifikasi</tspan></text>
+          <text x="897" y="127"><tspan x="897">Perbaiki bug</tspan><tspan x="897" dy="16">dari QC</tspan></text>
+          <text x="1102" y="127"><tspan x="1102">Dukung</tspan><tspan x="1102" dy="16">rehearsal demo</tspan></text>
+          <text x="1307" y="127"><tspan x="1307">Bersihkan</tspan><tspan x="1307" dy="16">kode</tspan></text>
+
+          <!-- BE-2 row -->
+          <g fill="none" stroke="var(--border)"><rect x="190" y="205" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="395" y="205" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="600" y="205" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="805" y="205" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1010" y="205" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1215" y="205" width="185" height="70" rx="10" fill="var(--surface)"/></g>
+          <text x="282" y="237"><tspan x="282">Setup skema</tspan><tspan x="282" dy="16">SQLite + MCP</tspan></text>
+          <text x="487" y="237"><tspan x="487">understand_repo</tspan><tspan x="487" dy="16">+ mentor</tspan></text>
+          <text x="692" y="237"><tspan x="692">Wire SSE</tspan><tspan x="692" dy="16">+ reviewer</tspan></text>
+          <text x="897" y="237"><tspan x="897">Perbaiki bug</tspan><tspan x="897" dy="16">dari QC</tspan></text>
+          <text x="1102" y="237"><tspan x="1102">Dukung</tspan><tspan x="1102" dy="16">rehearsal demo</tspan></text>
+          <text x="1307" y="237"><tspan x="1307">Bersihkan</tspan><tspan x="1307" dy="16">kode</tspan></text>
+
+          <!-- FE-1 row -->
+          <g fill="none" stroke="var(--border)"><rect x="190" y="355" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="395" y="355" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="600" y="355" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="805" y="355" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1010" y="355" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1215" y="355" width="185" height="70" rx="10" fill="var(--surface)"/></g>
+          <text x="282" y="387"><tspan x="282">Sepakati</tspan><tspan x="282" dy="16">skema SSE</tspan></text>
+          <text x="487" y="387"><tspan x="487">Force-graph</tspan><tspan x="487" dy="16">(data mock)</tspan></text>
+          <text x="692" y="387"><tspan x="692">Sambung ke</tspan><tspan x="692" dy="16">SSE asli</tspan></text>
+          <text x="897" y="387"><tspan x="897">Poles</tspan><tspan x="897" dy="16">animasi</tspan></text>
+          <text x="1102" y="387"><tspan x="1102">Dukung</tspan><tspan x="1102" dy="16">rehearsal demo</tspan></text>
+          <text x="1307" y="387"><tspan x="1307">Screenshot</tspan><tspan x="1307" dy="16">+ aset</tspan></text>
+
+          <!-- FE-2 row -->
+          <g fill="none" stroke="var(--border)"><rect x="190" y="465" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="395" y="465" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="600" y="465" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="805" y="465" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1010" y="465" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1215" y="465" width="185" height="70" rx="10" fill="var(--surface)"/></g>
+          <text x="282" y="497"><tspan x="282">Sepakati</tspan><tspan x="282" dy="16">skema SSE</tspan></text>
+          <text x="487" y="497"><tspan x="487">Sidebar +</tspan><tspan x="487" dy="16">tombol approve</tspan></text>
+          <text x="692" y="497"><tspan x="692">Sambung ke</tspan><tspan x="692" dy="16">API asli</tspan></text>
+          <text x="897" y="497"><tspan x="897">Poles</tspan><tspan x="897" dy="16">UI</tspan></text>
+          <text x="1102" y="497"><tspan x="1102">Dukung</tspan><tspan x="1102" dy="16">rehearsal demo</tspan></text>
+          <text x="1307" y="497"><tspan x="1307">Screenshot</tspan><tspan x="1307" dy="16">+ aset</tspan></text>
+
+          <!-- QC-1 row -->
+          <g fill="none" stroke="var(--border)"><rect x="190" y="615" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="395" y="615" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="600" y="615" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="805" y="615" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1010" y="615" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1215" y="615" width="185" height="70" rx="10" fill="var(--surface)"/></g>
+          <text x="282" y="647"><tspan x="282">Susun</tspan><tspan x="282" dy="16">skenario tes</tspan></text>
+          <text x="487" y="647"><tspan x="487">Tulis test</tspan><tspan x="487" dy="16">rule engine</tspan></text>
+          <text x="692" y="647"><tspan x="692">Coba bobol</tspan><tspan x="692" dy="16">approval</tspan></text>
+          <text x="897" y="647"><tspan x="897">Pastikan</tspan><tspan x="897" dy="16">fail-closed</tspan></text>
+          <text x="1102" y="647"><tspan x="1102">Sahkan</tspan><tspan x="1102" dy="16">rollback benar</tspan></text>
+          <text x="1307" y="647"><tspan x="1307">Checklist</tspan><tspan x="1307" dy="16">submission</tspan></text>
+
+          <!-- QC-2 row -->
+          <g fill="none" stroke="var(--border)"><rect x="190" y="725" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="395" y="725" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="600" y="725" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="805" y="725" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1010" y="725" width="185" height="70" rx="10" fill="var(--surface)"/><rect x="1215" y="725" width="185" height="70" rx="10" fill="var(--surface)"/></g>
+          <text x="282" y="757"><tspan x="282">Susun</tspan><tspan x="282" dy="16">skenario tes</tspan></text>
+          <text x="487" y="757"><tspan x="487">Siapkan repo</tspan><tspan x="487" dy="16">+ seed data</tspan></text>
+          <text x="692" y="757"><tspan x="692">Tes integrasi</tspan><tspan x="692" dy="16">end-to-end</tspan></text>
+          <text x="897" y="757"><tspan x="897">Uji reliabilitas</tspan><tspan x="897" dy="16">skenario rusak</tspan></text>
+          <text x="1102" y="757"><tspan x="1102">Rekam video</tspan><tspan x="1102" dy="16">fallback</tspan></text>
+          <text x="1307" y="757"><tspan x="1307">Checklist</tspan><tspan x="1307" dy="16">submission</tspan></text>
+        </g>
+
+        <!-- sequential arrows within each row (neutral, low emphasis) -->
+        <g stroke="currentColor" stroke-width="1.5" opacity=".35">
+          <!-- BE-1 -->
+          <line x1="375" y1="130" x2="393" y2="130" marker-end="url(#arr-neutral)"/>
+          <line x1="580" y1="130" x2="598" y2="130" marker-end="url(#arr-neutral)"/>
+          <line x1="785" y1="130" x2="803" y2="130" marker-end="url(#arr-neutral)"/>
+          <line x1="990" y1="130" x2="1008" y2="130" marker-end="url(#arr-neutral)"/>
+          <line x1="1195" y1="130" x2="1213" y2="130" marker-end="url(#arr-neutral)"/>
+          <!-- BE-2 -->
+          <line x1="375" y1="240" x2="393" y2="240" marker-end="url(#arr-neutral)"/>
+          <line x1="580" y1="240" x2="598" y2="240" marker-end="url(#arr-neutral)"/>
+          <line x1="785" y1="240" x2="803" y2="240" marker-end="url(#arr-neutral)"/>
+          <line x1="990" y1="240" x2="1008" y2="240" marker-end="url(#arr-neutral)"/>
+          <line x1="1195" y1="240" x2="1213" y2="240" marker-end="url(#arr-neutral)"/>
+          <!-- FE-1 -->
+          <line x1="375" y1="390" x2="393" y2="390" marker-end="url(#arr-neutral)"/>
+          <line x1="580" y1="390" x2="598" y2="390" marker-end="url(#arr-neutral)"/>
+          <line x1="785" y1="390" x2="803" y2="390" marker-end="url(#arr-neutral)"/>
+          <line x1="990" y1="390" x2="1008" y2="390" marker-end="url(#arr-neutral)"/>
+          <line x1="1195" y1="390" x2="1213" y2="390" marker-end="url(#arr-neutral)"/>
+          <!-- FE-2 -->
+          <line x1="375" y1="500" x2="393" y2="500" marker-end="url(#arr-neutral)"/>
+          <line x1="580" y1="500" x2="598" y2="500" marker-end="url(#arr-neutral)"/>
+          <line x1="785" y1="500" x2="803" y2="500" marker-end="url(#arr-neutral)"/>
+          <line x1="990" y1="500" x2="1008" y2="500" marker-end="url(#arr-neutral)"/>
+          <line x1="1195" y1="500" x2="1213" y2="500" marker-end="url(#arr-neutral)"/>
+          <!-- QC-1 -->
+          <line x1="375" y1="650" x2="393" y2="650" marker-end="url(#arr-neutral)"/>
+          <line x1="580" y1="650" x2="598" y2="650" marker-end="url(#arr-neutral)"/>
+          <line x1="785" y1="650" x2="803" y2="650" marker-end="url(#arr-neutral)"/>
+          <line x1="990" y1="650" x2="1008" y2="650" marker-end="url(#arr-neutral)"/>
+          <line x1="1195" y1="650" x2="1213" y2="650" marker-end="url(#arr-neutral)"/>
+          <!-- QC-2 -->
+          <line x1="375" y1="760" x2="393" y2="760" marker-end="url(#arr-neutral)"/>
+          <line x1="580" y1="760" x2="598" y2="760" marker-end="url(#arr-neutral)"/>
+          <line x1="785" y1="760" x2="803" y2="760" marker-end="url(#arr-neutral)"/>
+          <line x1="990" y1="760" x2="1008" y2="760" marker-end="url(#arr-neutral)"/>
+          <line x1="1195" y1="760" x2="1213" y2="760" marker-end="url(#arr-neutral)"/>
+        </g>
+
+        <!-- sync marker at P0/P1 boundary -->
+        <line x1="385" y1="85" x2="385" y2="805" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 4" opacity=".45"/>
+        <rect x="300" y="70" width="170" height="20" rx="10" fill="var(--surface)" stroke="var(--accent)"/>
+        <text x="385" y="84" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--accent)">SYNC: skema + kontrak MCP</text>
+
+        <!-- backend readiness fan-out: BE row -> FE-P2 and QC-P2 -->
+        <g stroke="var(--be)" stroke-width="2.5" fill="none">
+          <path d="M580,130 L595,195"/>
+          <path d="M580,240 L595,195"/>
+          <path d="M595,195 L595,650"/>
+          <path d="M595,390 L598,390" marker-end="url(#arr-be)"/>
+          <path d="M595,650 L598,650" marker-end="url(#arr-be)"/>
+        </g>
+        <text x="500" y="330" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="var(--be)" text-anchor="end">API + SSE siap &rarr;</text>
+        <text x="500" y="590" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="var(--be)" text-anchor="end">build siap dites &rarr;</text>
+
+        <!-- QC feedback loop: QC row -> FE-P3 and BE-P3 -->
+        <g stroke="var(--qc)" stroke-width="2.5" fill="none" stroke-dasharray="6 4">
+          <path d="M805,650 L790,650"/>
+          <path d="M805,760 L790,705"/>
+          <path d="M790,705 L790,130"/>
+          <path d="M790,130 L803,130" marker-end="url(#arr-qc)"/>
+          <path d="M790,240 L803,240" marker-end="url(#arr-qc)"/>
+          <path d="M790,390 L803,390" marker-end="url(#arr-qc)"/>
+          <path d="M790,500 L803,500" marker-end="url(#arr-qc)"/>
+        </g>
+        <text x="770" y="460" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="var(--qc)" text-anchor="end">temuan bug &uarr;</text>
+
+        <!-- convergence to submission -->
+        <rect x="1450" y="350" width="150" height="180" rx="16" fill="var(--accent)"/>
+        <text x="1525" y="432" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="14" font-weight="700" fill="#fff"><tspan x="1525">KIRIM KE</tspan><tspan x="1525" dy="18">LABLAB.AI</tspan></text>
+        <g stroke="var(--accent)" stroke-width="2" fill="none" opacity=".8">
+          <path d="M1400,130 L1450,420" marker-end="url(#arr-accent)"/>
+          <path d="M1400,240 L1450,425" marker-end="url(#arr-accent)"/>
+          <path d="M1400,390 L1450,432" marker-end="url(#arr-accent)"/>
+          <path d="M1400,500 L1450,438" marker-end="url(#arr-accent)"/>
+          <path d="M1400,650 L1450,445" marker-end="url(#arr-accent)"/>
+          <path d="M1400,760 L1450,450" marker-end="url(#arr-accent)"/>
+        </g>
+      </svg>
+    </div>
+    <figcaption>Enam orang, enam fase 48 jam: backend membuka jalan untuk frontend &amp; QC (garis biru), QC melempar balik temuan bug ke fase pengerasan (garis oranye putus-putus), semua orang berhenti di titik yang sama &mdash; submit ke lablab.ai (garis ungu).</figcaption>
+  </figure>
+
+  <section class="table-scroll" aria-label="Tabel rincian tugas per orang per fase">
+    <table>
+      <thead>
+        <tr><th>Orang</th><th>Setup (0&ndash;2j)</th><th>Build paralel (2&ndash;16j)</th><th>Integrasi (16&ndash;30j)</th><th>Pengerasan (30&ndash;40j)</th><th>Rehearsal (40&ndash;46j)</th><th>Submit (46&ndash;48j)</th></tr>
+      </thead>
+      <tbody>
+        <tr class="role-be"><th>BE-1 &middot; Guardian</th><td>Kunci skema SQLite &amp; kontrak MCP</td><td>propose_operation + execute_operation, snapshot &amp; rollback migration</td><td>Sambungkan verifikasi post-condition + rollback otomatis</td><td>Perbaiki bug yang dilaporkan QC-1</td><td>Dukung rehearsal, siaga fix cepat</td><td>Bersihkan kode, tulis komentar seperlunya</td></tr>
+        <tr class="role-be"><th>BE-2 &middot; Cortex</th><td>Kunci skema SQLite &amp; kontrak MCP</td><td>understand_repo (tree-sitter) + explain_topic (mentor)</td><td>Ekspos SSE stream + review_artifact</td><td>Perbaiki bug yang dilaporkan QC-1/QC-2</td><td>Dukung rehearsal, siaga fix cepat</td><td>Bersihkan kode, tulis komentar seperlunya</td></tr>
+        <tr class="role-fe"><th>FE-1 &middot; Graph</th><td>Sepakati bentuk event SSE dengan backend</td><td>Bangun force-graph pakai data mock</td><td>Sambungkan ke SSE asli dari BE-2</td><td>Poles animasi pulse/warna node</td><td>Dukung rehearsal, catat glitch visual</td><td>Ambil screenshot &amp; aset video</td></tr>
+        <tr class="role-fe"><th>FE-2 &middot; Dashboard</th><td>Sepakati bentuk event SSE dengan backend</td><td>Sidebar penjelasan + tombol approve/deny (mock)</td><td>Sambungkan ke API asli (operations, approvals)</td><td>Poles UI, tangani state kosong/error</td><td>Dukung rehearsal, catat glitch UI</td><td>Ambil screenshot &amp; aset video</td></tr>
+        <tr class="role-qc"><th>QC-1 &middot; Rule engine</th><td>Susun daftar skenario uji (termasuk operasi tak dikenal)</td><td>Tulis test case buat rule table &amp; blast radius</td><td>Coba bobol jalur approval (adversarial test)</td><td>Pastikan default fail-closed konsisten di semua jalur</td><td>Sahkan rollback benar-benar memulihkan state</td><td>Isi submission checklist bagian teknis</td></tr>
+        <tr class="role-qc"><th>QC-2 &middot; Demo/Integrasi</th><td>Susun daftar skenario uji (repo demo &amp; data seed)</td><td>Siapkan repo demo + skenario migrasi yang sengaja rusak</td><td>Tes integrasi end-to-end BE&harr;FE&harr;Bob</td><td>Uji ulang skenario rusak&rarr;rollback sampai reliable</td><td>Rekam video fallback (asuransi kalau live demo gagal)</td><td>Isi submission checklist bagian aset</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="checkpoints">
+    <h2>Titik sinkron wajib (semua 6 orang stop &amp; cek bareng)</h2>
+    <ol>
+      <li><b>Jam 2</b> &mdash; skema SQLite &amp; kontrak MCP terkunci, tidak boleh berubah lagi tanpa kesepakatan bersama.</li>
+      <li><b>Jam 16</b> &mdash; demo internal pertama: backend dan frontend harus sudah saling nyambung, walau kasar.</li>
+      <li><b>Jam 30</b> &mdash; semua temuan QC-1/QC-2 sejauh ini sudah masuk daftar perbaikan, bukan menumpuk di kepala masing-masing.</li>
+      <li><b>Jam 40</b> &mdash; rehearsal penuh dimulai; berhenti menambah fitur baru mulai titik ini.</li>
+      <li><b>Jam 46</b> &mdash; submission dikirim lebih awal dari deadline, bukan mepet jam 48.</li>
+    </ol>
+  </section>
+
+  <footer>Diturunkan dari <code>SYNAPSE.md</code> &mdash; PRD, master prompt, dan arsitektur lengkap ada di file itu.</footer>
+
+</div>

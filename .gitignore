@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.db
+*.db.bak.*
+
+node_modules/
+.next/
+.env
+.env.local
+
+.DS_Store
