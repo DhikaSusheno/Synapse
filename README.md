@@ -13,13 +13,13 @@ Full PRD, master prompt, and architecture: [`SYNAPSE.md`](./SYNAPSE.md).
 
 ## Team (6 orang, 3 tim, kerja mandiri masing-masing dengan Bob 2.0 + AI tools lain)
 
-| Tim | Orang | Fokus |
-|---|---|---|
-| Backend (`/backend`) | [@DhikaSusheno](https://github.com/DhikaSusheno) · [@Masrendra](https://github.com/Masrendra) | Guardian (propose/execute/rollback) + Cortex (ingest/mentor/review), MCP server |
-| Frontend / UI-UX (`/frontend`) | [@nabilfauzandafa](https://github.com/nabilfauzandafa) · [@ShannWasHere](https://github.com/ShannWasHere) | Live graph (force-graph) + dashboard (sidebar, approve/deny), SSE consumer |
-| Security & QC (`/security`) | [@pidpid35](https://github.com/pidpid35) · [@zuyss](https://github.com/zuyss) | Rule engine tests, adversarial/fail-closed testing, demo reliability, rollback verification |
+| Tim | Orang | Fokus | PRD | Master Prompt |
+|---|---|---|---|---|
+| Backend (`/backend`) | [@DhikaSusheno](https://github.com/DhikaSusheno) · [@Masrendra](https://github.com/Masrendra) | Guardian (propose/execute/rollback) + Cortex (ingest/mentor/review), MCP server | [PRD](./backend/PRD.md) | [Master Prompt](./backend/MASTER_PROMPT.md) |
+| Frontend / UI-UX (`/frontend`) | [@nabilfauzandafa](https://github.com/nabilfauzandafa) · [@ShannWasHere](https://github.com/ShannWasHere) | Live graph (force-graph) + dashboard (sidebar, approve/deny), SSE consumer | [PRD](./frontend/PRD.md) | [Master Prompt](./frontend/MASTER_PROMPT.md) |
+| Security & QC (`/security`) | [@pidpid35](https://github.com/pidpid35) · [@zuyss](https://github.com/zuyss) | Rule engine tests, adversarial/fail-closed testing, demo reliability, rollback verification | [PRD](./security/PRD.md) | [Master Prompt](./security/MASTER_PROMPT.md) |
 
-Ownership per folder is enforced via [`CODEOWNERS`](./.github/CODEOWNERS).
+Ownership per folder is enforced via [`CODEOWNERS`](./.github/CODEOWNERS). Setiap tim kerja mandiri dari PRD + Master Prompt masing-masing (diturunkan dari [`SYNAPSE.md`](./SYNAPSE.md) — kontrak SQLite schema, rule table, dan SSE event shape tetap satu sumber kebenaran bersama, dikunci di jam 2).
 
 ## Workflow (48 jam)
 
