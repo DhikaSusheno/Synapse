@@ -95,17 +95,41 @@ import asyncio
 
 _sse_subscribers: list[asyncio.Queue] = []
 
+# BUG-08 FIX: simpan referensi event loop agar _emit() bisa dipanggil
+# dari sync thread (FastAPI threadpool) dengan aman via call_soon_threadsafe().
+_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def set_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Dipanggil dari on_startup (async context) untuk menyimpan loop reference."""
+    global _event_loop
+    _event_loop = loop
+
 
 def _emit(event_type: str, data: dict) -> None:
+    """
+    BUG-08 FIX: thread-safe emit.
+    Bisa dipanggil dari sync thread (Guardian) maupun async context.
+    - Jika ada event loop running: gunakan call_soon_threadsafe() agar queue
+      di-update dari loop thread yang benar, bukan dari sync worker thread.
+    - Jika tidak ada loop (unit test / startup): fallback ke put_nowait() langsung.
+    """
     payload = json.dumps({"event": event_type, "data": data})
     dead = []
-    for q in _sse_subscribers:
+    for q in list(_sse_subscribers):  # copy list agar aman dari concurrent remove
         try:
-            q.put_nowait(payload)
+            if _event_loop is not None and _event_loop.is_running():
+                # Panggil dari sync thread ke event loop thread dengan aman
+                _event_loop.call_soon_threadsafe(q.put_nowait, payload)
+            else:
+                q.put_nowait(payload)
         except asyncio.QueueFull:
             dead.append(q)
+        except Exception:
+            dead.append(q)
     for q in dead:
-        _sse_subscribers.remove(q)
+        if q in _sse_subscribers:
+            _sse_subscribers.remove(q)
 
 
 def subscribe_sse() -> asyncio.Queue:

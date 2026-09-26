@@ -67,9 +67,12 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     init_db()
-    # guardian.py langsung import _emit dari cortex — tidak perlu set_emit()
+    # BUG-08 FIX: set event loop reference di cortex agar _emit() thread-safe
+    # (Guardian endpoint adalah sync, dipanggil dari threadpool — perlu call_soon_threadsafe)
+    import asyncio
+    cortex.set_event_loop(asyncio.get_event_loop())
     print("[Synapse] Server ready. Visit http://localhost:8000/docs")
 
 

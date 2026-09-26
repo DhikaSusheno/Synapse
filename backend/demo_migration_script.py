@@ -1,16 +1,16 @@
-﻿"""
-demo_migration_script.py — Skenario Demo Guardian (BE-1 DhikaSusheno)
+"""
+demo_migration_script.py - Skenario Demo Guardian (BE-1 DhikaSusheno)
 
-Skrip ini menjalankan skenario demo Synapse secara berurutan lewat HTTP API:
-  1. Propose + approve + execute migration SUKSES (tambah kolom 'tag')
-  2. Propose migration KONFLIK (target sama, dalam window 15 menit)
-  3. Propose + approve + execute migration GAGAL (SQL salah → auto-rollback)
-  4. Verifikasi tabel masih utuh setelah rollback
+Skenario:
+  1. Propose op-A + approve  (status: approved, belum execute)
+  2. Propose op-B target SAMA -> konflik terdeteksi (op-A masih approved)
+  3. Execute op-A -> SUKSES verified
+  4. Propose + approve + execute op-C SQL RUSAK -> auto-rollback
+  5. Fail-closed: tool tidak dikenal -> blast=unknown, requires_approval=True
+  6. Verifikasi tabel DB masih utuh
 
-Jalankan SETELAH uvicorn main:app berjalan:
-  python demo_migration_script.py
-
-Output: log tiap langkah + hasil verifikasi final
+Jalankan:
+  set PYTHONIOENCODING=utf-8 && python demo_migration_script.py
 """
 import sys
 import time
@@ -22,11 +22,7 @@ import urllib.error
 BASE_URL = "http://localhost:8000"
 
 
-# ---------------------------------------------------------------------------
-# HTTP helper
-# ---------------------------------------------------------------------------
-
-def api(method: str, path: str, body: dict = None) -> dict:
+def api(method, path, body=None):
     url = f"{BASE_URL}{path}"
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(
@@ -37,150 +33,145 @@ def api(method: str, path: str, body: dict = None) -> dict:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        body_text = e.read().decode()
-        return {"error": f"HTTP {e.code}", "detail": body_text}
+        return {"error": f"HTTP {e.code}", "detail": e.read().decode()}
     except Exception as e:
         return {"error": str(e)}
 
 
-def sep(title: str):
-    print(f"\n{'='*60}")
-    print(f"  {title}")
-    print('='*60)
+def sep(title):
+    print(f"\n{'='*60}\n  {title}\n{'='*60}")
 
 
-# ---------------------------------------------------------------------------
-# Main demo
-# ---------------------------------------------------------------------------
+def ok(msg):
+    print(f"[PASS] {msg}")
+
+
+def fail(msg):
+    print(f"[FAIL] {msg}")
+    sys.exit(1)
+
 
 def main():
-    sep("0. Health check")
+    sep("0. Health Check")
     r = api("GET", "/health")
-    print(f"Server: {r}")
     if r.get("status") != "ok":
-        print("❌ Server tidak merespons. Jalankan: uvicorn main:app --reload")
-        sys.exit(1)
-    print("✅ Server OK")
+        fail(f"Server tidak merespons: {r}")
+    ok(f"Server UP (v{r.get('version','?')})")
 
-    # ──────────────────────────────────────────────────────────────────────
-    sep("1. Migration SUKSES — tambah kolom 'tag' ke tabel nodes")
-    # ──────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    sep("1. Propose op-A + Approve -> status: approved (belum execute)")
+    # ------------------------------------------------------------------
     r1 = api("POST", "/propose_operation", {
         "tool_name": "db.run_migration",
         "params": {"sql": "ALTER TABLE nodes ADD COLUMN tag TEXT DEFAULT NULL;"},
         "target": "synapse.db::nodes",
     })
-    print(f"propose → {r1.get('status')} | blast={r1.get('blast_radius')} | "
-          f"conflicts={len(r1.get('conflicts', []))}")
-    op_id_1 = r1.get("operation_id")
+    if not r1.get("ok"):
+        fail(f"propose op-A gagal: {r1}")
+    op_id_a = r1["operation_id"]
+    print(f"  propose -> blast={r1['blast_radius']} | requires_approval={r1['requires_approval']} | conflicts={len(r1.get('conflicts',[]))}")
 
-    # Approve
-    r_approve = api("POST", "/approve_operation", {
-        "operation_id": op_id_1,
-        "decision": "approved",
-        "note": "demo: migration sukses",
+    ra = api("POST", "/approve_operation", {
+        "operation_id": op_id_a, "decision": "approved", "note": "demo step 1",
     })
-    print(f"approve → {r_approve.get('new_status')}")
+    if not ra.get("ok"):
+        fail(f"approve op-A gagal: {ra}")
+    print(f"  approve -> status={ra.get('status')}")
+    ok("op-A approved, belum di-execute")
 
-    # Execute
-    r_exec = api("POST", "/execute_operation", {"operation_id": op_id_1})
-    print(f"execute → status={r_exec.get('status')} | "
-          f"ok={r_exec.get('ok')} | {r_exec.get('verify_message', r_exec.get('exec_error', ''))}")
-    assert r_exec.get("ok"), f"❌ Migration sukses gagal: {r_exec}"
-    print("✅ Migration sukses — kolom 'tag' ditambahkan")
-
-    time.sleep(0.5)
-
-    # ──────────────────────────────────────────────────────────────────────
-    sep("2. Migration KONFLIK — target sama dalam 15 menit terakhir")
-    # ──────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    sep("2. Konflik: op-B ke target SAMA saat op-A masih 'approved'")
+    # ------------------------------------------------------------------
     r2 = api("POST", "/propose_operation", {
         "tool_name": "db.run_migration",
         "params": {"sql": "ALTER TABLE nodes ADD COLUMN priority INTEGER DEFAULT 0;"},
-        "target": "synapse.db::nodes",   # target SAMA dengan op1 → konflik!
+        "target": "synapse.db::nodes",
     })
     conflicts = r2.get("conflicts", [])
-    print(f"propose → conflicts={len(conflicts)} | "
-          f"requires_approval={r2.get('requires_approval')}")
-    print(f"message: {r2.get('message')}")
-    assert len(conflicts) > 0, "❌ Konflik seharusnya terdeteksi!"
-    assert r2.get("requires_approval") is True, "❌ require_approval harus True saat konflik!"
-    print("✅ Konflik terdeteksi — approval wajib, tidak bisa auto-execute")
+    print(f"  propose -> conflicts={len(conflicts)} | requires_approval={r2.get('requires_approval')}")
+    if len(conflicts) == 0:
+        fail("Konflik seharusnya terdeteksi! op-A masih approved")
+    if not r2.get("requires_approval"):
+        fail("requires_approval harus True saat ada konflik!")
+    ok(f"Konflik terdeteksi ({len(conflicts)} op) - approval wajib")
 
-    time.sleep(0.5)
+    # ------------------------------------------------------------------
+    sep("3. Execute op-A -> SUKSES, status: verified")
+    # ------------------------------------------------------------------
+    re_a = api("POST", "/execute_operation", {"operation_id": op_id_a})
+    print(f"  execute -> ok={re_a.get('ok')} | status={re_a.get('status')}")
+    if not re_a.get("ok") or re_a.get("status") != "verified":
+        fail(f"Execute op-A gagal: {re_a}")
+    ok("Migration sukses, status: verified")
 
-    # ──────────────────────────────────────────────────────────────────────
-    sep("3. Migration GAGAL (SQL rusak) → auto-rollback")
-    # ──────────────────────────────────────────────────────────────────────
+    time.sleep(0.3)
+
+    # ------------------------------------------------------------------
+    sep("4. Migration GAGAL (SQL rusak) -> auto-rollback")
+    # ------------------------------------------------------------------
     r3 = api("POST", "/propose_operation", {
         "tool_name": "db.run_migration",
         "params": {"sql": "THIS IS NOT VALID SQL @@@@;"},
-        "target": "synapse.db::broken_target",  # target berbeda agar tidak konflik dengan op1
+        "target": "synapse.db::broken",
     })
-    op_id_3 = r3.get("operation_id")
-    print(f"propose → {r3.get('status')} | blast={r3.get('blast_radius')}")
-
-    # Approve (paksa jalan meskipun SQL rusak)
+    op_id_c = r3.get("operation_id")
+    print(f"  propose -> blast={r3.get('blast_radius')}")
     api("POST", "/approve_operation", {
-        "operation_id": op_id_3,
-        "decision": "approved",
-        "note": "demo: sengaja rusak untuk trigger rollback",
+        "operation_id": op_id_c, "decision": "approved", "note": "sengaja rusak",
     })
+    re_c = api("POST", "/execute_operation", {"operation_id": op_id_c})
+    print(f"  execute -> ok={re_c.get('ok')} | status={re_c.get('status')}")
+    print(f"  error   -> {str(re_c.get('error', re_c.get('exec_error', '')))[:80]}")
+    if re_c.get("ok") is not False:
+        fail("Seharusnya gagal karena SQL rusak!")
+    if re_c.get("status") not in ("rolled_back", "failed"):
+        fail(f"Status harus rolled_back/failed, dapat: {re_c.get('status')}")
+    ok(f"Auto-rollback triggered, status: {re_c.get('status')}")
 
-    r_exec3 = api("POST", "/execute_operation", {"operation_id": op_id_3})
-    print(f"execute → ok={r_exec3.get('ok')} | status={r_exec3.get('status')}")
-    print(f"exec_error: {r_exec3.get('exec_error', '')}")
-    print(f"rollback_ok: {r_exec3.get('rollback_ok')} | {r_exec3.get('rollback_message', '')}")
-    assert r_exec3.get("ok") is False, "❌ Harusnya gagal!"
-    assert r_exec3.get("status") in ("rolled_back", "failed"), "❌ Status harus rolled_back/failed"
-    print(f"✅ Migration gagal terdeteksi → auto-rollback ke status: {r_exec3.get('status')}")
+    time.sleep(0.3)
 
-    # ──────────────────────────────────────────────────────────────────────
-    sep("4. Fail-closed — tool tidak dikenal wajib ditolak")
-    # ──────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    sep("5. Fail-closed: tool tidak dikenal")
+    # ------------------------------------------------------------------
     r4 = api("POST", "/propose_operation", {
         "tool_name": "unknown.dangerous_tool",
         "params": {},
         "target": "production-db",
     })
-    print(f"propose → blast={r4.get('blast_radius')} | "
-          f"requires_approval={r4.get('requires_approval')}")
-    assert r4.get("blast_radius") == "unknown", "❌ blast_radius harus 'unknown'"
-    assert r4.get("requires_approval") is True, "❌ harus require approval"
-    print("✅ Fail-closed: tool tidak dikenal → wajib approval manusia")
+    print(f"  propose -> blast={r4.get('blast_radius')} | requires_approval={r4.get('requires_approval')}")
+    if r4.get("blast_radius") != "unknown":
+        fail(f"blast_radius harus 'unknown', dapat: {r4.get('blast_radius')}")
+    if not r4.get("requires_approval"):
+        fail("requires_approval harus True untuk tool tidak dikenal!")
+    ok("Fail-closed OK: tool tidak dikenal -> wajib approval")
 
-    # ──────────────────────────────────────────────────────────────────────
-    sep("5. Verifikasi final — tabel DB masih utuh")
-    # ──────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    sep("6. Verifikasi tabel DB masih utuh setelah rollback")
+    # ------------------------------------------------------------------
     try:
         conn = sqlite3.connect("synapse.db")
-        tables = {
-            row[0] for row in
-            conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
         conn.close()
-        required = {"nodes", "edges", "operations", "approvals"}
-        missing = required - tables
+        missing = {"nodes", "edges", "operations", "approvals"} - tables
         if missing:
-            print(f"❌ Tabel hilang: {missing}")
-        else:
-            print(f"✅ Semua tabel kontrak masih ada: {required}")
+            fail(f"Tabel hilang: {missing}")
+        ok(f"Semua tabel kontrak ada: {sorted(tables & {'nodes','edges','operations','approvals'})}")
     except Exception as e:
-        print(f"❌ Tidak bisa koneksi ke synapse.db: {e}")
+        fail(f"DB error: {e}")
 
-    # ──────────────────────────────────────────────────────────────────────
-    sep("6. Operasi history")
-    # ──────────────────────────────────────────────────────────────────────
-    ops = api("GET", "/operations")
-    print(f"Total operasi tercatat: {len(ops)}")
-    for op in ops:
-        print(f"  [{op.get('status', '?').upper():25}] {op.get('tool_name')} → {op.get('target_node_id')}")
+    # ------------------------------------------------------------------
+    sep("7. Ringkasan operasi")
+    # ------------------------------------------------------------------
+    ops = api("GET", "/operations?limit=20")
+    if isinstance(ops, list):
+        print(f"  Total: {len(ops)}")
+        for op in ops:
+            print(f"    [{op.get('status','?').upper():20}] {op.get('tool_name')} -> {op.get('target_node_id','')[:40]}")
 
-    sep("✅ DEMO SELESAI — semua skenario berhasil diverifikasi")
+    sep("DEMO SELESAI - Semua skenario PASS")
 
 
 if __name__ == "__main__":
     main()
-
