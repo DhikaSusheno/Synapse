@@ -164,15 +164,21 @@ def _get_graph() -> nx.DiGraph:
     Ini yang membuat analyze_*.py tetap berguna setelah restart: proses baru
     mulai dengan _graph kosong, dan tidak ada yang memanggil ingest_repository()
     kalau user cuma langsung nanya /repo_health.
+
+    ISSUE-33 FIX: rebuild DIBAWAH lock. Versi sebelumnya melepas lock dulu
+    lalu rebuild di luar, jadi N thread yang datang bersamaan semuanya
+    melihat graph kosong dan semuanya membangun graph sendiri — yang terakhir
+    menimpa, sementara thread lain memegang referensi graph yang sudah
+    basi. Itu persis skenario "overwrite graph valid" yang dilapor issue #33.
+
+    Lock hanya dipegang saat graph masih kosong, jadi setelah rebuild pertama
+    semua panggilan berikutnya cuma lock + cek `len(_graph)` yang murah.
     """
+    global _graph
     with _graph_lock:
         if len(_graph) == 0:
-            needs_rebuild = True
-        else:
-            return _graph
-    if needs_rebuild:
-        return _rebuild_and_swap()
-    return _graph
+            _graph = _build_graph_from_db()
+        return _graph
 
 
 # ===========================================================================
@@ -195,37 +201,54 @@ def set_event_loop(loop: asyncio.AbstractEventLoop) -> None:
     _event_loop = loop
 
 
+def _deliver(q: asyncio.Queue, payload: str) -> None:
+    """
+    ISSUE-32 (residual): dipanggil DI DALAM event loop.
+
+    try/except di _emit() tidak akan menangkap QueueFull di sini, karena
+    call_soon_threadsafe() menjadwalkan callback — exception-nya muncul
+    belakangan di thread loop, bukan di thread pemanggil. Akibatnya
+    "Task exception was never retrieved" di log dan queue yang sudah penuh
+    tidak pernah dibuang, sehingga client lambat itu tetap berlangganan
+    selamanya dan setiap emit terus gagal.
+
+    Solusi: tandai queue-nya di tempat (flag per-queue, tanpa state bersama
+    yang perlu lock), lalu _emit() yang memangkas di thread pemanggil.
+    """
+    try:
+        q.put_nowait(payload)
+    except Exception:
+        q.synapse_dead = True  # type: ignore[attr-defined]
+
+
 def _emit(event_type: str, data: dict) -> None:
     """Kirim event ke semua subscriber. Aman dipanggil dari thread mana pun."""
     payload = json.dumps({"event": event_type, "data": data}, default=str)
     with _sse_lock:
+        # pangkas subscriber yang sudah ditandai mati (queue penuh / error)
+        for q in [q for q in _sse_subscribers
+                  if getattr(q, "synapse_dead", False)]:
+            _sse_subscribers.remove(q)
         targets = list(_sse_subscribers)
 
-    dead: list[asyncio.Queue] = []
+    loop = _event_loop
+    use_loop = loop is not None and loop.is_running()
     for q in targets:
-        try:
-            loop = _event_loop
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(q.put_nowait, payload)
-            else:
-                # Tidak ada loop hidup (mis. dipanggil dari script/pytest).
-                # q.put_nowait() masih aman karena Queue tanpa waiter tidak
-                # butuh loop; yang tidak bisa dilakukan hanya await get().
+        if use_loop:
+            loop.call_soon_threadsafe(_deliver, q, payload)
+        else:
+            # Tidak ada loop hidup (mis. dipanggil dari script/pytest).
+            # q.put_nowait() masih aman karena Queue tanpa waiter tidak
+            # butuh loop; yang tidak bisa dilakukan hanya await get().
+            try:
                 q.put_nowait(payload)
-        except asyncio.QueueFull:
-            dead.append(q)
-        except Exception:
-            dead.append(q)
-
-    if dead:
-        with _sse_lock:
-            for q in dead:
-                if q in _sse_subscribers:
-                    _sse_subscribers.remove(q)
+            except Exception:
+                q.synapse_dead = True  # type: ignore[attr-defined]
 
 
 def subscribe_sse() -> asyncio.Queue:
     q: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
+    q.synapse_dead = False  # type: ignore[attr-defined]
     with _sse_lock:
         _sse_subscribers.append(q)
     return q

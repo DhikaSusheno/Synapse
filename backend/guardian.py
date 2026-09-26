@@ -30,6 +30,14 @@ Bug fixes (dari security/TEST_SCENARIOS.md Bug Findings Log):
   BUG-B [HIGH] _exec_migration() pakai executescript() yang auto-commit
          FIX: explicit transaction BEGIN/COMMIT/ROLLBACK per statement.
 
+  ISSUE-34 [HIGH] _exec_migration() memecah SQL dengan split(";") secara naif
+         Gejala: `;` di dalam string literal (''), identifier ("", ``, []),
+                 atau komentar membuat SQL terpotong jadi statement invalid →
+                 data corruption atau ROLLBACK yang menyesatkan.
+         FIX: _split_sql_statements() — lexer yang menghormati quoting dan
+              komentar. Tanpa dependensi baru (sqlparse tidak dipakai supaya
+              requirements.txt tetap ringan).
+
   BUG-D [LOW]  list_pending_approvals() bocorkan operasi 'approved' ke pending list
          FIX: WHERE status = 'pending' (exact, bukan IN ('pending','approved')).
 
@@ -1020,11 +1028,117 @@ def execute_operation(operation_id: str) -> dict:
 # Eksekutor per tipe operasi
 # ---------------------------------------------------------------------------
 
+def _split_sql_statements(sql: str) -> list[str]:
+    """
+    ISSUE-34 FIX: pecah SQL menjadi statement dengan LEXER, bukan split(";").
+
+    Yang harus dihormati:
+      - string literal  '...'   dengan escape '' (dua kutip)
+      - identifier     "..."   dengan escape ""
+      - identifier     `...`    (SQLite/MySQL)
+      - identifier     [...]    (SQL Server)
+      - komentar baris  -- ... hingga akhir baris
+      - komentar blok  /* ... */
+
+    Karakter ';' di dalam salah satu quoting/komentar di atas TIDAK boleh
+    memotong statement. Contoh yang rusak kalau tetap split(";"):
+
+        INSERT INTO config VALUES ('key', 'value;with;semicolons');
+
+    Akan jadi 2 statement, dan statement pertama berisi SQL terpotong yang
+    tidak valid — data tersimpan tidak lengkap atau ROLLBACK menyesatkan.
+    """
+    statements: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+
+        # --- komentar blok: /* ... */ -------------------------------------
+        if ch == "/" and nxt == "*":
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+
+        # --- komentar baris: -- ... ---------------------------------------
+        if ch == "-" and nxt == "-":
+            end = sql.find("\n", i)
+            i = n if end == -1 else end + 1
+            continue
+
+        # --- string literal '...' dengan escape '' ------------------------
+        if ch == "'":
+            buf.append(ch)
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    # '' di dalam string = literal kutip tunggal
+                    if i + 1 < n and sql[i + 1] == "'":
+                        buf.append("''")
+                        i += 2
+                        continue
+                    buf.append("'")
+                    i += 1
+                    break
+                buf.append(sql[i])
+                i += 1
+            continue
+
+        # --- identifier/quoted: "..." atau `...` -------------------------
+        if ch in ('"', "`"):
+            closer = ch
+            buf.append(ch)
+            i += 1
+            while i < n:
+                if sql[i] == closer:
+                    if i + 1 < n and sql[i + 1] == closer:
+                        buf.append(closer * 2)
+                        i += 2
+                        continue
+                    buf.append(closer)
+                    i += 1
+                    break
+                buf.append(sql[i])
+                i += 1
+            continue
+        if ch == "[":
+            end = sql.find("]", i)
+            if end == -1:
+                buf.append(sql[i:])
+                i = n
+                continue
+            buf.append(sql[i : end + 1])
+            i = end + 1
+            continue
+
+        # --- statement terminator ----------------------------------------
+        if ch == ";":
+            stmt = "".join(buf).strip()
+            if stmt:
+                statements.append(stmt)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
 def _exec_migration(params: dict) -> tuple[bool, str]:
     """
     BUG-B FIX: ganti executescript() (auto-commit tiap statement) ke
     explicit transaction dengan execute() per statement.
     Jika salah satu statement gagal, ROLLBACK dilakukan dan snapshot masih valid.
+
+    ISSUE-34 FIX: statement dipecah dengan _split_sql_statements() yang
+    menghormati string literal dan komentar, bukan split(";").
     """
     sql = params.get("sql", "")
     db_path = params.get("db_path", _db_path())
@@ -1035,13 +1149,16 @@ def _exec_migration(params: dict) -> tuple[bool, str]:
         conn.isolation_level = None  # autocommit off, kita kelola sendiri
         conn.execute("BEGIN")
         try:
-            for statement in sql.split(";"):
-                stmt = statement.strip()
-                if stmt:
-                    conn.execute(stmt)
+            statements = _split_sql_statements(sql)
+            if not statements:
+                conn.execute("ROLLBACK")
+                conn.close()
+                return False, "Tidak ada statement SQL yang bisa dieksekusi"
+            for statement in statements:
+                conn.execute(statement)
             conn.execute("COMMIT")
             conn.close()
-            return True, f"Migration berhasil: {sql[:80]}"
+            return True, f"Migration berhasil ({len(statements)} statement): {sql[:80]}"
         except Exception as e:
             conn.execute("ROLLBACK")
             conn.close()
