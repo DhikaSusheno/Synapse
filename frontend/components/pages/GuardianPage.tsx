@@ -60,6 +60,8 @@ function PendingOpDetail({ op, onDecided }: PendingOpDetailProps) {
   const [error, setError]     = useState<string | null>(null);
   const params = (() => { try { return JSON.parse(op.params_json); } catch { return {}; } })();
 
+  // #39 fix: approve error ditangani dengan benar;
+  // execute hanya dipanggil kalau d.ok === true.
   async function decide(decision: "approved" | "denied") {
     setLoading(true); setError(null);
     try {
@@ -67,9 +69,21 @@ function PendingOpDetail({ op, onDecided }: PendingOpDetailProps) {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ operation_id: op.id, decision }),
       }).catch(() => null);
-      if (!r?.ok) { setStatus(decision === "approved" ? "approved" : "failed"); onDecided(op.id, decision); return; }
+
+      if (!r?.ok) {
+        setError("Approve gagal — coba lagi.");
+        return;
+      }
+
       const d = await r.json().catch(() => null);
+
+      if (!d?.ok) {
+        setError(d?.error ?? "Approve gagal.");
+        return;
+      }
+
       setStatus((d?.status ?? (decision === "approved" ? "approved" : "failed")) as typeof status);
+
       if (decision === "approved") {
         setStatus("executing");
         const er = await fetch(`${BACKEND_URL}/execute_operation`, {

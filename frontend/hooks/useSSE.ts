@@ -2,9 +2,8 @@
 // Konsumsi SSE stream dari backend /stream.
 // Diaktifkan saat backend sudah live - gantikan useMockSimulation.
 //
-// Mitigation BUG-08: cortex._emit() not thread-safe (issue #11)
-// Frontend reconnect dengan exponential backoff agar SSE bisa recover
-// otomatis jika stream mati saat approve/execute diklik di demo.
+// Fix #38: tambah onRawEvent callback supaya page.tsx bisa collect
+// event log tanpa OperationsSidebar membuka koneksi SSE tersendiri.
 
 import { useEffect, useRef, useCallback } from "react";
 import type { SSEEvent, GraphNode } from "@/lib/types";
@@ -35,10 +34,19 @@ export interface IngestProgress {
   stats: Record<string, number>;
 }
 
+// #38: entry shape yang sama dengan EventLogPanel di OperationsSidebar
+export interface RawSSEEntry {
+  ts: string;
+  event: string;
+  summary: string;
+}
+
 interface UseSSEOptions {
   onNodeUpdate: (nodeId: string, status: GraphNode["status"]) => void;
   onGraphUpdate: (nodes: GraphNode[]) => void;
   onIngestProgress?: (progress: IngestProgress) => void;
+  /** #38: dipanggil untuk setiap SSE event non-heartbeat — untuk event log di OperationsSidebar */
+  onRawEvent?: (entry: RawSSEEntry) => void;
   enabled: boolean;
 }
 
@@ -51,6 +59,7 @@ export function useSSE({
   onNodeUpdate,
   onGraphUpdate,
   onIngestProgress,
+  onRawEvent,
   enabled,
 }: UseSSEOptions) {
   const esRef = useRef<EventSource | null>(null);
@@ -110,8 +119,21 @@ export function useSSE({
             break;
           case "heartbeat":
           case "connected":
+            return; // jangan masuk onRawEvent
           default:
             break;
+        }
+
+        // #38: kirim ke event log via callback — tidak buka koneksi baru
+        if (onRawEvent) {
+          const d = parsed.data;
+          const summary = (() => {
+            if (d.operation_id) return `op ${String(d.operation_id).slice(0, 8)}... ${d.tool_name ?? ""}`.trim();
+            if (d.current_doc) return `ingest: ${d.current_doc}`;
+            if (d.repo) return `graph: ${d.repo}`;
+            return JSON.stringify(d).slice(0, 60);
+          })();
+          onRawEvent({ ts: new Date().toLocaleTimeString(), event: parsed.event, summary });
         }
       } catch {
         // Abaikan event yang tidak bisa di-parse
@@ -122,12 +144,12 @@ export function useSSE({
       es.close();
       esRef.current = null;
       if (!mountedRef.current) return;
-      // Exponential backoff reconnect (mitigasi BUG-08)
+      // Exponential backoff reconnect
       const delay = nextDelay(attemptRef.current);
       attemptRef.current += 1;
       timerRef.current = setTimeout(connect, delay);
     };
-  }, [onNodeUpdate, onGraphUpdate, onIngestProgress]);
+  }, [onNodeUpdate, onGraphUpdate, onIngestProgress, onRawEvent]);
 
   useEffect(() => {
     mountedRef.current = true;

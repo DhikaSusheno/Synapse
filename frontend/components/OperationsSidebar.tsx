@@ -5,8 +5,9 @@
 // Owner FE-2: @ShannWasHere (wiring ke API asli + encoding fix)
 // Owner FE-1: @nabilfauzandafa (state, explain_topic panel, repo_health, event log)
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import type { GraphNode, Operation } from "@/lib/types";
+import type { RawSSEEntry } from "@/hooks/useSSE";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
@@ -36,6 +37,8 @@ const MOCK_OPERATIONS: Operation[] = [
 
 interface Props {
   selectedNode: GraphNode | null;
+  /** #38: event log dari page.tsx (single SSE connection) — tidak buka koneksi sendiri */
+  eventLog: RawSSEEntry[];
 }
 
 // --- Badge ---
@@ -68,6 +71,8 @@ function OperationCard({ op }: { op: Operation }) {
   const [localStatus, setLocalStatus] = useState(op.status);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // #39 fix: approve error ditangani dengan benar;
+  // execute hanya dipanggil kalau approveData.ok === true.
   async function decide(decision: "approved" | "denied") {
     setLoading(true);
     setErrorMsg(null);
@@ -78,11 +83,15 @@ function OperationCard({ op }: { op: Operation }) {
         body: JSON.stringify({ operation_id: op.id, decision }),
       }).catch(() => null);
 
-      const approveData = approveRes?.ok ? await approveRes.json().catch(() => null) : null;
-
       if (!approveRes || !approveRes.ok) {
-        await new Promise((r) => setTimeout(r, 600));
-        setLocalStatus(decision === "approved" ? "approved" : "failed");
+        setErrorMsg("Approve gagal — coba lagi.");
+        return;
+      }
+
+      const approveData = await approveRes.json().catch(() => null);
+
+      if (!approveData?.ok) {
+        setErrorMsg(approveData?.error ?? "Approve gagal.");
         return;
       }
 
@@ -229,45 +238,6 @@ function NodeInfoPanel({ node }: { node: GraphNode }) {
   );
 }
 
-// --- Event log - tabel live SSE events (deliverable #6 PRD) ---
-interface EventLogEntry {
-  ts: string;
-  event: string;
-  summary: string;
-}
-
-// Hook global - subscribe SSE stream dan catat semua event ke log
-function useEventLog(enabled: boolean): EventLogEntry[] {
-  const [log, setLog] = useState<EventLogEntry[]>([]);
-  const esRef = useRef<EventSource | null>(null);
-
-  useEffect(() => {
-    if (!enabled) return;
-    const es = new EventSource(`${BACKEND_URL}/stream`);
-    esRef.current = es;
-    es.onmessage = (e) => {
-      try {
-        const parsed = JSON.parse(e.data) as { event: string; data: Record<string, unknown> };
-        if (parsed.event === "heartbeat" || parsed.event === "connected") return;
-        const summary = (() => {
-          const d = parsed.data;
-          if (d.operation_id) return `op ${String(d.operation_id).slice(0, 8)}... ${d.tool_name ?? ""}`.trim();
-          if (d.current_doc) return `ingest: ${d.current_doc}`;
-          if (d.repo) return `graph: ${d.repo}`;
-          return JSON.stringify(d).slice(0, 60);
-        })();
-        setLog((prev) => [
-          { ts: new Date().toLocaleTimeString(), event: parsed.event, summary },
-          ...prev.slice(0, 49), // cap at 50 entries
-        ]);
-      } catch { /* ignore */ }
-    };
-    return () => es.close();
-  }, [enabled]);
-
-  return log;
-}
-
 const EVENT_COLORS: Record<string, string> = {
   operation_proposed:    "text-yellow-400",
   operation_approved:    "text-blue-400",
@@ -283,7 +253,7 @@ const EVENT_COLORS: Record<string, string> = {
   refactor_suggestion:   "text-indigo-400",
 };
 
-function EventLogPanel({ log }: { log: EventLogEntry[] }) {
+function EventLogPanel({ log }: { log: RawSSEEntry[] }) {
   if (log.length === 0) {
     return (
       <p className="text-xs text-slate-500 px-0.5">Menunggu event dari backend.</p>
@@ -342,10 +312,9 @@ function useOperations() {
 }
 
 // --- Sidebar utama ---
-export default function OperationsSidebar({ selectedNode }: Props) {
+export default function OperationsSidebar({ selectedNode, eventLog }: Props) {
   const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
   const ops = useOperations();
-  const eventLog = useEventLog(USE_LIVE);
   const [activeTab, setActiveTab] = useState<"ops" | "log">("ops");
 
   return (

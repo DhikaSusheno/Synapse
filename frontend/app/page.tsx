@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import type { GraphNode, Operation } from "@/lib/types";
 import type { NavPage } from "@/components/LeftNav";
+import type { RawSSEEntry } from "@/hooks/useSSE";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -86,7 +87,6 @@ function useOperations(): [Operation[], (id: string, d: "approved" | "denied") =
     if (!USE_LIVE) return;
     async function load() {
       try {
-        // Load semua operasi (untuk history + operations page)
         const [allRes, pendingRes] = await Promise.all([
           fetch(`${BACKEND_URL}/operations?limit=100`, { cache: "no-store" }),
           fetch(`${BACKEND_URL}/list_pending_approvals`, { cache: "no-store" }),
@@ -99,7 +99,6 @@ function useOperations(): [Operation[], (id: string, d: "approved" | "denied") =
         if (pendingRes.ok) {
           const data = await pendingRes.json();
           const pending = ((data.pending ?? []) as Record<string, unknown>[]).map(normalizeOp);
-          // Merge pending ke allOps (upsert by id — pending override karena punya conflicts field)
           for (const p of pending) {
             if (!allOps.find((o) => o.id === p.id)) allOps.push(p);
             else {
@@ -147,6 +146,9 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
   const [loading, setLoading] = useState(false);
   const [localStatus, setLocalStatus] = useState(op.status);
   const [errorMsg, setErrorMsg]       = useState<string | null>(null);
+
+  // #39 fix: approve error ditangani dengan benar;
+  // execute hanya dipanggil kalau d.ok === true.
   async function decide(decision: "approved" | "denied") {
     setLoading(true); setErrorMsg(null);
     try {
@@ -154,8 +156,21 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ operation_id: op.id, decision }),
       }).catch(() => null);
-      if (!r?.ok) { setLocalStatus(decision === "approved" ? "approved" : "failed"); onDecided?.(op.id, decision); return; }
-      setLocalStatus(decision === "approved" ? "approved" : "failed");
+
+      if (!r?.ok) {
+        setErrorMsg("Approve gagal — coba lagi.");
+        return;
+      }
+
+      const d = await r.json().catch(() => null);
+
+      if (!d?.ok) {
+        setErrorMsg(d?.error ?? "Approve gagal.");
+        return;
+      }
+
+      setLocalStatus((d?.status ?? (decision === "approved" ? "approved" : "failed")) as Operation["status"]);
+
       if (decision === "approved") {
         setLocalStatus("executing");
         const er = await fetch(`${BACKEND_URL}/execute_operation`, {
@@ -169,6 +184,7 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
       onDecided?.(op.id, decision);
     } finally { setLoading(false); }
   }
+
   const params = (() => { try { return JSON.parse(op.params_json); } catch { return {}; } })();
   const isDone = localStatus !== "pending";
   return (
@@ -313,6 +329,13 @@ export default function HomePage() {
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [graphCount, setGraphCount]     = useState({ nodes: 0, links: 0 });
   const [ops, handleOpDecided]          = useOperations();
+
+  // #38: satu event log di level atas, dikumpulkan via onRawEvent dari useSSE
+  // OperationsSidebar terima sebagai prop — tidak buka koneksi SSE tersendiri
+  const [sseEventLog, setSseEventLog] = useState<RawSSEEntry[]>([]);
+  const handleRawEvent = useCallback((entry: RawSSEEntry) => {
+    setSseEventLog((prev) => [entry, ...prev.slice(0, 49)]);
+  }, []);
 
   const handleNodeCount = useCallback((nodes: number, links: number) => {
     setGraphCount({ nodes, links });
