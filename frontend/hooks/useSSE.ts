@@ -1,19 +1,50 @@
 // hooks/useSSE.ts
 // Konsumsi SSE stream dari backend /stream.
-// Diaktifkan saat backend sudah live — gantikan useMockSimulation.
+// Diaktifkan saat backend sudah live - gantikan useMockSimulation.
 
 import { useEffect, useRef, useCallback } from "react";
 import type { SSEEvent, GraphNode } from "@/lib/types";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
+// Node seperti yang dikirim backend dari understand_repo graph_update
+interface BackendNode {
+  id: string;
+  type: GraphNode["type"];
+  name: string;
+  parent?: string;
+  complexity?: number;
+}
+
+// Konversi node format backend → format GraphNode frontend
+function mapBackendNode(n: BackendNode): GraphNode {
+  return {
+    id: n.id,
+    name: n.name,
+    type: n.type ?? "file",
+    status: "idle",
+    meta: n.complexity !== undefined ? { complexity: n.complexity } : undefined,
+  };
+}
+
+export interface IngestProgress {
+  current_doc: string;
+  stats: Record<string, number>;
+}
+
 interface UseSSEOptions {
   onNodeUpdate: (nodeId: string, status: GraphNode["status"]) => void;
   onGraphUpdate: (nodes: GraphNode[]) => void;
+  onIngestProgress?: (progress: IngestProgress) => void;
   enabled: boolean;
 }
 
-export function useSSE({ onNodeUpdate, onGraphUpdate, enabled }: UseSSEOptions) {
+export function useSSE({
+  onNodeUpdate,
+  onGraphUpdate,
+  onIngestProgress,
+  enabled,
+}: UseSSEOptions) {
   const esRef = useRef<EventSource | null>(null);
 
   const connect = useCallback(() => {
@@ -31,14 +62,23 @@ export function useSSE({ onNodeUpdate, onGraphUpdate, enabled }: UseSSEOptions) 
         switch (parsed.event) {
           // Backend emit graph_update saat understand_repo selesai
           case "graph_update": {
-            const newNodes = (parsed.data.nodes as GraphNode[] | undefined) ?? [];
-            if (newNodes.length > 0) {
-              onGraphUpdate(newNodes);
+            const rawNodes = (parsed.data.nodes as BackendNode[] | undefined) ?? [];
+            if (rawNodes.length > 0) {
+              onGraphUpdate(rawNodes.map(mapBackendNode));
             }
             break;
           }
 
-          // Status transition operasi
+          // Progress ingest per-doc
+          case "ingest_progress": {
+            onIngestProgress?.({
+              current_doc: (parsed.data.current_doc as string) ?? "",
+              stats: (parsed.data.stats_so_far as Record<string, number>) ?? {},
+            });
+            break;
+          }
+
+          // Status transition operasi — backend pakai operation_id UUID
           case "operation_proposed":
             onNodeUpdate(parsed.data.operation_id as string, "pending");
             break;
@@ -73,7 +113,7 @@ export function useSSE({ onNodeUpdate, onGraphUpdate, enabled }: UseSSEOptions) 
       es.close();
       setTimeout(connect, 3000);
     };
-  }, [onNodeUpdate, onGraphUpdate]);
+  }, [onNodeUpdate, onGraphUpdate, onIngestProgress]);
 
   useEffect(() => {
     if (!enabled) return;
