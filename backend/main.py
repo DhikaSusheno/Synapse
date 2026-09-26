@@ -71,8 +71,10 @@ async def on_startup():
     init_db()
     # BUG-08 FIX: set event loop reference di cortex agar _emit() thread-safe
     # (Guardian endpoint adalah sync, dipanggil dari threadpool — perlu call_soon_threadsafe)
+    # BUG-E FIX: get_running_loop() adalah cara yang benar dalam async context (Python 3.7+)
+    # get_event_loop() deprecated di Python 3.10+ dan error di Python 3.12+
     import asyncio
-    cortex.set_event_loop(asyncio.get_event_loop())
+    cortex.set_event_loop(asyncio.get_running_loop())
     print("[Synapse] Server ready. Visit http://localhost:8000/docs")
 
 

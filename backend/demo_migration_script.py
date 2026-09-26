@@ -76,6 +76,7 @@ def main():
     })
     if not ra.get("ok"):
         fail(f"approve op-A gagal: {ra}")
+    # GLITCH-1 FIX: field adalah 'status', bukan 'new_status'
     print(f"  approve -> status={ra.get('status')}")
     ok("op-A approved, belum di-execute")
 
@@ -99,7 +100,8 @@ def main():
     sep("3. Execute op-A -> SUKSES, status: verified")
     # ------------------------------------------------------------------
     re_a = api("POST", "/execute_operation", {"operation_id": op_id_a})
-    print(f"  execute -> ok={re_a.get('ok')} | status={re_a.get('status')}")
+    # GLITCH-2 FIX: field adalah 'verify_msg', bukan 'verify_message'
+    print(f"  execute -> ok={re_a.get('ok')} | status={re_a.get('status')} | {re_a.get('verify_msg', re_a.get('error', ''))}")
     if not re_a.get("ok") or re_a.get("status") != "verified":
         fail(f"Execute op-A gagal: {re_a}")
     ok("Migration sukses, status: verified")
@@ -121,7 +123,8 @@ def main():
     })
     re_c = api("POST", "/execute_operation", {"operation_id": op_id_c})
     print(f"  execute -> ok={re_c.get('ok')} | status={re_c.get('status')}")
-    print(f"  error   -> {str(re_c.get('error', re_c.get('exec_error', '')))[:80]}")
+    # GLITCH-2 FIX: field adalah 'error', bukan 'exec_error'
+    print(f"  error   -> {str(re_c.get('error', ''))[:80]}")
     if re_c.get("ok") is not False:
         fail("Seharusnya gagal karena SQL rusak!")
     if re_c.get("status") not in ("rolled_back", "failed"):

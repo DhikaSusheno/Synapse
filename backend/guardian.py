@@ -1,5 +1,6 @@
 """
 guardian.py - BE-1 DhikaSusheno + fix BUG-01..BUG-04 oleh Masrendra
+                 + fix BUG-A..BUG-E + GLITCH-5 oleh DhikaSusheno
 Tanggung jawab:
   - propose_operation()     : klasifikasi risiko + conflict check + plan rollback
   - execute_operation()     : snapshot -> jalankan -> verifikasi -> auto-rollback
@@ -10,23 +11,33 @@ Bug fixes (dari security/TEST_SCENARIOS.md Bug Findings Log):
   BUG-01 [CRITICAL] execute_operation bypass approval via direct DB manipulation
          FIX: re-derive requires_approval dari RULE ENGINE (tool_name yang immutable),
               BUKAN dari kolom requires_approval di DB yang bisa di-inject attacker.
-              Attacker tidak bisa bypass hanya dengan mengubah integer kolom DB.
 
   BUG-02 [HIGH] _do_rollback hardcoded ke DB_PATH, bukan ke target DB dari params
-         FIX: rollback_command sekarang menyimpan "restore_from:<bak>:<target_db>"
-              sehingga restore ke file yang benar.
+         FIX: rollback_command sekarang menyimpan JSON {"bak": ..., "target": ...}
+              sehingga restore ke file yang benar bahkan di Windows path.
 
   BUG-03 [HIGH] rollback db.run_migration restore seluruh file DB - operasi
          verified lain yang dibuat SETELAH snapshot ikut terhapus.
-         FIX: snapshot hanya berlaku per-operasi. Rollback hanya membalik
-              perubahan yang dibuat oleh operasi itu sendiri menggunakan
-              SQLite ROLLBACK-SQL yang disimpan di snapshot_ref,
-              bukan replace seluruh file DB.
+         FIX: snapshot hanya berlaku per-operasi.
 
   BUG-04 [MEDIUM] _make_snapshot dipanggil terlalu awal di propose()
-         FIX: snapshot dipindahkan ke execute_operation() tepat sebelum eksekusi,
-              bukan di propose(). propose() hanya menyusun rencana snapshot
-              (snapshot_strategy string), tidak mengeksekusinya.
+         FIX: snapshot dipindahkan ke execute_operation() tepat sebelum eksekusi.
+
+  BUG-A [HIGH] _do_rollback() gagal pada Windows path dengan drive letter (colon)
+         FIX: rollback_command sekarang JSON {"bak": "...", "target": "..."},
+              tidak ada ambiguitas split pada C:\path.
+
+  BUG-B [HIGH] _exec_migration() pakai executescript() yang auto-commit
+         FIX: explicit transaction BEGIN/COMMIT/ROLLBACK per statement.
+
+  BUG-D [LOW]  list_pending_approvals() bocorkan operasi 'approved' ke pending list
+         FIX: WHERE status = 'pending' (exact, bukan IN ('pending','approved')).
+
+  BUG-E [LOW]  asyncio.get_event_loop() deprecated Python 3.10+
+         FIX: di main.py on_startup() ganti ke asyncio.get_running_loop().
+
+  GLITCH-5 [MEDIUM] _exec_file_delete() tidak validasi snapshot integrity
+         FIX: cek bak.exists() dan bak.stat().st_size > 0 sebelum hapus original.
 """
 
 import json
@@ -181,11 +192,10 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
     BUG-04 FIX: eksekusi snapshot NYATA dilakukan di sini,
     dipanggil dari execute_operation() tepat sebelum eksekusi.
 
-    BUG-03 FIX: untuk db.run_migration, snapshot berupa file .bak
-    di lokasi yang sama dengan target DB (bukan DB_PATH global).
+    BUG-A FIX: rollback_command disimpan sebagai JSON {"bak": ..., "target": ...}
+    sehingga tidak ada ambiguitas split pada Windows path dengan drive letter.
 
-    Return (snapshot_ref, rollback_command)
-    rollback_command format: "restore_from:<bak_path>:<target_path>"
+    Return (snapshot_ref, rollback_command_json)
     """
     if tool_name.startswith("db.run_migration"):
         # BUG-02 + BUG-03 FIX: gunakan db_path dari params, bukan DB_PATH global
@@ -194,8 +204,9 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
         bak = f"{db_target}.bak.{ts}"
         try:
             shutil.copy2(db_target, bak)
-            # Format: restore_from:<bak>:<target> - target eksplisit
-            return bak, f"restore_from:{bak}:{db_target}"
+            # BUG-A FIX: JSON format, tidak ada ambiguitas colon di Windows path
+            rollback_cmd = json.dumps({"bak": bak, "target": db_target})
+            return bak, rollback_cmd
         except Exception:
             return None, None
 
@@ -206,7 +217,8 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
             bak = f"{file_path}.bak.{ts}"
             try:
                 shutil.copy2(file_path, bak)
-                return bak, f"restore_from:{bak}:{file_path}"
+                rollback_cmd = json.dumps({"bak": bak, "target": file_path})
+                return bak, rollback_cmd
             except Exception:
                 pass
 
@@ -217,7 +229,8 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
             bak = f"{file_path}.bak.{ts}"
             try:
                 shutil.copy2(file_path, bak)
-                return bak, f"restore_from:{bak}:{file_path}"
+                rollback_cmd = json.dumps({"bak": bak, "target": file_path})
+                return bak, rollback_cmd
             except Exception:
                 pass
 
@@ -226,18 +239,31 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
 
 def _do_rollback(rollback_command: str | None) -> bool:
     """
-    BUG-02 FIX: rollback ke target_path yang disimpan di rollback_command,
-    bukan hardcoded ke DB_PATH global.
+    BUG-A FIX: rollback_command sekarang JSON {"bak": "...", "target": "..."}.
+    Tidak ada lagi ambiguitas split pada Windows path (C:\\path punya colon).
 
-    Format rollback_command: "restore_from:<bak_path>:<target_path>"
+    Backward compat: jika format lama "restore_from:<bak>:<target>" masih ada
+    di DB (dari commit sebelumnya), fallback ke split lama.
     """
     if not rollback_command:
         return False
+
+    # Format baru: JSON
+    try:
+        data = json.loads(rollback_command)
+        if isinstance(data, dict) and "bak" in data and "target" in data:
+            try:
+                shutil.copy2(data["bak"], data["target"])
+                return True
+            except Exception:
+                return False
+    except (json.JSONDecodeError, ValueError):
+        pass  # bukan JSON, coba format lama
+
+    # Format lama (backward compat): "restore_from:<bak_path>:<target_path>"
     if rollback_command.startswith("restore_from:"):
         parts = rollback_command.split(":", 2)
-        # parts[0]="restore_from", parts[1]=bak_path, parts[2]=target_path
         if len(parts) < 3:
-            # Format lama (sebelum fix) - fallback ke DB_PATH
             bak_path = parts[1]
             target_path = _db_path()
         else:
@@ -248,6 +274,7 @@ def _do_rollback(rollback_command: str | None) -> bool:
             return True
         except Exception:
             return False
+
     return False
 
 
@@ -569,18 +596,33 @@ def execute_operation(operation_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _exec_migration(params: dict) -> tuple[bool, str]:
+    """
+    BUG-B FIX: ganti executescript() (auto-commit tiap statement) ke
+    explicit transaction dengan execute() per statement.
+    Jika salah satu statement gagal, ROLLBACK dilakukan dan snapshot masih valid.
+    """
     sql = params.get("sql", "")
     db_path = params.get("db_path", _db_path())
     if not sql:
         return False, "Tidak ada SQL di params['sql']"
     try:
         conn = sqlite3.connect(db_path)
-        conn.executescript(sql)
-        conn.commit()
-        conn.close()
-        return True, f"Migration berhasil: {sql[:80]}"
+        conn.isolation_level = None  # autocommit off, kita kelola sendiri
+        conn.execute("BEGIN")
+        try:
+            for statement in sql.split(";"):
+                stmt = statement.strip()
+                if stmt:
+                    conn.execute(stmt)
+            conn.execute("COMMIT")
+            conn.close()
+            return True, f"Migration berhasil: {sql[:80]}"
+        except Exception as e:
+            conn.execute("ROLLBACK")
+            conn.close()
+            return False, f"Migration gagal: {e}"
     except Exception as e:
-        return False, f"Migration gagal: {e}"
+        return False, f"Migration gagal (koneksi): {e}"
 
 
 def _exec_config_write(params: dict) -> tuple[bool, str]:
@@ -596,11 +638,20 @@ def _exec_config_write(params: dict) -> tuple[bool, str]:
 
 
 def _exec_file_delete(params: dict, snapshot_ref: str | None) -> tuple[bool, str]:
+    """
+    GLITCH-5 FIX: validasi snapshot benar-benar ada dan ukurannya > 0
+    sebelum menghapus file original. Mencegah data loss permanen jika
+    .bak korup atau disk penuh saat snapshot.
+    """
     file_path = params.get("file_path", "")
     if not file_path:
         return False, "params['file_path'] tidak ada"
     if not snapshot_ref:
         return False, "Tidak ada snapshot - file delete dibatalkan (fail-safe)"
+    # GLITCH-5 FIX: pastikan file .bak benar-benar ada dan tidak kosong
+    bak = Path(snapshot_ref)
+    if not bak.exists() or bak.stat().st_size == 0:
+        return False, f"Snapshot tidak valid atau kosong: {snapshot_ref} — file delete dibatalkan"
     try:
         Path(file_path).unlink()
         return True, f"File {file_path} dihapus"
@@ -613,6 +664,12 @@ def _exec_file_delete(params: dict, snapshot_ref: str | None) -> tuple[bool, str
 # ---------------------------------------------------------------------------
 
 def list_pending_approvals() -> dict:
+    """
+    BUG-D FIX: hanya kembalikan operasi dengan status 'pending' (belum diputuskan).
+    Sebelumnya WHERE status IN ('pending','approved') menyebabkan operasi yang
+    sudah diapprove ikut tampil di pending list — membingungkan dan berpotensi
+    double-approval dari UI.
+    """
     conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -620,7 +677,7 @@ def list_pending_approvals() -> dict:
            FROM operations o
            LEFT JOIN approvals a ON a.operation_id = o.id
            WHERE o.requires_approval = 1
-             AND o.status IN ('pending', 'approved')
+             AND o.status = 'pending'
            ORDER BY o.created_at DESC"""
     ).fetchall()
     conn.close()
