@@ -45,6 +45,7 @@ from pydantic import BaseModel
 import sqlite3
 
 from database import init_db, DB_PATH
+import storage
 import cortex
 import guardian
 
@@ -69,6 +70,11 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup():
     init_db()
+    # Skema v2 (storage.py) -> file TERPISA synapse_v2.db, bukan synapse.db.
+    # Tetap di-init di startup supaya tabel entities/relations/actions/decisions/
+    # audit_log selalu ada; kalau tidak, pemakai pertama akan kena
+    # "no such table: entities" saat runtime.
+    storage.init_db()
     # BUG-08 FIX: set event loop reference di cortex agar _emit() thread-safe
     # (Guardian endpoint adalah sync, dipanggil dari threadpool — perlu call_soon_threadsafe)
     # BUG-E FIX: get_running_loop() adalah cara yang benar dalam async context (Python 3.7+)

@@ -5,3 +5,4 @@ tree-sitter-languages==1.10.2
 networkx==3.3
 aiofiles==23.2.1
 python-multipart==0.0.9
+PyYAML==6.0.1
