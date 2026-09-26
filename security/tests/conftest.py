@@ -2,20 +2,20 @@
 conftest.py — shared fixtures untuk semua test QC-1 (pidpid35)
 
 Strategi:
-- Semua test pakai DB SQLite in-memory (:memory:) via monkeypatching database.DB_PATH
-  agar tidak mencemari synapse.db yang sedang berjalan.
-- guardian di-import setelah DB di-patch supaya setiap test mulai dari state bersih.
+- Semua test pakai DB SQLite file sementara via tmp_path pytest.
+- TEST-BUG-3 FIX: gunakan monkeypatch pytest untuk patch DB_PATH agar
+  thread-safe dan otomatis di-restore setelah setiap test.
 """
 import sqlite3
 import sys
-import os
 import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
 # Pastikan folder backend ada di path
 BACKEND_DIR = Path(__file__).resolve().parents[2] / "backend"
-sys.path.insert(0, str(BACKEND_DIR))
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 
 # ---------------------------------------------------------------------------
@@ -71,9 +71,7 @@ CREATE TABLE IF NOT EXISTS approvals (
 @pytest.fixture()
 def mem_db(tmp_path):
     """
-    Buat SQLite file sementara di tmp_path, jalankan DDL,
-    dan patch database.DB_PATH + semua sqlite3.connect di guardian
-    agar menunjuk ke file tersebut.
+    Buat SQLite file sementara di tmp_path, jalankan DDL.
     Return path file DB (pathlib.Path).
     """
     db_file = tmp_path / "test_synapse.db"
@@ -85,25 +83,21 @@ def mem_db(tmp_path):
 
 
 @pytest.fixture()
-def guardian_module(mem_db):
+def guardian_module(mem_db, monkeypatch):
     """
-    Import guardian dengan DB_PATH di-patch ke mem_db.
-    Setiap test dapat modul yang bersih.
+    TEST-BUG-3 FIX: gunakan monkeypatch pytest untuk patch DB_PATH.
+    monkeypatch otomatis di-restore setelah setiap test, thread-safe,
+    dan tidak bergantung pada Python module caching behavior.
     """
-    # Patch sebelum import supaya guardian.DB_PATH ikut terupdate
-    import database as db_mod
-    original_path = db_mod.DB_PATH
-    db_mod.DB_PATH = mem_db
-
-    # Reload guardian agar _emit tidak memanggil queue asli
     import importlib
+    import database as db_mod
     import guardian as g
-    # Patch _emit agar tidak butuh SSE queue
-    g._emit = MagicMock()
+
+    # monkeypatch.setattr otomatis di-restore setelah test selesai
+    monkeypatch.setattr(db_mod, "DB_PATH", mem_db)
+
+    # Reload guardian agar _db_path() langsung pakai DB_PATH yang sudah di-patch
     importlib.reload(g)
     g._emit = MagicMock()
 
     yield g
-
-    # Teardown
-    db_mod.DB_PATH = original_path

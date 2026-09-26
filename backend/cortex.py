@@ -13,6 +13,7 @@ import json
 import uuid
 import sqlite3
 import re
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -24,6 +25,11 @@ from database import DB_PATH
 # In-memory graph (networkx)
 # ---------------------------------------------------------------------------
 
+# BUG-C FIX: _graph_lock melindungi akses concurrent ke _graph.
+# FastAPI menjalankan sync endpoint di threadpool — tanpa lock, assign
+# _graph = new_graph di satu thread bisa terjadi saat thread lain sedang
+# iterasi _graph.nodes → RuntimeError atau hasil yang korup.
+_graph_lock: threading.Lock = threading.Lock()
 _graph: nx.DiGraph = nx.DiGraph()
 
 
@@ -43,6 +49,12 @@ def _rebuild_graph() -> nx.DiGraph:
                    confidence=row["confidence"])
     conn.close()
     return g
+
+
+def _get_graph() -> nx.DiGraph:
+    """BUG-C FIX: Ambil referensi lokal _graph dengan aman via lock."""
+    with _graph_lock:
+        return _graph
 
 
 # ---------------------------------------------------------------------------
@@ -110,16 +122,12 @@ def _emit(event_type: str, data: dict) -> None:
     """
     BUG-08 FIX: thread-safe emit.
     Bisa dipanggil dari sync thread (Guardian) maupun async context.
-    - Jika ada event loop running: gunakan call_soon_threadsafe() agar queue
-      di-update dari loop thread yang benar, bukan dari sync worker thread.
-    - Jika tidak ada loop (unit test / startup): fallback ke put_nowait() langsung.
     """
     payload = json.dumps({"event": event_type, "data": data})
     dead = []
-    for q in list(_sse_subscribers):  # copy list agar aman dari concurrent remove
+    for q in list(_sse_subscribers):
         try:
             if _event_loop is not None and _event_loop.is_running():
-                # Panggil dari sync thread ke event loop thread dengan aman
                 _event_loop.call_soon_threadsafe(q.put_nowait, payload)
             else:
                 q.put_nowait(payload)
@@ -168,7 +176,6 @@ def understand_repo(repo_path: str) -> dict:
     graph_diff: list[dict] = []
     documented_files: set[str] = set()
 
-    # Pass 1: file kode
     for fpath in root.rglob("*"):
         if not fpath.is_file():
             continue
@@ -249,8 +256,11 @@ def understand_repo(repo_path: str) -> dict:
     conn.commit()
     conn.close()
 
+    # BUG-C FIX: rebuild di luar lock, assign atomik dengan lock
+    new_graph = _rebuild_graph()
     global _graph
-    _graph = _rebuild_graph()
+    with _graph_lock:
+        _graph = new_graph
 
     _emit("graph_update", {
         "repo": repo_path,
@@ -259,20 +269,19 @@ def understand_repo(repo_path: str) -> dict:
         "ingested_at": datetime.utcnow().isoformat(),
     })
 
+    g = _get_graph()
     return {
         "ok": True,
         "repo": repo_path,
         "stats": stats,
-        "node_count": len(_graph.nodes),
-        "edge_count": len(_graph.edges),
+        "node_count": len(g.nodes),
+        "edge_count": len(g.edges),
         "ingested_at": datetime.utcnow().isoformat(),
     }
 
 
 def _parse_ast(fpath: Path, lang: str, src: str = "") -> list[dict]:
-    """
-    Parse file kode + hitung complexity score per fungsi.
-    """
+    """Parse file kode + hitung complexity score per fungsi."""
     symbols: list[dict] = []
 
     try:
@@ -397,15 +406,15 @@ def _link_doc_to_code(conn, doc_id, content, root, documented_files: set) -> int
 def explain_topic(topic: str) -> dict:
     """
     Cari entitas di graph, baca snippet, return penjelasan.
-    Tambahan unik:
-      - Relevance scoring per node hasil pencarian
-      - Sertakan "callers" (siapa yang memanggil entitas ini)
-      - Sertakan "how_to_use" yang diinfer dari graph
-      - Tampilkan complexity note
     """
-    global _graph
-    if len(_graph.nodes) == 0:
-        _graph = _rebuild_graph()
+    # BUG-C FIX: ambil referensi lokal via _get_graph() — thread-safe
+    g = _get_graph()
+    if len(g.nodes) == 0:
+        new_graph = _rebuild_graph()
+        global _graph
+        with _graph_lock:
+            _graph = new_graph
+        g = new_graph
 
     topic_lower = topic.lower()
     conn = sqlite3.connect(DB_PATH)
@@ -435,21 +444,21 @@ def explain_topic(topic: str) -> dict:
 
     related: list[dict] = []
     callers: list[dict] = []
-    if primary["id"] in _graph:
-        for nb_id in list(_graph.successors(primary["id"])):
-            if nb_id in _graph.nodes:
-                nd = _graph.nodes[nb_id]
-                ed = _graph.get_edge_data(primary["id"], nb_id) or {}
+    if primary["id"] in g:
+        for nb_id in list(g.successors(primary["id"])):
+            if nb_id in g.nodes:
+                nd = g.nodes[nb_id]
+                ed = g.get_edge_data(primary["id"], nb_id) or {}
                 related.append({
                     "id": nb_id, "name": nd.get("name", nb_id),
                     "type": nd.get("type", "unknown"),
                     "relationship": ed.get("relationship", ""),
                     "direction": "outgoing",
                 })
-        for nb_id in list(_graph.predecessors(primary["id"])):
-            if nb_id in _graph.nodes:
-                nd = _graph.nodes[nb_id]
-                ed = _graph.get_edge_data(nb_id, primary["id"]) or {}
+        for nb_id in list(g.predecessors(primary["id"])):
+            if nb_id in g.nodes:
+                nd = g.nodes[nb_id]
+                ed = g.get_edge_data(nb_id, primary["id"]) or {}
                 entry = {
                     "id": nb_id, "name": nd.get("name", nb_id),
                     "type": nd.get("type", "unknown"),
@@ -492,9 +501,9 @@ def explain_topic(topic: str) -> dict:
 
     cx = meta.get("complexity", None)
     complexity_note = (
-        f"⚠️ Complexity tinggi ({cx}) — kandidat refactor." if cx and cx >= 10 else
-        f"⚡ Complexity sedang ({cx})." if cx and cx >= 5 else
-        f"✅ Complexity rendah ({cx})." if cx else ""
+        f"\u26a0\ufe0f Complexity tinggi ({cx}) \u2014 kandidat refactor." if cx and cx >= 10 else
+        f"\u26a1 Complexity sedang ({cx})." if cx and cx >= 5 else
+        f"\u2705 Complexity rendah ({cx})." if cx else ""
     )
 
     return {
@@ -524,16 +533,15 @@ def explain_topic(topic: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def review_artifact(path_or_diff: str) -> dict:
-    """
-    Scoring artifact 4 dimensi.
-    Tambahan unik:
-      - Deteksi apakah ini git diff (baris +/-)
-      - Hitung churn (added vs removed lines)
-      - Pattern-based risk detection (bukan hanya keyword)
-    """
-    global _graph
-    if len(_graph.nodes) == 0:
-        _graph = _rebuild_graph()
+    """Scoring artifact 4 dimensi."""
+    # BUG-C FIX: gunakan referensi lokal
+    g = _get_graph()
+    if len(g.nodes) == 0:
+        new_graph = _rebuild_graph()
+        global _graph
+        with _graph_lock:
+            _graph = new_graph
+        g = new_graph
 
     content = ""
     is_file = Path(path_or_diff).exists()
@@ -555,33 +563,29 @@ def review_artifact(path_or_diff: str) -> dict:
     effective_lines = added_lines if is_diff else lines
     total_lines = len(effective_lines)
 
-    # 1. Completeness
     incomplete_markers = sum(
         1 for l in effective_lines
         if any(m in l.upper() for m in ["TODO", "FIXME", "HACK", "XXX", "PASS ", "..."])
     )
     completeness = max(0.0, 1.0 - (incomplete_markers / max(total_lines, 1)) * 10)
 
-    # 2. Clarity
     avg_len = sum(len(l.lstrip("+-")) for l in effective_lines) / max(total_lines, 1)
     clarity = 1.0 if avg_len < 80 else max(0.3, 1.0 - (avg_len - 80) / 200)
 
-    # 3. Correctness vs spec
     graph_names = {
         data.get("name", "").lower()
-        for _, data in _graph.nodes(data=True)
+        for _, data in g.nodes(data=True)
     }
     referenced = sum(1 for name in graph_names if name and name in content.lower())
     correctness = min(1.0, 0.5 + referenced * 0.1)
 
-    # 4. Risk — pattern spesifik
     risk_patterns = [
         (r"drop\s+table", "DROP TABLE terdeteksi"),
         (r"delete\s+from\s+\w+\s*;", "DELETE tanpa WHERE"),
         (r"rm\s+-rf", "rm -rf terdeteksi"),
         (r"os\.remove|shutil\.rmtree", "File delete terdeteksi"),
         (r"subprocess\.call|subprocess\.run", "Subprocess execution"),
-        (r"\beval\s*\(", "eval() — potensi code injection"),
+        (r"\beval\s*\(", "eval() \u2014 potensi code injection"),
         (r"password\s*=\s*['\"][^'\"]+['\"]", "Hardcoded password"),
         (r"secret\s*=\s*['\"][^'\"]+['\"]", "Hardcoded secret"),
         (r"ALTER\s+TABLE", "ALTER TABLE terdeteksi"),
@@ -635,18 +639,15 @@ def review_artifact(path_or_diff: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def repo_health() -> dict:
-    """
-    Laporan kesehatan repo:
-      - Coverage dokumentasi (% file punya edge DOCUMENTS)
-      - Dead code candidates (simbol tanpa incoming edge)
-      - High complexity symbols (complexity >= 10)
-      - Isolated nodes
-      - Hub nodes (node dengan koneksi terbanyak)
-      - Health score 0-100
-    """
-    global _graph
-    if len(_graph.nodes) == 0:
-        _graph = _rebuild_graph()
+    """Laporan kesehatan repo."""
+    # BUG-C FIX: gunakan referensi lokal
+    g = _get_graph()
+    if len(g.nodes) == 0:
+        new_graph = _rebuild_graph()
+        global _graph
+        with _graph_lock:
+            _graph = new_graph
+        g = new_graph
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -673,7 +674,7 @@ def repo_health() -> dict:
         meta = json.loads(sym["meta_json"] or "{}")
         if meta.get("kind") == "import":
             continue
-        in_degree = _graph.in_degree(sym["id"]) if sym["id"] in _graph else 0
+        in_degree = g.in_degree(sym["id"]) if sym["id"] in g else 0
         if in_degree == 0:
             dead_candidates.append({
                 "id": sym["id"], "name": sym["name"],
@@ -696,18 +697,18 @@ def repo_health() -> dict:
     high_cx.sort(key=lambda x: x["complexity"], reverse=True)
 
     isolated = [
-        {"id": n, "name": _graph.nodes[n].get("name", n),
-         "type": _graph.nodes[n].get("type", "")}
-        for n in nx.isolates(_graph)
-        if _graph.nodes[n].get("type") not in ("import",)
+        {"id": n, "name": g.nodes[n].get("name", n),
+         "type": g.nodes[n].get("type", "")}
+        for n in nx.isolates(g)
+        if g.nodes[n].get("type") not in ("import",)
     ]
 
     hub_nodes = sorted(
         [
-            {"id": n, "name": _graph.nodes[n].get("name", n),
-             "type": _graph.nodes[n].get("type", ""),
-             "degree": _graph.degree(n)}
-            for n in _graph.nodes
+            {"id": n, "name": g.nodes[n].get("name", n),
+             "type": g.nodes[n].get("type", ""),
+             "degree": g.degree(n)}
+            for n in g.nodes
         ],
         key=lambda x: x["degree"], reverse=True
     )[:5]
@@ -722,8 +723,8 @@ def repo_health() -> dict:
     )
 
     summary = (
-        f"{'🟢 Sehat' if health_score >= 80 else '🟡 Perlu perhatian' if health_score >= 60 else '🔴 Butuh perbaikan'}"
-        f" — Skor {health_score}/100. Dokumentasi {doc_coverage}%, "
+        f"{'\U0001f7e2 Sehat' if health_score >= 80 else '\U0001f7e1 Perlu perhatian' if health_score >= 60 else '\U0001f534 Butuh perbaikan'}"
+        f" \u2014 Skor {health_score}/100. Dokumentasi {doc_coverage}%, "
         f"{len(dead_candidates)} kandidat dead code, {len(high_cx)} fungsi kompleks."
     )
 
@@ -754,13 +755,15 @@ def repo_health() -> dict:
 # ---------------------------------------------------------------------------
 
 def find_path(from_node_name: str, to_node_name: str) -> dict:
-    """
-    Cari jalur terpendek antara dua entitas di knowledge graph.
-    Menjawab: 'bagaimana A mempengaruhi B?'
-    """
-    global _graph
-    if len(_graph.nodes) == 0:
-        _graph = _rebuild_graph()
+    """Cari jalur terpendek antara dua entitas di knowledge graph."""
+    # BUG-C FIX: gunakan referensi lokal
+    g = _get_graph()
+    if len(g.nodes) == 0:
+        new_graph = _rebuild_graph()
+        global _graph
+        with _graph_lock:
+            _graph = new_graph
+        g = new_graph
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -782,17 +785,17 @@ def find_path(from_node_name: str, to_node_name: str) -> dict:
         return {"ok": False, "error": f"Node '{to_node_name}' tidak ditemukan"}
 
     try:
-        path_ids = nx.shortest_path(_graph, source=from_id, target=to_id)
+        path_ids = nx.shortest_path(g, source=from_id, target=to_id)
         path_nodes = [
-            {"id": nid, "name": _graph.nodes[nid].get("name", nid),
-             "type": _graph.nodes[nid].get("type", "")}
+            {"id": nid, "name": g.nodes[nid].get("name", nid),
+             "type": g.nodes[nid].get("type", "")}
             for nid in path_ids
         ]
         edges_in_path = [
             {
-                "from": _graph.nodes[path_ids[i]].get("name", path_ids[i]),
-                "to": _graph.nodes[path_ids[i + 1]].get("name", path_ids[i + 1]),
-                "relationship": (_graph.get_edge_data(
+                "from": g.nodes[path_ids[i]].get("name", path_ids[i]),
+                "to": g.nodes[path_ids[i + 1]].get("name", path_ids[i + 1]),
+                "relationship": (g.get_edge_data(
                     path_ids[i], path_ids[i + 1]) or {}).get("relationship", "->"),
             }
             for i in range(len(path_ids) - 1)
@@ -815,10 +818,7 @@ def find_path(from_node_name: str, to_node_name: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def complexity_report(top_n: int = 10) -> dict:
-    """
-    Ranking N fungsi dengan complexity score tertinggi.
-    Berguna untuk menentukan prioritas refactor.
-    """
+    """Ranking N fungsi dengan complexity score tertinggi."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -862,17 +862,15 @@ def complexity_report(top_n: int = 10) -> dict:
 # ---------------------------------------------------------------------------
 
 def suggest_refactor(node_name: str) -> dict:
-    """
-    Saran refactor berbasis graph:
-      - Complexity terlalu tinggi → split function
-      - Degree terlalu banyak → God Object
-      - Lines terlalu panjang → split file
-      - Tidak ada dokumentasi → tambah docstring
-      - Tidak ada caller → dead code
-    """
-    global _graph
-    if len(_graph.nodes) == 0:
-        _graph = _rebuild_graph()
+    """Saran refactor berbasis graph."""
+    # BUG-C FIX: gunakan referensi lokal
+    g = _get_graph()
+    if len(g.nodes) == 0:
+        new_graph = _rebuild_graph()
+        global _graph
+        with _graph_lock:
+            _graph = new_graph
+        g = new_graph
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -889,13 +887,13 @@ def suggest_refactor(node_name: str) -> dict:
     node_id = row["id"]
     cx = meta.get("complexity", 1)
     lines = meta.get("lines", 0)
-    degree = _graph.degree(node_id) if node_id in _graph else 0
-    in_deg = _graph.in_degree(node_id) if node_id in _graph else 0
-    out_deg = _graph.out_degree(node_id) if node_id in _graph else 0
+    degree = g.degree(node_id) if node_id in g else 0
+    in_deg = g.in_degree(node_id) if node_id in g else 0
+    out_deg = g.out_degree(node_id) if node_id in g else 0
 
     has_doc = any(
-        (_graph.get_edge_data(pred, node_id) or {}).get("relationship") == "DOCUMENTS"
-        for pred in _graph.predecessors(node_id)
+        (g.get_edge_data(pred, node_id) or {}).get("relationship") == "DOCUMENTS"
+        for pred in g.predecessors(node_id)
     )
 
     suggestions = []
@@ -920,14 +918,14 @@ def suggest_refactor(node_name: str) -> dict:
     if lines >= 100:
         suggestions.append({
             "type": "split_file_or_function", "priority": "high",
-            "message": f"Fungsi ini {lines} baris — terlalu panjang. Idealnya < 50 baris.",
+            "message": f"Fungsi ini {lines} baris \u2014 terlalu panjang. Idealnya < 50 baris.",
         })
 
     if degree >= 15:
         suggestions.append({
             "type": "god_object", "priority": "high",
             "message": (
-                f"Node ini punya {degree} koneksi — kemungkinan 'God Object'. "
+                f"Node ini punya {degree} koneksi \u2014 kemungkinan 'God Object'. "
                 f"Pecah menjadi modul lebih kecil."
             ),
         })
@@ -941,13 +939,13 @@ def suggest_refactor(node_name: str) -> dict:
     if in_deg == 0 and row["type"] == "symbol" and meta.get("kind") == "function":
         suggestions.append({
             "type": "dead_code", "priority": "medium",
-            "message": "Tidak ada caller di graph — kemungkinan dead code. Pertimbangkan dihapus.",
+            "message": "Tidak ada caller di graph \u2014 kemungkinan dead code. Pertimbangkan dihapus.",
         })
 
     if not suggestions:
         suggestions.append({
             "type": "no_action", "priority": "low",
-            "message": "Entitas ini sehat — tidak ada saran refactor.",
+            "message": "Entitas ini sehat \u2014 tidak ada saran refactor.",
         })
 
     _emit("refactor_suggestion", {

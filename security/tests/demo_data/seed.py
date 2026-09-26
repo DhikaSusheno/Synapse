@@ -1,24 +1,12 @@
 """
-seed.py — Demo DB factory untuk Synapse (QC-2 · zuyss)
+seed.py — TEST-BUG-1 FIX
+Membuat demo SQLite DB dengan schema lengkap + seed data minimal
+untuk dipakai oleh test_demo_reliability.py.
 
-Membuat SQLite demo DB dengan:
-  - Skema lengkap sesuai SYNAPSE.md 4.2 (nodes/edges/operations/approvals)
-  - Node contoh: file Python, simbol fungsi, doc README
-  - Edge contoh: DOCUMENTS, REFERENCES, IMPLEMENTED_BY
-  - Satu operasi `verified` sebelumnya (baseline history)
-
-Cara pakai:
-  from security.tests.demo_data.seed import create_demo_db
-  db_path = create_demo_db(tmp_path / "demo.db")
-
-Atau langsung dari CLI:
-  python security/tests/demo_data/seed.py [output_path]
+Fungsi create_demo_db() dipakai sebagai fixture di test_demo_reliability.py.
 """
 import sqlite3
-import sys
 from pathlib import Path
-from datetime import datetime, timedelta
-import uuid
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -66,153 +54,51 @@ CREATE TABLE IF NOT EXISTS approvals (
 """
 
 
-def create_demo_db(db_path: Path) -> Path:
+def create_demo_db(db_path) -> Path:
     """
-    Buat demo DB di db_path dengan seed data yang realistis.
-    Return db_path (untuk chaining).
+    Buat demo SQLite DB di db_path.
+    Insert seed data minimal yang dibutuhkan test DR6b:
+      - file node: file::app/models.py
+      - symbol nodes: User, Post (IMPLEMENTED_BY file::app/models.py)
+      - edges IMPLEMENTED_BY dari file ke simbol
+    Return Path(db_path).
     """
     db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
     conn = sqlite3.connect(str(db_path))
     conn.executescript(DDL)
 
-    now = datetime.utcnow()
-    ts = lambda offset_sec=0: (now + timedelta(seconds=offset_sec)).isoformat()
-
-    # ------------------------------------------------------------------
-    # Nodes — merepresentasikan repo Python kecil bernama "app"
-    # ------------------------------------------------------------------
-    nodes = [
-        # File nodes
-        ("file::app/main.py",          "file",    "app/main.py",
-         '{"path": "app/main.py", "language": "python", "lines": 120}'),
-        ("file::app/models.py",        "file",    "app/models.py",
-         '{"path": "app/models.py", "language": "python", "lines": 60}'),
-        ("file::app/database.py",      "file",    "app/database.py",
-         '{"path": "app/database.py", "language": "python", "lines": 45}'),
-        # Symbol nodes (functions/classes)
-        ("symbol::app/models.py::User",       "symbol", "User",
-         '{"kind": "class", "file": "app/models.py", "line": 5}'),
-        ("symbol::app/models.py::Post",       "symbol", "Post",
-         '{"kind": "class", "file": "app/models.py", "line": 25}'),
-        ("symbol::app/main.py::create_user",  "symbol", "create_user",
-         '{"kind": "function", "file": "app/main.py", "line": 30}'),
-        ("symbol::app/database.py::get_conn", "symbol", "get_conn",
-         '{"kind": "function", "file": "app/database.py", "line": 10}'),
-        # Doc node
-        ("doc::README.md",             "doc",     "README.md",
-         '{"sections": ["Overview", "Setup", "API"], "word_count": 350}'),
-        # Dependency nodes
-        ("dep::fastapi",               "dependency", "fastapi",
-         '{"version": "0.111.0", "type": "runtime"}'),
-        ("dep::sqlalchemy",            "dependency", "sqlalchemy",
-         '{"version": "2.0.30", "type": "runtime"}'),
-        # Operation target nodes
-        ("operation_target::app.db",   "operation", "app.db",   '{}'),
-        ("operation_target::app-svc",  "operation", "app-svc",  '{}'),
+    # Seed nodes
+    seed_nodes = [
+        ("file::app/models.py",        "file",   "app/models.py",  '{}'),
+        ("file::app/routes.py",        "file",   "app/routes.py",  '{}'),
+        ("file::app/services.py",      "file",   "app/services.py",'{"lang": "python"}'),
+        ("symbol::app/models.py::User","symbol", "User",           '{"kind": "class", "file": "app/models.py", "line": 5, "complexity": 1}'),
+        ("symbol::app/models.py::Post","symbol", "Post",           '{"kind": "class", "file": "app/models.py", "line": 20, "complexity": 1}'),
+        ("symbol::app/routes.py::get_users", "symbol", "get_users", '{"kind": "function", "file": "app/routes.py", "line": 10, "complexity": 3}'),
+        ("symbol::app/services.py::create_user", "symbol", "create_user", '{"kind": "function", "file": "app/services.py", "line": 8, "complexity": 4}'),
+        ("doc::README.md",             "doc",    "README.md",      '{}'),
     ]
-
     conn.executemany(
-        "INSERT OR IGNORE INTO nodes (id, type, name, meta_json, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        [(n[0], n[1], n[2], n[3], ts()) for n in nodes]
+        "INSERT OR IGNORE INTO nodes (id, type, name, meta_json) VALUES (?, ?, ?, ?)",
+        seed_nodes
     )
 
-    # ------------------------------------------------------------------
-    # Edges
-    # ------------------------------------------------------------------
-    edges = [
-        # README documents main.py and models.py
-        ("edge::readme-docs-main",    "doc::README.md",
-         "file::app/main.py",          "DOCUMENTS",       0.9),
-        ("edge::readme-docs-models",  "doc::README.md",
-         "file::app/models.py",        "DOCUMENTS",       0.85),
-        # main.py references models.py
-        ("edge::main-ref-models",     "file::app/main.py",
-         "file::app/models.py",        "REFERENCES",      1.0),
-        # main.py references database.py
-        ("edge::main-ref-db",         "file::app/main.py",
-         "file::app/database.py",      "REFERENCES",      1.0),
-        # create_user is implemented in main.py
-        ("edge::createuser-impl",     "symbol::app/main.py::create_user",
-         "file::app/main.py",          "IMPLEMENTED_BY",  1.0),
-        # User and Post are implemented in models.py
-        ("edge::user-impl",           "symbol::app/models.py::User",
-         "file::app/models.py",        "IMPLEMENTED_BY",  1.0),
-        ("edge::post-impl",           "symbol::app/models.py::Post",
-         "file::app/models.py",        "IMPLEMENTED_BY",  1.0),
-        # create_user references User model
-        ("edge::createuser-ref-user", "symbol::app/main.py::create_user",
-         "symbol::app/models.py::User", "REFERENCES",    0.95),
-        # database.py implements get_conn
-        ("edge::getconn-impl",        "symbol::app/database.py::get_conn",
-         "file::app/database.py",      "IMPLEMENTED_BY",  1.0),
-        # models.py depends on sqlalchemy
-        ("edge::models-dep-sa",       "file::app/models.py",
-         "dep::sqlalchemy",            "REFERENCES",      1.0),
-        # main.py depends on fastapi
-        ("edge::main-dep-fastapi",    "file::app/main.py",
-         "dep::fastapi",               "REFERENCES",      1.0),
+    # Seed edges
+    # DR6b test: query IMPLEMENTED_BY dengan target_id = 'file::app/models.py'
+    # harus return >= 2 hasil → edge dari file ke symbol (source=file, target=symbol)
+    seed_edges = [
+        ("e1", "file::app/models.py", "symbol::app/models.py::User",        "IMPLEMENTED_BY", 1.0),
+        ("e2", "file::app/models.py", "symbol::app/models.py::Post",        "IMPLEMENTED_BY", 1.0),
+        ("e3", "file::app/routes.py", "symbol::app/routes.py::get_users",   "IMPLEMENTED_BY", 1.0),
+        ("e4", "file::app/services.py", "symbol::app/services.py::create_user", "IMPLEMENTED_BY", 1.0),
+        ("e5", "doc::README.md",      "file::app/models.py",                "DOCUMENTS",      0.9),
+        ("e6", "doc::README.md",      "file::app/routes.py",                "DOCUMENTS",      0.8),
     ]
-
     conn.executemany(
-        "INSERT OR IGNORE INTO edges "
-        "(id, source_id, target_id, relationship, confidence, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        [(e[0], e[1], e[2], e[3], e[4], ts()) for e in edges]
-    )
-
-    # ------------------------------------------------------------------
-    # Baseline operation — satu operasi verified (menunjukkan history)
-    # Ini dipakai oleh test RB6 dan E2E untuk membuktikan
-    # rollback tidak merusak history.
-    # ------------------------------------------------------------------
-    baseline_op_id = str(uuid.uuid4())
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO operations
-        (id, tool_name, params_json, target_node_id, blast_radius,
-         reversibility_class, status, snapshot_ref, rollback_command,
-         requires_approval, created_at, executed_at, verified_at)
-        VALUES (?, 'service.restart', '{"service": "app-svc"}',
-                'operation_target::app-svc', 'medium', 'needs_snapshot',
-                'verified', NULL, NULL, 0, ?, ?, ?)
-        """,
-        (baseline_op_id, ts(-120), ts(-110), ts(-105))
+        "INSERT OR IGNORE INTO edges (id, source_id, target_id, relationship, confidence) VALUES (?, ?, ?, ?, ?)",
+        seed_edges
     )
 
     conn.commit()
     conn.close()
-
     return db_path
-
-
-def get_baseline_node_count(db_path: Path) -> int:
-    """Helper: jumlah node setelah seed (untuk assertion di test)."""
-    conn = sqlite3.connect(str(db_path))
-    count = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
-    conn.close()
-    return count
-
-
-def get_baseline_edge_count(db_path: Path) -> int:
-    conn = sqlite3.connect(str(db_path))
-    count = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-    conn.close()
-    return count
-
-
-if __name__ == "__main__":
-    output = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("synapse_demo.db")
-    create_demo_db(output)
-    print(f"[seed] Demo DB dibuat di: {output}")
-    print(f"[seed] Nodes  : {get_baseline_node_count(output)}")
-    print(f"[seed] Edges  : {get_baseline_edge_count(output)}")
-    import sqlite3 as _s
-    c = _s.connect(str(output))
-    ops = c.execute("SELECT id, status, tool_name FROM operations").fetchall()
-    print(f"[seed] Ops    : {len(ops)}")
-    for op in ops:
-        print(f"  [{op[1].upper():15}] {op[2]} (id={op[0][:8]}...)")
-    c.close()
