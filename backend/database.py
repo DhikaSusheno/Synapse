@@ -1,23 +1,39 @@
 """
-database.py — SQLite setup & helpers (Synapse schema sesuai SYNAPSE.md 4.2)
+database.py — Skema storage Synapse LEGACY (v1) sesuai SYNAPSE.md 4.2.
+
+Skema v2 (entities / relations / actions / decisions / audit_log) ada di
+storage.py dan SENGAJA TIDAK digabung di sini:
+
+    modul         file DB          tabel
+    ------------   --------------   ------------------------------------------
+    database.py   synapse.db       nodes, edges, operations, approvals  (v1)
+    storage.py    synapse_v2.db    entities, relations, actions,
+                                   decisions, audit_log                 (v2)
+
+Kedua skema hidup berdampingan di file BERBEDA, jadi:
+  - init_db() di bawah hanya menyentuh tabel v1; cortex.py, guardian.py, dan
+    seluruh test suite tetap querying nodes/edges/operations/approvals apa adanya
+  - tidak ada FK atau INDEX silang antar skema
+  - v1 -> v2 adalah migrasi yang harus dijadwalkan eksplisit (nama tabel dan
+    kolom berubah, dan beberapa nilai status berubah: executing->running,
+    executed_unverified->done_unverified, rolled_back->reverted,
+    approvals.decision 'denied' -> decisions.result 'rejected')
+
+Override path v2 lewat env var SYNAPSE_DB_PATH (lihat storage.py).
 """
 import sqlite3
-import threading
 from pathlib import Path
 
 DB_PATH = Path("synapse.db")
 
-# Thread-local connection agar aman dipakai di async FastAPI
-_local = threading.local()
-
-
-def get_conn() -> sqlite3.Connection:
-    if not hasattr(_local, "conn") or _local.conn is None:
-        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _local.conn.row_factory = sqlite3.Row
-        _local.conn.execute("PRAGMA journal_mode=WAL")
-        _local.conn.execute("PRAGMA foreign_keys=ON")
-    return _local.conn
+# GLITCH-4: get_conn() (thread-local connection) DIHAPUS. Fungsi itu dead code
+# — tidak pernah dipanggil dari guardian.py maupun cortex.py, keduanya membuka
+# koneksi sendiri per unit kerja. Menghapusnya karena:
+#   - koneksi thread-local mengunci DB_PATH saat koneksi pertama dibuat, sehingga
+#     override database.DB_PATH di test (conftest.py, test_bugfix.py) jadi bocor
+#   - tidak ada connection.close(), jadi koneksi tidak pernah dilepas
+# Guardian memakai _db_path() yang membaca DB_PATH ulang tiap panggilan;
+# itulah yang membuat test override tetap bekerja.
 
 
 def init_db() -> None:
