@@ -1,5 +1,5 @@
 """
-main.py — Synapse MCP Server
+main.py - Synapse MCP Server
 BE-2 Masrendra: Cortex endpoints + SSE stream + fitur unik
 BE-1 DhikaSusheno: Guardian endpoints (propose_operation, execute_operation, approvals)
 
@@ -7,10 +7,10 @@ Jalankan: uvicorn main:app --reload
 Docs    : http://localhost:8000/docs
 
 Fitur unik BE-2 (Masrendra):
-  GET  /repo_health          — skor kesehatan repo: dead code, coverage, complexity
-  GET  /complexity_report    — ranking fungsi paling kompleks
-  POST /find_path            — jalur terpendek antar dua entitas di graph
-  POST /suggest_refactor     — saran refactor berbasis graph connectivity
+  GET  /repo_health          - skor kesehatan repo: dead code, coverage, complexity
+  GET  /complexity_report    - ranking fungsi paling kompleks
+  POST /find_path            - jalur terpendek antar dua entitas di graph
+  POST /suggest_refactor     - saran refactor berbasis graph connectivity
 """
 import asyncio
 import json
@@ -46,6 +46,8 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     init_db()
+    # Hubungkan SSE emit dari cortex ke guardian
+    guardian.set_emit(cortex._emit)
     print("[Synapse] Server ready. Visit http://localhost:8000/docs")
 
 
@@ -74,8 +76,24 @@ class SuggestRefactorRequest(BaseModel):
     node_name: str
 
 
+class ProposeOperationRequest(BaseModel):
+    tool_name: str
+    params: dict = {}
+    target: str
+
+
+class ExecuteOperationRequest(BaseModel):
+    operation_id: str
+
+
+class ApproveOperationRequest(BaseModel):
+    operation_id: str
+    decision: str  # 'approved' | 'denied'
+    note: str = ""
+
+
 # ---------------------------------------------------------------------------
-# CORTEX endpoints (BE-2 — Masrendra)
+# CORTEX endpoints (BE-2 - Masrendra)
 # ---------------------------------------------------------------------------
 
 @app.post("/understand_repo", tags=["Cortex"])
@@ -83,7 +101,7 @@ def understand_repo(req: UnderstandRepoRequest):
     """
     Ingest sebuah repo ke SQLite graph.
     - Parse AST via tree-sitter (file, fungsi, kelas, import)
-    - Baca file doc (README, .md, .txt) → edge DOCUMENTS ke kode
+    - Baca file doc (README, .md, .txt)  edge DOCUMENTS ke kode
     - Emit SSE 'graph_update' dengan semua node baru
     """
     result = cortex.understand_repo(req.repo_path)
@@ -96,7 +114,7 @@ def understand_repo(req: UnderstandRepoRequest):
 def explain_topic(req: ExplainTopicRequest):
     """
     Jawab pertanyaan tentang suatu topik/modul dari knowledge graph.
-    Return: definition → mental_model → example (snippet kode), related_nodes.
+    Return: definition  mental_model  example (snippet kode), related_nodes.
     """
     result = cortex.explain_topic(req.topic)
     if not result.get("ok"):
@@ -171,7 +189,90 @@ def suggest_refactor(req: SuggestRefactorRequest):
 
 
 # ---------------------------------------------------------------------------
-# SSE stream endpoint (BE-2 — dikonsumsi frontend live)
+# GUARDIAN endpoints (BE-1 - DhikaSusheno)
+# ---------------------------------------------------------------------------
+
+@app.post("/propose_operation", tags=["Guardian"])
+def propose_operation(req: ProposeOperationRequest):
+    """
+    🛡️ Guardian Step 1: Propose operasi berisiko.
+    - Klasifikasi blast_radius via rule table (SYNAPSE.md 4.4)
+    - Deteksi konflik: operasi lain yang menyentuh target sama dalam 15 menit terakhir
+    - Buat reversibility plan (snapshot strategy)
+    - Simpan ke DB dengan status 'pending'
+
+    Contoh (DB migration):
+      { "tool_name": "db.run_migration", "params": {"sql": "ALTER TABLE nodes ADD COLUMN tag TEXT"}, "target": "synapse.db" }
+    """
+    result = guardian.propose_operation(req.tool_name, req.params, req.target)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@app.post("/execute_operation", tags=["Guardian"])
+def execute_operation(req: ExecuteOperationRequest):
+    """
+    🚀 Guardian Step 2: Eksekusi operasi yang sudah diapprove.
+    - Ambil snapshot otomatis sebelum eksekusi
+    - Jalankan operasi
+    - Verifikasi post-conditions (invariants)
+    - Auto-rollback jika verifikasi gagal
+    - Emit SSE di setiap state transition
+
+    Status flow: pending → approved → executing → executed_unverified → verified
+                                                                       ↘ rolled_back (jika gagal)
+    """
+    result = guardian.execute_operation(req.operation_id)
+    return result
+
+
+@app.get("/list_pending_approvals", tags=["Guardian"])
+def list_pending_approvals():
+    """
+    📋 Daftar operasi yang menunggu approval manusia.
+    """
+    return guardian.list_pending_approvals()
+
+
+@app.post("/approve_operation", tags=["Guardian"])
+def approve_operation(req: ApproveOperationRequest):
+    """
+    ✅ Setujui atau tolak operasi yang sedang pending.
+    decision: 'approved' | 'denied'
+    """
+    result = guardian.approve_operation(req.operation_id, req.decision, req.note)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@app.get("/operations", tags=["Guardian"])
+def list_operations(status: str = None, limit: int = Query(default=20, ge=1, le=100)):
+    """
+    📜 Riwayat semua operasi. Filter by status opsional.
+    Status: pending | approved | executing | executed_unverified | verified | failed | rolled_back
+    """
+    import sqlite3
+    from database import DB_PATH
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM operations WHERE status=? ORDER BY created_at DESC LIMIT ?",
+            (status, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM operations ORDER BY created_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# SSE stream endpoint (BE-2 - dikonsumsi frontend live)
 # ---------------------------------------------------------------------------
 
 @app.get("/stream", tags=["SSE"])
@@ -179,9 +280,11 @@ async def stream_events():
     """
     Server-Sent Events stream.
     Frontend subscribe ke endpoint ini untuk menerima update real-time:
-      - graph_update  : node/edge baru ditambahkan ke graph
-      - operation_*   : state transition operasi (Guardian)
-      - review_done   : hasil review artifact
+      - graph_update     : node/edge baru ditambahkan ke graph
+      - operation_*      : state transition operasi (Guardian)
+      - review_done      : hasil review artifact
+      - health_report    : laporan kesehatan repo
+      - refactor_suggestion: saran refactor
     Format: text/event-stream, setiap event: 'data: <json>\\n\\n'
     """
     q = cortex.subscribe_sse()

@@ -1,0 +1,100 @@
+# synapse.invariants.yaml
+# Post-execution invariant checks untuk Guardian (execute_operation)
+# Sesuai SYNAPSE.md section 1 (MASTER PROMPT) — "runs the verification checks from synapse.invariants.yaml"
+#
+# Format per invariant:
+#   - id         : identifier unik
+#   - applies_to : tool_name yang dicek (atau '*' untuk semua)
+#   - check      : jenis pengecekan
+#   - params     : parameter spesifik check
+#   - on_fail    : 'rollback' | 'warn'  (default: rollback)
+
+invariants:
+
+  # ── DB Migration ──────────────────────────────────────────────────────────
+  - id: db_schema_tables_exist
+    applies_to: db.run_migration
+    check: sqlite_tables_exist
+    params:
+      tables: [nodes, edges, operations, approvals]
+      db_path: "synapse.db"   # default; bisa dioverride via params['db_path']
+    on_fail: rollback
+    description: >
+      Setelah migration, pastikan keempat tabel kontrak (SYNAPSE.md 4.2)
+      masih ada. Jika hilang, langsung rollback — migration merusak skema dasar.
+
+  - id: db_wal_mode
+    applies_to: db.run_migration
+    check: sqlite_pragma
+    params:
+      pragma: journal_mode
+      expected_value: wal
+      db_path: "synapse.db"
+    on_fail: warn
+    description: >
+      WAL mode harus aktif untuk performa baca-tulis paralel FastAPI.
+      Jika tidak aktif setelah migration, emit warning (tidak rollback).
+
+  - id: db_not_empty_after_migration
+    applies_to: db.run_migration
+    check: sqlite_row_count_gte
+    params:
+      table: nodes
+      min_count: 0      # boleh kosong; cukup pastikan tabel bisa di-query
+      db_path: "synapse.db"
+    on_fail: rollback
+    description: >
+      Pastikan tabel 'nodes' bisa di-query tanpa error setelah migration.
+
+  # ── Config Write ──────────────────────────────────────────────────────────
+  - id: config_file_exists_after_write
+    applies_to: config.write
+    check: file_exists
+    params:
+      path_from: params.path    # path diambil dari params operasi
+    on_fail: rollback
+    description: >
+      Setelah config.write, pastikan file target ada. Jika tidak (disk penuh,
+      permission error), rollback dari snapshot.
+
+  - id: config_file_not_empty
+    applies_to: config.write
+    check: file_size_gte
+    params:
+      path_from: params.path
+      min_bytes: 1
+    on_fail: warn
+    description: >
+      File config tidak boleh 0 bytes setelah write. Emit warning jika kosong.
+
+  # ── File Delete ───────────────────────────────────────────────────────────
+  - id: file_absent_after_delete
+    applies_to: file.delete
+    check: file_not_exists
+    params:
+      path_from: params.path
+    on_fail: warn
+    description: >
+      Setelah file.delete, file target seharusnya tidak ada lagi.
+      Jika masih ada (locked, permission), emit warning.
+
+  # ── Service Restart (stub) ────────────────────────────────────────────────
+  - id: service_stub_always_pass
+    applies_to: service.restart
+    check: always_pass
+    params: {}
+    on_fail: warn
+    description: >
+      Service restart adalah stub di MVP — verifikasi selalu lolos.
+      Ganti dengan process/port check saat implementasi nyata.
+
+  # ── Semua operasi (global) ────────────────────────────────────────────────
+  - id: operation_status_not_executing
+    applies_to: "*"
+    check: operation_status_not
+    params:
+      forbidden_status: executing
+    on_fail: warn
+    description: >
+      Setelah execute_operation selesai, status operasi tidak boleh masih
+      'executing'. Jika iya, ada bug di flow Guardian.
