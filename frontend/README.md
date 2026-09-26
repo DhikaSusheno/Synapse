@@ -46,7 +46,7 @@ curl -X POST http://localhost:8000/understand_repo \
   -d '{"repo_path": ".."}'  
 ```
 
-## 8 Halaman Dashboard
+## 9 Halaman Dashboard
 
 | Nav | Halaman | Owner | Status |
 |---|---|---|---|
@@ -81,16 +81,18 @@ curl -X POST http://localhost:8000/understand_repo \
 | GET | `/operations` | Operations, Approvals, Agents |
 | GET | `/health` | Settings |
 
-## Endpoint Backend Baru yang Dibutuhkan
+## Endpoint Backend yang Dibutuhkan
 
-Frontend fallback ke mock data jika endpoint ini belum tersedia:
+Tidak ada endpoint baru. Semua halaman unmet dari endpoint yang sudah ada. Semua halaman unmet dari endpoint yang sudah ada:
 
-| Method | Endpoint | Response | Dibutuhkan untuk |
-|---|---|---|---|
-| GET | `/agents/status` | `{guardian,cortex,review: {tasks,healthy}}` | Agents page |
-| GET | `/security/report` | security stats + adversarial results | Security page |
-| GET | `/settings` | platform config object | Settings page |
-| POST | `/settings` | `{ok:true}` | Settings page |
+| Halaman | Sumber data |
+|---|---|
+| Agents | `GET /operations?limit=100` (via `useLiveOps`) + `GET /graph/summary` + SSE `/stream` |
+| Security | `GET /operations?limit=100` + SSE `/stream` |
+| Settings | `GET /health` + `GET /graph/summary` |
+
+Statistik Agents/Security diturunkan di client (`lib/derive.ts`), bukan mock.
+Saat `NEXT_PUBLIC_USE_LIVE_SSE=false` halaman menampilkan badge "Env off" + empty state.
 
 ## SSE Events yang Ditangani
 
@@ -141,12 +143,13 @@ frontend/
 │       └── AgentBadge.tsx      ← FE-1 ✅
 ├── hooks/
 │   ├── useSSE.ts             ← SSE + exponential backoff
+│   ├── useLiveOps.ts         ← poll /operations (Agents, Security)
 │   └── useMockSimulation.ts
 └── lib/
     ├── types.ts
     ├── mockData.ts
-    ├── mockAgents.ts         ← FE-1 ✅
-    ├── mockSecurity.ts       ← FE-1 ✅
+    ├── derive.ts             ← derivasi /operations -> UI (pure, diuji)
+    ├── derive.test.ts        ← node --test
     └── nodeVisuals.ts
 ```
 

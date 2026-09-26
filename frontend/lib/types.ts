@@ -56,6 +56,14 @@ export interface SSEEvent {
   data: Record<string, unknown>;
 }
 
+// Baris log event SSE yang dirender di halaman Agents
+export interface SSELogEntry {
+  ts: string;
+  agent: string;
+  event: string;
+  message: string;
+}
+
 // Operasi dari backend operations table
 export interface Operation {
   id: string;

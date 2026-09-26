@@ -46,19 +46,19 @@
 
 ---
 
-## Navigation Pages (8 halaman)
+## Navigation Pages (9 halaman)
 
 | ID | Label | Komponen | Owner | Status |
 |---|---|---|---|---|
 | `overview` | Overview | `OverviewMain` | FE-1 | ✅ Done |
-| `code-graph` | Code Graph | `CodeGraphPage` | FE-1 | 🔲 Needed |
-| `guardian` | Guardian | `GuardianPage` | FE-1 | 🔲 Needed |
-| `cortex` | Cortex | `CortexPage` | FE-1 | 🔲 Needed |
-| `agents` | Agents | `AgentsPage` | FE-1 | 🔲 Needed |
+| `code-graph` | Code Graph | `CodeGraphPage` | FE-1 | ✅ Done |
+| `guardian` | Guardian | `GuardianPage` | FE-1 | ✅ Done |
+| `cortex` | Cortex | `CortexPage` | FE-1 | ✅ Done |
+| `agents` | Agents | `AgentsPage` | FE-1 | ✅ Done |
 | `approvals` | Approvals | `ApprovalsPage` | FE-2 | ✅ Done (Shann) |
 | `operations` | Operations | `OperationsPage` | FE-2 | ✅ Done (Shann) |
-| `security` | Security | `SecurityPage` | FE-1 | 🔲 Needed |
-| `settings` | Settings | `SettingsPage` | FE-1 | 🔲 Needed |
+| `security` | Security | `SecurityPage` | FE-1 | ✅ Done |
+| `settings` | Settings | `SettingsPage` | FE-1 | ✅ Done |
 
 ---
 
@@ -349,27 +349,28 @@ btn-ghost: border border-slate-700/60 text-slate-400 hover:text-slate-200 hover:
 
 ---
 
-## Mock Data untuk Mode `NEXT_PUBLIC_USE_LIVE_SSE=false`
+## Data untuk Mode `NEXT_PUBLIC_USE_LIVE_SSE=false`
 
-Semua halaman harus berfungsi di mock mode. Gunakan data dari:
-- `lib/mockData.ts` — MOCK_NODES, MOCK_LINKS, MOCK_TIMELINE
-- `lib/mockAgents.ts` (baru, dibuat FE-1) — mock agent stats + tasks + events
-- `lib/mockSecurity.ts` (baru, dibuat FE-1) — mock security report
+- `lib/mockData.ts` — MOCK_NODES, MOCK_LINKS, MOCK_TIMELINE (graph + timeline)
+- Halaman Agents & Security **tidak punya mock**. Statistik diturunkan dari
+  `GET /operations` + `GET /graph/summary` lewat `lib/derive.ts`, jadi mode env-off
+  menampilkan badge "Env off" + empty state, bukan angka palsu.
 
 ---
 
-## Kontrak API Baru (Backend perlu expose)
+## Kontrak API (Backend perlu expose)
 
-Beberapa endpoint baru yang **dibutuhkan frontend** untuk 8 halaman penuh:
+Semua endpoint sudah ada di backend. Yang dipakai FE-1:
 
-| Endpoint | Method | Payload | Response | Dibutuhkan untuk |
-|---|---|---|---|---|
-| `/agents/status` | GET | — | `{guardian:{tasks,healthy}, cortex:{tasks,healthy}, review:{tasks,healthy}}` | Agents page |
-| `/security/report` | GET | — | `{total_checks, violations, blocked_ops, rules_active, adversarial_results, recent_events}` | Security page |
-| `/settings` | GET | — | `{platform_name, env, log_level, workspace_path, ...}` | Settings page |
-| `/settings` | POST | config object | `{ok:true}` | Settings page |
+| Endpoint | Method | Dipakai untuk |
+|---|---|---|
+| `/operations?limit=100` | GET | Agents, Security (poll 5s) |
+| `/graph/summary` | GET | Agents (jumlah symbol/file), Settings |
+| `/graph/nodes?type=file\|doc` | GET | Cortex (repo tree) |
+| `/health` | GET | Settings |
 
-Jika belum tersedia, frontend akan **fallback ke mock data** secara otomatis.
+Tidak ada endpoint baru yang dibutuhkan. Kalau nanti backend menambah
+`/security/rules`, ganti konstanta `RULES` di `SecurityPage.tsx` dengan fetch.
 
 ---
 
@@ -393,24 +394,25 @@ frontend/
 │   ├── SynapseGraph.tsx     ← FE-1+2: force graph canvas
 │   ├── OperationsSidebar.tsx← FE-2: sidebar ops+log
 │   ├── pages/
-│   │   ├── CodeGraphPage.tsx  ← FE-1 🔲
-│   │   ├── GuardianPage.tsx   ← FE-1 🔲
-│   │   ├── CortexPage.tsx     ← FE-1 🔲
-│   │   ├── AgentsPage.tsx     ← FE-1 🔲
-│   │   ├── SecurityPage.tsx   ← FE-1 🔲
-│   │   └── SettingsPage.tsx   ← FE-1 🔲
+│   │   ├── CodeGraphPage.tsx  ← FE-1 ✅
+│   │   ├── GuardianPage.tsx   ← FE-1 ✅
+│   │   ├── CortexPage.tsx     ← FE-1 ✅
+│   │   ├── AgentsPage.tsx     ← FE-1 ✅
+│   │   ├── SecurityPage.tsx   ← FE-1 ✅
+│   │   └── SettingsPage.tsx   ← FE-1 ✅
 │   └── shared/
-│       ├── RiskBadge.tsx      ← FE-1 🔲
-│       ├── StatusBadge.tsx    ← FE-1 🔲
-│       └── AgentBadge.tsx     ← FE-1 🔲
+│       ├── RiskBadge.tsx      ← FE-1 ✅
+│       ├── StatusBadge.tsx    ← FE-1 ✅
+│       └── AgentBadge.tsx     ← FE-1 ✅
 ├── hooks/
 │   ├── useSSE.ts
+│   ├── useLiveOps.ts          ← FE-1 ✅ poll /operations
 │   └── useMockSimulation.ts
 └── lib/
     ├── types.ts
     ├── mockData.ts
-    ├── mockAgents.ts          ← FE-1 🔲
-    ├── mockSecurity.ts        ← FE-1 🔲
+    ├── derive.ts              ← FE-1 ✅ derivasi data live -> UI
+    ├── derive.test.ts         ← FE-1 ✅
     └── nodeVisuals.ts
 ```
 
@@ -420,18 +422,19 @@ frontend/
 
 ### FE-1 @nabilfauzandafa
 - [x] OverviewMain (Code Graph panel + Timeline + Risk & Activity + Feature Cards)
-- [x] LeftNav (8 item + badge)
+- [x] LeftNav (9 item + badge)
 - [x] TopNavbar
 - [x] GuardianPanel (semua pending ops, scrollable)
-- [ ] CodeGraphPage — graph fullscreen + node panel + SSE activity
-- [ ] GuardianPage — pending op detail + reversibility + timeline
-- [ ] CortexPage — repo tree + explain + review + graph context
-- [ ] AgentsPage — 3 agent cards + tasks + SSE stream + activity chart
-- [ ] SecurityPage — stats + rule engine + adversarial + event feed
-- [ ] SettingsPage — tabs: General + MCP + Storage + Repository
-- [ ] Shared badges (RiskBadge, StatusBadge, AgentBadge)
-- [ ] lib/mockAgents.ts
-- [ ] lib/mockSecurity.ts
+- [x] CodeGraphPage — graph fullscreen + node panel + SSE activity
+- [x] GuardianPage — pending op detail + reversibility + timeline
+- [x] CortexPage — repo tree dari `/graph/nodes` + explain + review + graph context
+- [x] AgentsPage — 3 agent cards + tasks + SSE stream + activity chart (data live)
+- [x] SecurityPage — stats + rule engine + conflict candidates + event feed (data live)
+- [x] SettingsPage — tabs: General + MCP + Storage + Repository
+- [x] Shared badges (RiskBadge, StatusBadge, AgentBadge)
+- [x] hooks/useLiveOps.ts — poll `/operations`
+- [x] lib/derive.ts + lib/derive.test.ts — derivasi murni + 12 test
+- [x] Nav "Agents" masuk LeftNav (sebelumnya halaman tidak terjangkau)
 
 ### FE-2 @ShannWasHere
 - [x] OperationsSidebar (ops tab + log tab)
@@ -440,7 +443,6 @@ frontend/
 - [x] GuardianPanel — semua pending ops (commit 8c085c3)
 
 ### Backend @DhikaSusheno / @Masrendra
-- [ ] `GET /agents/status` — agent health + task count
-- [ ] `GET /security/report` — security stats + adversarial results
-- [ ] `GET /settings` + `POST /settings` — platform config
-- (semua existing endpoint sudah ada dan berjalan)
+- [x] Semua endpoint yang dipakai FE-1 sudah ada (`/operations`, `/graph/summary`, `/graph/nodes`, `/health`)
+- [ ] (opsional) `GET /security/rules` — kalau ditambah, `RULES` di SecurityPage diisi dari backend
+- [ ] (opsional) `GET /settings` + `POST /settings` — untuk tab General di SettingsPage

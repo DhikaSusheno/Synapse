@@ -4,7 +4,7 @@
 // FE-1 @nabilfauzandafa
 
 import { useEffect, useState } from "react";
-import type { GraphNode } from "@/lib/types";
+import { buildFileTree, type TreeNode } from "@/lib/derive";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -25,22 +25,35 @@ interface ReviewScores {
   verdict: string;
 }
 
-const MOCK_TREE_NODES = [
-  { id: "src", name: "src/", type: "dir", depth: 0 },
-  { id: "app", name: "app.py", type: "file", depth: 1 },
-  { id: "api", name: "api/", type: "dir", depth: 1 },
-  { id: "routes", name: "routes.py", type: "file", depth: 2 },
-  { id: "schemas", name: "schemas.py", type: "file", depth: 2 },
-  { id: "core", name: "core/", type: "dir", depth: 1 },
-  { id: "cortex_py", name: "cortex.py", type: "file", depth: 2 },
-  { id: "guardian_py", name: "guardian.py", type: "file", depth: 2 },
-  { id: "database", name: "database/", type: "dir", depth: 1 },
-  { id: "database_py", name: "database.py", type: "file", depth: 2 },
-  { id: "models_py", name: "models.py", type: "file", depth: 2 },
-  { id: "utils", name: "utils/", type: "dir", depth: 1 },
-  { id: "parser_py", name: "parser.py", type: "file", depth: 2 },
-  { id: "readme", name: "README.md", type: "doc", depth: 0 },
-];
+// Tree repo dari node graph backend (/graph/nodes) — bukan mock.
+function useFileTree(enabled: boolean): { tree: TreeNode[]; loading: boolean; error: string | null } {
+  const [tree, setTree] = useState<TreeNode[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!enabled) { setLoading(false); return; }
+    let cancelled = false;
+    Promise.all([
+      fetch(`${BACKEND_URL}/graph/nodes?type=file`, { cache: "no-store" }).then((r) => (r.ok ? r.json() : [])),
+      fetch(`${BACKEND_URL}/graph/nodes?type=doc`, { cache: "no-store" }).then((r) => (r.ok ? r.json() : [])),
+    ])
+      .then(([files, docs]) => {
+        if (cancelled) return;
+        const all = [
+          ...(Array.isArray(files) ? files : []),
+          ...(Array.isArray(docs) ? docs : []),
+        ] as { id: string; name: string; type: string }[];
+        setTree(buildFileTree(all));
+        setError(null);
+      })
+      .catch(() => { if (!cancelled) setError("Backend tidak dapat dijangkau"); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [enabled]);
+
+  return { tree, loading, error };
+}
 
 const MOCK_EXPLAIN: ExplainResult = {
   definition: "The guardian module handles risky operation protection, including conflict detection, snapshots and rollback.",
@@ -59,7 +72,8 @@ const MOCK_REVIEW: ReviewScores = {
 };
 
 export default function CortexPage() {
-  const [selectedFile, setSelectedFile] = useState("cortex_py");
+  const { tree, loading: treeLoading, error: treeError } = useFileTree(USE_LIVE);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [explainTopic, setExplainTopic] = useState("How does the guardian module work?");
   const [explainResult, setExplainResult] = useState<ExplainResult | null>(USE_LIVE ? null : MOCK_EXPLAIN);
   const [explainLoading, setExplainLoading] = useState(false);
@@ -119,19 +133,32 @@ export default function CortexPage() {
           </div>
         </div>
         <div className="flex-1 overflow-y-auto py-1">
-          {MOCK_TREE_NODES.map((node) => (
-            <button
-              key={node.id}
-              onClick={() => node.type !== "dir" && setSelectedFile(node.id)}
-              className={`w-full flex items-center gap-1.5 px-3 py-1 text-[10px] transition-colors ${
-                selectedFile === node.id ? "bg-blue-600/20 text-blue-400" : "text-slate-400 hover:bg-slate-800/60"
-              }`}
-              style={{ paddingLeft: `${12 + node.depth * 12}px` }}
-            >
-              <span>{node.type === "dir" ? "&#128193;" : node.type === "doc" ? "&#128196;" : "&#128462;"}</span>
-              <span className="truncate">{node.name}</span>
-            </button>
-          ))}
+          {treeError ? (
+            <div className="px-3 py-4 text-[10px] text-red-400">{treeError}</div>
+          ) : tree.length === 0 ? (
+            <div className="px-3 py-4 text-[10px] text-slate-600">
+              {treeLoading ? "Loading tree..." : !USE_LIVE ? "Live data OFF — set NEXT_PUBLIC_USE_LIVE_SSE=true." : "Graph kosong. POST /understand_repo untuk ingest."}
+            </div>
+          ) : (
+            tree.map((node) => (
+              <button
+                key={node.id}
+                onClick={() => {
+                  if (node.type === "dir") return;
+                  setSelectedFile(node.id);
+                  setArtifactPath(node.id);
+                  setExplainTopic(`How does ${node.name} work?`);
+                }}
+                className={`w-full flex items-center gap-1.5 px-3 py-1 text-[10px] text-left transition-colors ${
+                  selectedFile === node.id ? "bg-blue-600/20 text-blue-400" : "text-slate-400 hover:bg-slate-800/60"
+                }`}
+                style={{ paddingLeft: `${12 + node.depth * 12}px` }}
+              >
+                <span>{node.type === "dir" ? "&#128193;" : node.type === "doc" ? "&#128196;" : "&#128462;"}</span>
+                <span className="truncate">{node.name}</span>
+              </button>
+            ))
+          )}
         </div>
       </div>
 
@@ -223,7 +250,7 @@ export default function CortexPage() {
         <div className="bg-slate-800/40 rounded-xl border border-slate-700/60 h-40 flex items-center justify-center">
           <span className="text-[10px] text-slate-600">Mini graph preview</span>
         </div>
-        <div className="text-[10px] text-slate-500">Selected: <span className="text-slate-300">{selectedFile}</span></div>
+        <div className="text-[10px] text-slate-500">Selected: <span className="text-slate-300">{selectedFile ?? "none"}</span></div>
       </div>
     </div>
   );
