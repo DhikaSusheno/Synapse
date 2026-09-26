@@ -295,8 +295,32 @@ def list_operations(
             "SELECT * FROM operations ORDER BY created_at DESC LIMIT ?",
             (limit,)
         ).fetchall()
+    
+    ops = [dict(r) for r in rows]
+    
+    # Tambahkan conflicts dari edges table (relationship = 'CONFLICTS_WITH')
+    if ops:
+        op_ids = [op["id"] for op in ops]
+        placeholders = ",".join("?" * len(op_ids))
+        conflict_rows = conn.execute(
+            f"""
+            SELECT source_id, target_id
+            FROM edges
+            WHERE relationship = 'CONFLICTS_WITH'
+              AND source_id IN ({placeholders})
+            """,
+            op_ids
+        ).fetchall()
+        
+        conflicts_by_op = {}
+        for row in conflict_rows:
+            conflicts_by_op.setdefault(row["source_id"], []).append(row["target_id"])
+        
+        for op in ops:
+            op["conflicts"] = conflicts_by_op.get(op["id"], [])
+    
     conn.close()
-    return [dict(r) for r in rows]
+    return ops
 
 
 # ---------------------------------------------------------------------------

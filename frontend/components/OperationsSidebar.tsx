@@ -128,7 +128,7 @@ function OperationCard({ op }: { op: Operation }) {
       {op.conflicts && op.conflicts.length > 0 && (
         <div className="text-xs text-red-400 flex items-center gap-1">
           <span>&#9888;</span>
-          <span>Konflik dengan: {op.conflicts.join(", ")}</span>
+          <span>Konflik dengan: {op.conflicts.map((c) => typeof c === "string" ? c : c.id).join(", ")}</span>
         </div>
       )}
       {Object.keys(params).length > 0 && (

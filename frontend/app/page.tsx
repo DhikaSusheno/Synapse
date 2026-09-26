@@ -60,6 +60,24 @@ const MOCK_OPERATIONS: Operation[] = [
   },
 ];
 
+// Normalise satu operation row dari backend ke tipe Operation
+function normalizeOp(op: Record<string, unknown>): Operation {
+  const rawConflicts = op.conflicts as Array<string | { id: string }> | undefined;
+  return {
+    id: op.id as string,
+    tool_name: op.tool_name as string,
+    params_json: (op.params_json as string) ?? "{}",
+    target_node_id: (op.target_node_id as string) ?? null,
+    blast_radius: (op.blast_radius as Operation["blast_radius"]) ?? "unknown",
+    status: (op.status as GraphNode["status"]) ?? "pending",
+    requires_approval: (op.requires_approval as number) ?? 1,
+    conflicts: rawConflicts
+      ? rawConflicts.map((c) => (typeof c === "string" ? c : c.id))
+      : undefined,
+    created_at: (op.created_at as string) ?? new Date().toISOString(),
+  };
+}
+
 // --- Hook: load operations from backend or mock ---
 function useOperations(): [Operation[], (id: string, d: "approved" | "denied") => void] {
   const [ops, setOps] = useState<Operation[]>(MOCK_OPERATIONS);
@@ -68,22 +86,29 @@ function useOperations(): [Operation[], (id: string, d: "approved" | "denied") =
     if (!USE_LIVE) return;
     async function load() {
       try {
-        const res = await fetch(`${BACKEND_URL}/list_pending_approvals`, { cache: "no-store" });
-        if (res.ok) {
-          const data = await res.json();
-          const pending: Operation[] = (data.pending ?? []).map((op: Record<string, unknown>) => ({
-            id: op.id as string,
-            tool_name: op.tool_name as string,
-            params_json: (op.params_json as string) ?? "{}",
-            target_node_id: (op.target_node_id as string) ?? null,
-            blast_radius: (op.blast_radius as Operation["blast_radius"]) ?? "unknown",
-            status: (op.status as GraphNode["status"]) ?? "pending",
-            requires_approval: (op.requires_approval as number) ?? 1,
-            conflicts: op.conflicts ? (op.conflicts as string[]) : undefined,
-            created_at: (op.created_at as string) ?? new Date().toISOString(),
-          }));
-          if (pending.length > 0) setOps(pending);
+        // Load semua operasi (untuk history + operations page)
+        const [allRes, pendingRes] = await Promise.all([
+          fetch(`${BACKEND_URL}/operations?limit=100`, { cache: "no-store" }),
+          fetch(`${BACKEND_URL}/list_pending_approvals`, { cache: "no-store" }),
+        ]);
+        const allOps: Operation[] = [];
+        if (allRes.ok) {
+          const rows = (await allRes.json()) as Record<string, unknown>[];
+          allOps.push(...(Array.isArray(rows) ? rows.map(normalizeOp) : []));
         }
+        if (pendingRes.ok) {
+          const data = await pendingRes.json();
+          const pending = ((data.pending ?? []) as Record<string, unknown>[]).map(normalizeOp);
+          // Merge pending ke allOps (upsert by id — pending override karena punya conflicts field)
+          for (const p of pending) {
+            if (!allOps.find((o) => o.id === p.id)) allOps.push(p);
+            else {
+              const idx = allOps.findIndex((o) => o.id === p.id);
+              allOps[idx] = { ...allOps[idx], ...p };
+            }
+          }
+        }
+        if (allOps.length > 0) setOps(allOps);
       } catch { /* backend not ready */ }
     }
     load();
@@ -165,7 +190,7 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
       </div>
       {op.conflicts && op.conflicts.length > 0 && (
         <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-3 py-2 flex items-center gap-1.5">
-          <span>&#9888;</span><span>Conflicts with: {op.conflicts.join(", ")}</span>
+          <span>&#9888;</span><span>Conflicts with: {op.conflicts.map((c) => typeof c === "string" ? c : c.id).join(", ")}</span>
         </div>
       )}
       {errorMsg && <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-3 py-2">{errorMsg}</div>}
@@ -226,8 +251,10 @@ function OperationsPage() {
     try {
       const url = statusFilter === "all" ? `${BACKEND_URL}/operations?limit=50` : `${BACKEND_URL}/operations?status=${statusFilter}&limit=50`;
       const res = await fetch(url, { cache: "no-store" });
-      if (res.ok) setOps(Array.isArray(await res.json() as unknown) ? await res.clone().json() : []);
-      else setError("Backend tidak dapat dijangkau");
+      if (res.ok) {
+        const data = await res.json();
+        setOps(Array.isArray(data) ? data : []);
+      } else setError("Backend tidak dapat dijangkau");
     } catch { setError("Backend offline"); }
   }, [statusFilter]);
 
