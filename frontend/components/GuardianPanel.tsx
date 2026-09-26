@@ -125,7 +125,7 @@ function PendingApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id
       {op.conflicts && op.conflicts.length > 0 && (
         <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-2.5 py-1.5 flex items-center gap-1.5">
           <span>&#9888;</span>
-          <span>Conflicts with: {op.conflicts.join(", ")}</span>
+          <span>Conflicts with: {op.conflicts.map((c) => typeof c === "string" ? c : c.id).join(", ")}</span>
         </div>
       )}
 

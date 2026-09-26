@@ -68,17 +68,17 @@ function useOperations(): [Operation[], (id: string, d: "approved" | "denied") =
     if (!USE_LIVE) return;
     async function load() {
       try {
-        const [pendingRes, historyRes] = await Promise.all([
+        // Pending dari /list_pending_approvals, decided dari /operations (biar History tidak hilang tiap poll).
+        const [pendingRes, allRes] = await Promise.all([
           fetch(`${BACKEND_URL}/list_pending_approvals`, { cache: "no-store" }).catch(() => null),
-          fetch(`${BACKEND_URL}/operations?limit=50`, { cache: "no-store" }).catch(() => null),
+          fetch(`${BACKEND_URL}/operations?limit=100`, { cache: "no-store" }).catch(() => null),
         ]);
-        if (!pendingRes?.ok && !historyRes?.ok) return;
+        if (!pendingRes?.ok && !allRes?.ok) return;
         const pendingData = pendingRes?.ok ? ((await pendingRes.json()) as { pending?: unknown }) : null;
-        const historyData = historyRes?.ok ? await historyRes.json() : null;
-        const history = mapPending(historyData).filter(
+        const decided = mapPending(allRes?.ok ? await allRes.json() : null).filter(
           (op) => op.requires_approval === 1 && op.status !== "pending"
         );
-        setOps(withConflicts([...mapPending(pendingData?.pending ?? []), ...history]));
+        setOps(withConflicts([...mapPending(pendingData?.pending ?? []), ...decided]));
       } catch { /* backend not ready */ }
     }
     load();
@@ -162,7 +162,7 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
       </div>
       {op.conflicts && op.conflicts.length > 0 && (
         <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-3 py-2 flex items-center gap-1.5">
-          <span>&#9888;</span><span>Conflicts with: {op.conflicts.join(", ")}</span>
+          <span>&#9888;</span><span>Conflicts with: {op.conflicts.map((c) => typeof c === "string" ? c : c.id).join(", ")}</span>
         </div>
       )}
       {errorMsg && <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-3 py-2">{errorMsg}</div>}

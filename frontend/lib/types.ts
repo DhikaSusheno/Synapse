@@ -73,6 +73,8 @@ export interface Operation {
   blast_radius: "low" | "medium" | "high" | "unknown";
   status: NodeStatus;
   requires_approval: number; // 0 | 1
-  conflicts?: string[];
+  // conflicts: backend mengembalikan array objek {id,tool_name,status,created_at}
+  // atau array string id (untuk display di UI cukup id)
+  conflicts?: Array<string | { id: string; tool_name?: string; status?: string }>;
   created_at: string;
 }

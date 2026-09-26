@@ -4,8 +4,13 @@ __pycache__/
 venv/
 *.db
 *.db.bak.*
-*.db-shm
+# Sidecar WAL SQLite. `*.db` tidak match file berakhiran -wal/-shm, jadi
+# tanpa baris ini synapse_v2.db-wal ikut ter-commit.
 *.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 
 node_modules/
 .next/

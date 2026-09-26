@@ -1148,4 +1148,4 @@ def approve_operation(operation_id: str, decision: str, note: str = "") -> dict:
         {"operation_id": operation_id, "decision": decision, "tool_name": op["tool_name"]},
     )
 
-    return {"ok": True, "operation_id": operation_id, "decision": decision, "status": new_status}
+    return {"ok": True, "operation_id": operation_id, "decision": decision, "status": new_status, "new_status": new_status}
