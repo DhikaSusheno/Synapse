@@ -1,8 +1,20 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
-tree-sitter==0.21.3
-tree-sitter-languages==1.10.2
 networkx==3.3
 aiofiles==23.2.1
 python-multipart==0.0.9
 PyYAML==6.0.1
+
+# --- tree-sitter ------------------------------------------------------------
+# tree-sitter-languages==1.10.2 TIDAK LAGI dipakai dan sengaja dihapus.
+# Paket itu dibundel dengan Language() versi lama; di tree-sitter >= 0.22
+# setiap pemanggilannya melempar:
+#     TypeError: __init__() takes exactly 1 argument (2 given)
+# Akibatnya tree-sitter tidak pernah terpakai dan hanya fallback `ast` yang
+# bekerja — file .js/.go/.java/.rs menghasilkan nol simbol.
+#
+# Diganti language pack terpisah, satu paket per bahasa, yang mengikuti API
+# tree-sitter modern. engine.py Mendukung API >= 0.25 maupun < 0.25.
+tree-sitter>=0.25,<0.27
+tree-sitter-python>=0.23
+tree-sitter-javascript>=0.23

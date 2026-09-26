@@ -46,6 +46,7 @@ import sqlite3
 
 from database import init_db, DB_PATH
 import storage
+import engine
 import cortex
 import guardian
 
@@ -216,6 +217,63 @@ def suggest_refactor(req: SuggestRefactorRequest):
 
 
 # ---------------------------------------------------------------------------
+# Endpoint dengan nama engine.py yang baru
+# ---------------------------------------------------------------------------
+# Alias dari ketujuh endpoint di atas. Endpoint lama (/understand_repo,
+# /explain_topic, ...) sengaja dibiarkan karena frontend memakai nama itu;
+# endpoint baru supaya kode baru tidak perlu lewat path "/understand_repo".
+
+@app.post("/ingest_repository", tags=["Engine"], include_in_schema=False)
+def ingest_repository(req: UnderstandRepoRequest):
+    result = engine.ingest_repository(req.repo_path)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@app.post("/ask_about", tags=["Engine"], include_in_schema=False)
+def ask_about(req: ExplainTopicRequest):
+    result = engine.ask_about(req.topic)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("message"))
+    return result
+
+
+@app.post("/review_change", tags=["Engine"], include_in_schema=False)
+def review_change(req: ReviewArtifactRequest):
+    result = engine.review_change(req.path_or_diff)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@app.get("/health_report", tags=["Engine"], include_in_schema=False)
+def health_report():
+    return engine.health_report()
+
+
+@app.get("/rank_complexity", tags=["Engine"], include_in_schema=False)
+def rank_complexity(top_n: int = Query(default=10, ge=1, le=50)):
+    return engine.rank_complexity(top_n=top_n)
+
+
+@app.post("/trace_connection", tags=["Engine"], include_in_schema=False)
+def trace_connection(req: FindPathRequest):
+    result = engine.trace_connection(req.from_node, req.to_node)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error"))
+    return result
+
+
+@app.post("/propose_refactor", tags=["Engine"], include_in_schema=False)
+def propose_refactor(req: SuggestRefactorRequest):
+    result = engine.propose_refactor(req.node_name)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error"))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # GUARDIAN endpoints — BE-1 DhikaSusheno (diintegrasikan oleh Masrendra)
 # ---------------------------------------------------------------------------
 
@@ -351,65 +409,44 @@ async def stream_events():
 # ---------------------------------------------------------------------------
 
 @app.get("/graph/nodes", tags=["Graph"])
-def get_all_nodes(type: str = None):
-    """Ambil semua node dari graph. Filter by type opsional."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    if type:
-        rows = conn.execute(
-            "SELECT * FROM nodes WHERE type=? ORDER BY created_at DESC", (type,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM nodes ORDER BY created_at DESC"
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+def get_all_nodes(type: str = None, kind: str = None):
+    """
+    Semua entitas graph, dalam bentuk yang dikonsumsi frontend.
+
+    Sumbernya storage.py (entities/relations di synapse_v2.db), bukan tabel
+    legacy nodes. Mapping ke bentuk frontend dilakukan di engine:
+      entities.kind         -> type
+      entities.label        -> name
+      entities.attributes_json -> meta
+
+    Parameter `type` (nama lama) tetap diterima sebagai alias `kind` supaya
+    tidak ada caller yang ikut pecah.
+    """
+    return engine.get_graph_snapshot(kind=kind or type)
 
 
 @app.get("/graph/edges", tags=["Graph"])
-def get_all_edges(relationship: str = None):
-    """Ambil semua edge dari graph. Filter by relationship opsional."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    if relationship:
-        rows = conn.execute(
-            "SELECT * FROM edges WHERE relationship=? ORDER BY created_at DESC",
-            (relationship,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM edges ORDER BY created_at DESC"
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+def get_all_edges(relationship: str = None, relation_type: str = None):
+    """
+    Semua sisi graph, dalam bentuk frontend: source/target/relationship.
+
+    Mapping: relations.from_id -> source, relations.to_id -> target,
+    relations.relation_type -> relationship, relations.weight -> confidence.
+    """
+    return engine.get_graph_edges(relationship=relationship or relation_type)
 
 
 @app.get("/graph/summary", tags=["Graph"])
 def get_graph_summary():
-    """Ringkasan graph: jumlah node per type dan edge per relationship."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    node_counts = {
-        row["type"]: row["cnt"]
-        for row in conn.execute(
-            "SELECT type, COUNT(*) as cnt FROM nodes GROUP BY type"
-        ).fetchall()
-    }
-    edge_counts = {
-        row["relationship"]: row["cnt"]
-        for row in conn.execute(
-            "SELECT relationship, COUNT(*) as cnt FROM edges GROUP BY relationship"
-        ).fetchall()
-    }
-    total_nodes = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
-    total_edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-    conn.close()
+    """Ringkasan graph: jumlah entitas per kind dan sisi per relasi."""
+    stats = engine.graph_stats()
     return {
-        "total_nodes": total_nodes,
-        "total_edges": total_edges,
-        "nodes_by_type": node_counts,
-        "edges_by_relationship": edge_counts,
+        "total_nodes": stats["node_count"],
+        "total_edges": stats["edge_count"],
+        "nodes_by_type": stats["nodes_by_kind"],
+        "nodes_by_kind": stats["nodes_by_kind"],
+        "edges_by_relationship": stats["edges_by_relationship"],
+        "db_path": stats["db_path"],
     }
 
 
