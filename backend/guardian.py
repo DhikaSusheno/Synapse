@@ -389,6 +389,7 @@ def execute_operation(operation_id: str) -> dict:
     BUG-01 FIX: requires_approval di-derive dari RULE ENGINE (tool_name immutable),
     BUKAN dari kolom requires_approval di DB yang bisa di-inject attacker.
     BUG-04 FIX: snapshot diambil di sini, tepat sebelum eksekusi.
+    RACE FIX: atomic CAS UPDATE mencegah concurrent double-execute.
     """
     conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
@@ -439,11 +440,30 @@ def execute_operation(operation_id: str) -> dict:
                 "status": op["status"],
             }
 
-    if op["status"] not in ("pending", "approved"):
+    # RACE FIX: atomic Compare-And-Swap (CAS) — set status='executing' HANYA jika
+    # status masih 'pending' atau 'approved' pada saat UPDATE dieksekusi.
+    # SQLite menjamin UPDATE ini bersifat atomik: jika dua request concurrent sampai
+    # di sini bersamaan, hanya satu yang akan berhasil mengubah row (rowcount=1).
+    # Request kedua akan mendapat rowcount=0 dan langsung ditolak — mencegah
+    # double-execution dan replay attack tanpa perlu distributed lock.
+    cas_cursor = conn.execute(
+        """UPDATE operations
+           SET status='executing', executed_at=?
+           WHERE id=? AND status IN ('pending', 'approved')""",
+        (datetime.utcnow().isoformat(), operation_id),
+    )
+    conn.commit()
+
+    if cas_cursor.rowcount == 0:
+        # Kalah race atau status sudah bukan pending/approved
+        current = conn.execute(
+            "SELECT status FROM operations WHERE id=?", (operation_id,)
+        ).fetchone()
         conn.close()
+        current_status = current["status"] if current else "unknown"
         return {
             "ok": False,
-            "error": f"Status operasi '{op['status']}' tidak bisa dieksekusi",
+            "error": f"Status operasi '{current_status}' tidak bisa dieksekusi (sudah dieksekusi atau sedang berjalan)",
         }
 
     params = json.loads(op["params_json"] or "{}")
@@ -456,13 +476,8 @@ def execute_operation(operation_id: str) -> dict:
         "UPDATE operations SET snapshot_ref=?, rollback_command=? WHERE id=?",
         (snapshot_ref, rollback_command, operation_id),
     )
-
-    # State: executing
-    conn.execute(
-        "UPDATE operations SET status='executing', executed_at=? WHERE id=?",
-        (datetime.utcnow().isoformat(), operation_id),
-    )
     conn.commit()
+
     _emit("operation_executing", {
         "operation_id": operation_id, "tool_name": op["tool_name"]
     })
