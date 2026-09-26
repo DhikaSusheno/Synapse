@@ -2,7 +2,7 @@
 
 // components/OperationsSidebar.tsx
 // FE-2 placeholder - approve/deny controls + penjelasan operasi
-// Owner FE-2: @ShannWasHere (wiring ke API asli)
+// Owner FE-2: @ShannWasHere (wiring ke API asli + encoding fix)
 // Owner FE-1: @nabilfauzandafa (state, explain_topic panel, repo_health, event log)
 
 import { useEffect, useRef, useState } from "react";
@@ -38,7 +38,7 @@ interface Props {
   selectedNode: GraphNode | null;
 }
 
-// ─── Badge ──────────────────────────────────────────────────────────────────────
+// --- Badge ---
 function BlastBadge({ level }: { level: Operation["blast_radius"] }) {
   const styles: Record<string, string> = {
     high: "bg-red-900 text-red-300",
@@ -62,7 +62,7 @@ function StatusBadge({ status }: { status: GraphNode["status"] }) {
   return <span className={`text-xs px-2 py-0.5 rounded-full font-mono ${styles[status] ?? styles.idle}`}>{status}</span>;
 }
 
-// ─── Kartu operasi ─────────────────────────────────────────────────────────────────
+// --- Kartu operasi ---
 function OperationCard({ op }: { op: Operation }) {
   const [loading, setLoading] = useState(false);
   const [localStatus, setLocalStatus] = useState(op.status);
@@ -105,7 +105,7 @@ function OperationCard({ op }: { op: Operation }) {
           if (!execData?.ok) setErrorMsg(execData?.error ?? "Execute gagal.");
         } else {
           setLocalStatus("failed");
-          setErrorMsg("Execute gagal — lihat log backend.");
+          setErrorMsg("Execute gagal - lihat log backend.");
         }
       }
     } finally {
@@ -127,7 +127,7 @@ function OperationCard({ op }: { op: Operation }) {
       </div>
       {op.conflicts && op.conflicts.length > 0 && (
         <div className="text-xs text-red-400 flex items-center gap-1">
-          <span>⚡</span>
+          <span>&#9888;</span>
           <span>Konflik dengan: {op.conflicts.join(", ")}</span>
         </div>
       )}
@@ -151,14 +151,14 @@ function OperationCard({ op }: { op: Operation }) {
             disabled={loading}
             className="flex-1 text-xs py-1.5 rounded bg-green-700 hover:bg-green-600 text-white font-semibold disabled:opacity-50 transition-colors"
           >
-            {loading ? "…" : "✅ Approve"}
+            {loading ? "..." : "Approve"}
           </button>
           <button
             onClick={() => decide("denied")}
             disabled={loading}
             className="flex-1 text-xs py-1.5 rounded bg-red-800 hover:bg-red-700 text-white font-semibold disabled:opacity-50 transition-colors"
           >
-            {loading ? "…" : "❌ Deny"}
+            {loading ? "..." : "Deny"}
           </button>
         </div>
       )}
@@ -166,7 +166,7 @@ function OperationCard({ op }: { op: Operation }) {
   );
 }
 
-// ─── Panel info node + explain_topic ─────────────────────────────────────────────
+// --- Panel info node + explain_topic ---
 interface ExplainResult {
   definition: string;
   mental_model: string;
@@ -211,11 +211,11 @@ function NodeInfoPanel({ node }: { node: GraphNode }) {
         </div>
       )}
       {USE_LIVE && explainLoading && (
-        <div className="text-xs text-slate-500 animate-pulse">Menanya graph…</div>
+        <div className="text-xs text-slate-500 animate-pulse">Menanya graph...</div>
       )}
       {USE_LIVE && explain && (
         <div className="space-y-1.5 pt-1 border-t border-slate-700">
-          <div className="text-xs text-slate-400 uppercase tracking-wide">🧠 Explain</div>
+          <div className="text-xs text-slate-400 uppercase tracking-wide">Explain</div>
           <p className="text-xs text-slate-300">{explain.definition}</p>
           <p className="text-xs text-slate-400 italic">{explain.mental_model}</p>
           {explain.complexity_note && <p className="text-xs text-amber-400">{explain.complexity_note}</p>}
@@ -229,14 +229,14 @@ function NodeInfoPanel({ node }: { node: GraphNode }) {
   );
 }
 
-// ─── Event log — tabel live SSE events (deliverable #6 PRD) ───────────────────────
+// --- Event log - tabel live SSE events (deliverable #6 PRD) ---
 interface EventLogEntry {
   ts: string;
   event: string;
   summary: string;
 }
 
-// Hook global — subscribe SSE stream dan catat semua event ke log
+// Hook global - subscribe SSE stream dan catat semua event ke log
 function useEventLog(enabled: boolean): EventLogEntry[] {
   const [log, setLog] = useState<EventLogEntry[]>([]);
   const esRef = useRef<EventSource | null>(null);
@@ -251,7 +251,7 @@ function useEventLog(enabled: boolean): EventLogEntry[] {
         if (parsed.event === "heartbeat" || parsed.event === "connected") return;
         const summary = (() => {
           const d = parsed.data;
-          if (d.operation_id) return `op ${String(d.operation_id).slice(0, 8)}… ${d.tool_name ?? ""}`.trim();
+          if (d.operation_id) return `op ${String(d.operation_id).slice(0, 8)}... ${d.tool_name ?? ""}`.trim();
           if (d.current_doc) return `ingest: ${d.current_doc}`;
           if (d.repo) return `graph: ${d.repo}`;
           return JSON.stringify(d).slice(0, 60);
@@ -286,7 +286,7 @@ const EVENT_COLORS: Record<string, string> = {
 function EventLogPanel({ log }: { log: EventLogEntry[] }) {
   if (log.length === 0) {
     return (
-      <p className="text-xs text-slate-500 px-0.5">Menunggu event dari backend…</p>
+      <p className="text-xs text-slate-500 px-0.5">Menunggu event dari backend.</p>
     );
   }
   return (
@@ -304,7 +304,7 @@ function EventLogPanel({ log }: { log: EventLogEntry[] }) {
   );
 }
 
-// ─── Hook: fetch operasi dari backend, fallback ke mock ───────────────────────────
+// --- Hook: fetch operasi dari backend, fallback ke mock ---
 function useOperations() {
   const [ops, setOps] = useState<Operation[]>(MOCK_OPERATIONS);
 
@@ -341,7 +341,7 @@ function useOperations() {
   return ops;
 }
 
-// ─── Sidebar utama ────────────────────────────────────────────────────────────
+// --- Sidebar utama ---
 export default function OperationsSidebar({ selectedNode }: Props) {
   const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
   const ops = useOperations();
@@ -354,7 +354,7 @@ export default function OperationsSidebar({ selectedNode }: Props) {
       <div className="px-4 py-3 border-b border-slate-700">
         <h2 className="text-sm font-semibold text-slate-200">Operations</h2>
         <p className="text-xs text-slate-500 mt-0.5">
-          {USE_LIVE ? "🟢 Live — dari backend" : "🟡 Mock — data simulasi"}
+          {USE_LIVE ? "LIVE - dari backend" : "MOCK - data simulasi"}
         </p>
         <div className="flex gap-1 mt-2">
           {(["ops", "log"] as const).map((tab) => (
@@ -367,7 +367,7 @@ export default function OperationsSidebar({ selectedNode }: Props) {
                   : "text-slate-500 hover:text-slate-300"
               }`}
             >
-              {tab === "ops" ? "🛡️ Ops" : "📝 Log"}
+              {tab === "ops" ? "Ops" : "Log"}
             </button>
           ))}
         </div>
