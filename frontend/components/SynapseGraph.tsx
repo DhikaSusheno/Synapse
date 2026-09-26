@@ -14,8 +14,6 @@ import { useMockSimulation } from "@/hooks/useMockSimulation";
 import { useSSE, type IngestProgress } from "@/hooks/useSSE";
 import type { GraphNode, GraphLink } from "@/lib/types";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
-
 // react-force-graph-2d tidak support SSR
 const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), {
   ssr: false,
@@ -41,6 +39,7 @@ interface BackendEdge {
 
 interface Props {
   onNodeClick?: (node: GraphNode) => void;
+  onNodeCount?: (nodes: number, links: number) => void;
 }
 
 // ─── Canvas pulse/blink renderer ────────────────────────────────────────────
@@ -151,8 +150,6 @@ function useInitialGraph(
         const res = await fetch("/api/graph");
         if (!res.ok) return;
         const data = await res.json();
-
-        // nodes dari backend: { id, type, name, meta_json }
         if (Array.isArray(data.nodes) && data.nodes.length > 0) {
           setNodes(
             data.nodes.map((n: { id: string; type: GraphNode["type"]; name: string }) => ({
@@ -163,8 +160,6 @@ function useInitialGraph(
             }))
           );
         }
-
-        // edges dari backend: { source_id, target_id, relationship }
         if (Array.isArray(data.edges) && data.edges.length > 0) {
           setLinks(
             data.edges.map((e: BackendEdge) => ({
@@ -183,7 +178,7 @@ function useInitialGraph(
 }
 
 // ─── Komponen utama ──────────────────────────────────────────────────────────
-export default function SynapseGraph({ onNodeClick }: Props) {
+export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
   const [nodes, setNodes] = useState<GraphNode[]>(USE_LIVE ? [] : MOCK_NODES);
   const [links, setLinks] = useState<GraphLink[]>(USE_LIVE ? [] : MOCK_LINKS);
   const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(null);
@@ -192,6 +187,11 @@ export default function SynapseGraph({ onNodeClick }: Props) {
   const animTime = useAnimationTime();
   const animTimeRef = useRef(animTime);
   animTimeRef.current = animTime;
+
+  // Kirim node/link count ke parent tiap kali berubah
+  useEffect(() => {
+    onNodeCount?.(nodes.length, links.length);
+  }, [nodes.length, links.length, onNodeCount]);
 
   // Sesuaikan ukuran canvas dengan container
   useEffect(() => {
@@ -207,28 +207,19 @@ export default function SynapseGraph({ onNodeClick }: Props) {
     return () => ro.disconnect();
   }, []);
 
-  // Initial load dari backend (hanya saat LIVE)
   useInitialGraph(setNodes, setLinks, USE_LIVE);
 
-  // Fungsi update status node
   const handleNodeStatusUpdate = useCallback(
     (nodeId: string, status: GraphNode["status"]) => {
       setNodes((prev) => {
         const exists = prev.find((n) => n.id === nodeId);
-        if (exists) {
-          return prev.map((n) => (n.id === nodeId ? { ...n, status } : n));
-        }
-        // Node baru dari SSE (operasi baru yang diproposekan)
-        return [
-          ...prev,
-          { id: nodeId, name: nodeId, type: "operation" as const, status },
-        ];
+        if (exists) return prev.map((n) => (n.id === nodeId ? { ...n, status } : n));
+        return [...prev, { id: nodeId, name: nodeId, type: "operation" as const, status }];
       });
     },
     []
   );
 
-  // Fungsi tambah/update node dari SSE graph_update
   const handleGraphUpdate = useCallback((newNodes: GraphNode[]) => {
     setNodes((prev) => {
       const existingIds = new Set(prev.map((n) => n.id));
@@ -237,10 +228,8 @@ export default function SynapseGraph({ onNodeClick }: Props) {
     });
   }, []);
 
-  // Mock simulation (aktif saat USE_LIVE = false)
   useMockSimulation(handleNodeStatusUpdate, !USE_LIVE);
 
-  // Live SSE
   useSSE({
     onNodeUpdate: handleNodeStatusUpdate,
     onGraphUpdate: handleGraphUpdate,
@@ -248,7 +237,6 @@ export default function SynapseGraph({ onNodeClick }: Props) {
     enabled: USE_LIVE,
   });
 
-  // Hapus progress overlay setelah 3 detik tidak ada update
   useEffect(() => {
     if (!ingestProgress) return;
     const t = setTimeout(() => setIngestProgress(null), 3000);
@@ -297,6 +285,11 @@ export default function SynapseGraph({ onNodeClick }: Props) {
             {label}
           </span>
         ))}
+        {/* Node + Edge count */}
+        <div className="mt-2 pt-2 border-t border-slate-700 text-slate-500 space-y-0.5">
+          <div>{nodes.length} nodes</div>
+          <div>{links.length} edges</div>
+        </div>
       </div>
 
       {/* Mode badge */}
@@ -313,12 +306,14 @@ export default function SynapseGraph({ onNodeClick }: Props) {
       {/* Ingest progress overlay */}
       {ingestProgress && (
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 bg-slate-800/90 backdrop-blur rounded-lg px-4 py-2 text-xs text-slate-300 flex items-center gap-2 shadow-lg">
-          <span className="animate-spin inline-block">⧗</span>
+          <span className="inline-block animate-spin">⧗</span>
           <span>
-            Ingesting <span className="text-slate-100 font-mono">{ingestProgress.current_doc}</span>
+            Ingesting{" "}
+            <span className="text-slate-100 font-mono">{ingestProgress.current_doc}</span>
             {ingestProgress.stats.files !== undefined && (
               <span className="text-slate-400">
-                {" "}({ingestProgress.stats.files} files, {ingestProgress.stats.symbols} symbols)
+                {" "}({ingestProgress.stats.files} files,{" "}
+                {ingestProgress.stats.symbols} symbols)
               </span>
             )}
           </span>
@@ -326,10 +321,16 @@ export default function SynapseGraph({ onNodeClick }: Props) {
       )}
 
       {/* Empty state saat live mode dan graph kosong */}
-      {USE_LIVE && nodes.length === 0 && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-slate-500">
-          <span className="text-2xl">🧠</span>
-          <span className="text-sm">Graph kosong. Panggil <code className="bg-slate-800 px-1 rounded">POST /understand_repo</code> untuk mulai ingest.</span>
+      {USE_LIVE && nodes.length === 0 && !ingestProgress && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-slate-500 pointer-events-none">
+          <span className="text-3xl">🧠</span>
+          <span className="text-sm">
+            Graph kosong.{" "}
+            <code className="bg-slate-800 px-1 rounded text-slate-400">
+              POST /understand_repo
+            </code>{" "}
+            untuk mulai ingest.
+          </span>
         </div>
       )}
 
