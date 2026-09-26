@@ -5,7 +5,7 @@
 // Sesuai prototype prototawalsynapse.jpeg
 // FE-1 @nabilfauzandafa · FE-2 @ShannWasHere
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import type { GraphNode, Operation } from "@/lib/types";
 import type { NavPage } from "@/components/LeftNav";
@@ -20,6 +20,9 @@ const OverviewMain = dynamic(() => import("@/components/OverviewMain"), { ssr: f
   loading: () => <div className="flex-1 flex items-center justify-center text-slate-400 text-sm">Loading...</div>
 });
 const OperationsSidebar = dynamic(() => import("@/components/OperationsSidebar"), { ssr: false });
+const SynapseGraph = dynamic(() => import("@/components/SynapseGraph"), { ssr: false,
+  loading: () => <div className="flex items-center justify-center h-full text-slate-400 text-sm">Loading graph...</div>
+});
 
 const MOCK_OPERATIONS: Operation[] = [
   {
@@ -90,6 +93,387 @@ function useOperations(): [Operation[], (id: string, d: "approved" | "denied") =
   return [ops, handleDecided];
 }
 
+// ---------------------------------------------------------------------------
+// SynapseGraphFull — wrapper untuk halaman code-graph (full-width)
+// FE-2 @ShannWasHere
+// ---------------------------------------------------------------------------
+function SynapseGraphFull({
+  onNodeClick,
+  onNodeCount,
+}: {
+  onNodeClick: (node: GraphNode) => void;
+  onNodeCount: (n: number, l: number) => void;
+}) {
+  return (
+    <div className="w-full h-full">
+      <SynapseGraph onNodeClick={onNodeClick} onNodeCount={onNodeCount} />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ApprovalsPage — halaman khusus approvals dengan layout full + semua pending ops
+// FE-2 @ShannWasHere
+// ---------------------------------------------------------------------------
+
+const BLAST_BADGE: Record<string, string> = {
+  high:    "bg-red-500/20 text-red-400 border border-red-500/30",
+  medium:  "bg-yellow-500/20 text-yellow-400 border border-yellow-500/30",
+  low:     "bg-green-500/20 text-green-400 border border-green-500/30",
+  unknown: "bg-slate-700 text-slate-400 border border-slate-600",
+};
+
+const STATUS_BADGE: Record<string, string> = {
+  pending:     "bg-yellow-500/20 text-yellow-400 border border-yellow-500/30",
+  approved:    "bg-blue-500/20 text-blue-400 border border-blue-500/30",
+  executing:   "bg-orange-500/20 text-orange-400 border border-orange-500/30",
+  verified:    "bg-green-500/20 text-green-400 border border-green-500/30",
+  failed:      "bg-red-500/20 text-red-400 border border-red-500/30",
+  rolled_back: "bg-red-500/20 text-red-300 border border-red-500/30",
+  denied:      "bg-slate-700 text-slate-400 border border-slate-600",
+  idle:        "bg-slate-700 text-slate-500 border border-slate-700",
+};
+
+function ApprovalCard({
+  op,
+  onDecided,
+}: {
+  op: Operation;
+  onDecided?: (id: string, d: "approved" | "denied") => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [localStatus, setLocalStatus] = useState(op.status);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  async function decide(decision: "approved" | "denied") {
+    setLoading(true);
+    setErrorMsg(null);
+    try {
+      const approveRes = await fetch(`${BACKEND_URL}/approve_operation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ operation_id: op.id, decision }),
+      }).catch(() => null);
+
+      if (!approveRes || !approveRes.ok) {
+        setLocalStatus(decision === "approved" ? "approved" : "failed");
+        onDecided?.(op.id, decision);
+        return;
+      }
+
+      setLocalStatus(decision === "approved" ? "approved" : "failed");
+
+      if (decision === "approved") {
+        setLocalStatus("executing");
+        const execRes = await fetch(`${BACKEND_URL}/execute_operation`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operation_id: op.id }),
+        }).catch(() => null);
+        if (execRes?.ok) {
+          const execData = await execRes.json().catch(() => null);
+          setLocalStatus((execData?.status ?? "verified") as Operation["status"]);
+          if (!execData?.ok) setErrorMsg(execData?.error ?? "Execute failed.");
+        } else {
+          setLocalStatus("failed");
+          setErrorMsg("Execute failed — check backend log.");
+        }
+      }
+      onDecided?.(op.id, decision);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const params = (() => { try { return JSON.parse(op.params_json); } catch { return {}; } })();
+  const isDone = localStatus !== "pending";
+
+  return (
+    <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-4 space-y-3">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-white truncate">{op.tool_name}</div>
+          {params.sql && (
+            <div className="text-xs text-slate-400 font-mono mt-0.5 truncate">{params.sql}</div>
+          )}
+          {op.target_node_id && (
+            <div className="text-xs text-slate-500 mt-0.5 truncate">Target: {op.target_node_id}</div>
+          )}
+        </div>
+        <div className="flex flex-col items-end gap-1.5 shrink-0">
+          <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border ${BLAST_BADGE[op.blast_radius] ?? BLAST_BADGE.unknown}`}>
+            {op.blast_radius.toUpperCase()} RISK
+          </span>
+          <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border ${STATUS_BADGE[localStatus] ?? STATUS_BADGE.idle}`}>
+            {localStatus.toUpperCase()}
+          </span>
+        </div>
+      </div>
+
+      {/* Meta */}
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+        <span className="text-slate-500">ID</span>
+        <span className="text-slate-400 font-mono truncate">{op.id.slice(0, 16)}…</span>
+        <span className="text-slate-500">Time</span>
+        <span className="text-slate-400">{new Date(op.created_at).toLocaleString()}</span>
+      </div>
+
+      {op.conflicts && op.conflicts.length > 0 && (
+        <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-3 py-2 flex items-center gap-1.5">
+          <span>&#9888;</span>
+          <span>Conflicts with: {op.conflicts.join(", ")}</span>
+        </div>
+      )}
+
+      {errorMsg && (
+        <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-3 py-2">{errorMsg}</div>
+      )}
+
+      {!isDone ? (
+        <div className="flex gap-2 pt-1">
+          <button
+            onClick={() => decide("approved")}
+            disabled={loading}
+            className="flex-1 py-2 rounded-lg bg-green-600 hover:bg-green-500 text-white text-xs font-bold transition-colors disabled:opacity-50"
+          >
+            {loading ? "..." : "Approve"}
+          </button>
+          <button
+            onClick={() => decide("denied")}
+            disabled={loading}
+            className="flex-1 py-2 rounded-lg bg-red-700/80 hover:bg-red-600 text-white text-xs font-bold transition-colors disabled:opacity-50"
+          >
+            {loading ? "..." : "Deny"}
+          </button>
+        </div>
+      ) : (
+        <div className={`text-xs text-center py-2 rounded-lg font-semibold ${
+          localStatus === "verified" || localStatus === "approved"
+            ? "bg-green-900/30 text-green-400"
+            : localStatus === "failed" || localStatus === "rolled_back"
+            ? "bg-red-900/30 text-red-400"
+            : "bg-slate-700/50 text-slate-400"
+        }`}>
+          {localStatus.toUpperCase()}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ApprovalsPage({
+  ops,
+  onOpDecided,
+}: {
+  ops: Operation[];
+  onOpDecided: (id: string, d: "approved" | "denied") => void;
+}) {
+  const pending = ops.filter((op) => op.status === "pending");
+  const decided = ops.filter((op) => op.status !== "pending");
+
+  return (
+    <div className="flex-1 overflow-y-auto bg-[#080d14] p-6 space-y-6">
+      <div>
+        <h1 className="text-xl font-bold text-white">Approvals</h1>
+        <p className="text-sm text-slate-400 mt-0.5">
+          Review and approve or deny pending risky operations.
+        </p>
+      </div>
+
+      {/* Pending */}
+      <div>
+        <div className="flex items-center gap-2 mb-3">
+          <h2 className="text-sm font-semibold text-white">Pending</h2>
+          {pending.length > 0 && (
+            <span className="text-xs bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 px-2 py-0.5 rounded-full font-bold">
+              {pending.length}
+            </span>
+          )}
+        </div>
+        {pending.length === 0 ? (
+          <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-6 text-xs text-slate-500 text-center">
+            No pending approvals
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-3">
+            {pending.map((op) => (
+              <ApprovalCard key={op.id} op={op} onDecided={onOpDecided} />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* History */}
+      {decided.length > 0 && (
+        <div>
+          <h2 className="text-sm font-semibold text-white mb-3">History</h2>
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-3">
+            {decided.map((op) => (
+              <ApprovalCard key={op.id} op={op} onDecided={onOpDecided} />
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// OperationsPage — daftar semua operasi dari backend /operations
+// FE-2 @ShannWasHere
+// ---------------------------------------------------------------------------
+
+interface BackendOperation {
+  id: string;
+  tool_name: string;
+  params_json: string;
+  target_node_id: string | null;
+  blast_radius: string;
+  status: string;
+  requires_approval: number;
+  created_at: string;
+  executed_at: string | null;
+  verified_at: string | null;
+}
+
+function OperationsPage() {
+  const [ops, setOps] = useState<BackendOperation[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<string>("all");
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const url = statusFilter === "all"
+        ? `${BACKEND_URL}/operations?limit=50`
+        : `${BACKEND_URL}/operations?status=${statusFilter}&limit=50`;
+      const res = await fetch(url, { cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        setOps(Array.isArray(data) ? data : []);
+      } else {
+        setError("Backend tidak dapat dijangkau");
+      }
+    } catch {
+      setError("Backend offline — tidak ada data live");
+    }
+  }, [statusFilter]);
+
+  useEffect(() => {
+    setLoading(true);
+    load().finally(() => setLoading(false));
+    intervalRef.current = setInterval(load, 5000);
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [load]);
+
+  const STATUS_OPTIONS = ["all", "pending", "approved", "executing", "verified", "failed", "rolled_back", "denied"];
+
+  return (
+    <div className="flex-1 overflow-y-auto bg-[#080d14] p-6 space-y-4">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-bold text-white">Operations</h1>
+          <p className="text-sm text-slate-400 mt-0.5">
+            Full history of all proposed and executed operations.
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="text-xs text-slate-500">Filter:</span>
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className="text-xs bg-slate-800 border border-slate-700/60 rounded-lg px-2.5 py-1.5 text-slate-300 outline-none"
+          >
+            {STATUS_OPTIONS.map((s) => (
+              <option key={s} value={s}>{s === "all" ? "All Status" : s}</option>
+            ))}
+          </select>
+          <button
+            onClick={() => load()}
+            className="text-xs px-3 py-1.5 rounded-lg border border-slate-700/60 text-slate-400 hover:text-slate-200 hover:border-slate-600 transition-colors"
+          >
+            &#8635; Refresh
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div className="bg-yellow-900/20 border border-yellow-500/30 rounded-xl px-4 py-3 text-xs text-yellow-400">
+          {error} — showing data from last successful load.
+        </div>
+      )}
+
+      {loading && ops.length === 0 ? (
+        <div className="flex items-center justify-center py-16 text-slate-500 text-sm">
+          Loading operations...
+        </div>
+      ) : ops.length === 0 ? (
+        <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-10 text-xs text-slate-500 text-center">
+          No operations found.{" "}
+          <code className="bg-slate-800 px-1 rounded text-slate-400">POST /propose_operation</code>{" "}
+          to create one.
+        </div>
+      ) : (
+        <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 overflow-hidden">
+          {/* Table header */}
+          <div className="grid grid-cols-[minmax(0,2fr)_120px_100px_100px_140px] gap-3 px-4 py-2.5 border-b border-slate-800/60 text-[10px] text-slate-500 uppercase tracking-wide font-semibold">
+            <span>Tool / Target</span>
+            <span>Blast Radius</span>
+            <span>Status</span>
+            <span>Approval</span>
+            <span>Created</span>
+          </div>
+          {/* Rows */}
+          <div className="divide-y divide-slate-800/40">
+            {ops.map((op) => {
+              const params = (() => { try { return JSON.parse(op.params_json); } catch { return {}; } })();
+              return (
+                <div
+                  key={op.id}
+                  className="grid grid-cols-[minmax(0,2fr)_120px_100px_100px_140px] gap-3 px-4 py-3 hover:bg-slate-800/30 transition-colors items-center"
+                >
+                  {/* Tool / Target */}
+                  <div className="min-w-0">
+                    <div className="text-xs font-medium text-white truncate">{op.tool_name}</div>
+                    {params.sql && (
+                      <div className="text-[10px] text-slate-500 font-mono truncate">{params.sql}</div>
+                    )}
+                    {op.target_node_id && (
+                      <div className="text-[10px] text-slate-600 truncate">{op.target_node_id}</div>
+                    )}
+                  </div>
+                  {/* Blast Radius */}
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border w-fit ${BLAST_BADGE[op.blast_radius] ?? BLAST_BADGE.unknown}`}>
+                    {op.blast_radius.toUpperCase()}
+                  </span>
+                  {/* Status */}
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border w-fit ${STATUS_BADGE[op.status] ?? STATUS_BADGE.idle}`}>
+                    {op.status}
+                  </span>
+                  {/* Approval */}
+                  <span className="text-[10px] text-slate-400">
+                    {op.requires_approval ? "Required" : "Auto"}
+                  </span>
+                  {/* Created */}
+                  <span className="text-[10px] text-slate-500 font-mono">
+                    {new Date(op.created_at).toLocaleString()}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function HomePage() {
   const [activePage, setActivePage] = useState<NavPage>("overview");
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
@@ -134,21 +518,21 @@ export default function HomePage() {
         {activePage === "code-graph" && (
           <div className="flex flex-1 overflow-hidden">
             <main className="flex-1 overflow-hidden relative">
-              {/* Inline dynamic import to avoid circular dep */}
-              <div className="w-full h-full" id="code-graph-full" />
+              <SynapseGraphFull onNodeClick={setSelectedNode} onNodeCount={handleNodeCount} />
             </main>
             <OperationsSidebar selectedNode={selectedNode} />
           </div>
         )}
 
         {activePage === "approvals" && (
-          <div className="flex-1 overflow-y-auto p-6">
-            <h1 className="text-xl font-bold text-white mb-4">Approvals</h1>
-            <OperationsSidebar selectedNode={selectedNode} />
-          </div>
+          <ApprovalsPage ops={ops} onOpDecided={handleOpDecided} />
         )}
 
-        {(activePage === "guardian" || activePage === "cortex" || activePage === "operations" || activePage === "security" || activePage === "settings") && (
+        {activePage === "operations" && (
+          <OperationsPage />
+        )}
+
+        {(activePage === "guardian" || activePage === "cortex" || activePage === "security" || activePage === "settings") && (
           <div className="flex-1 flex items-center justify-center text-slate-500">
             <div className="text-center">
               <div className="text-4xl mb-3">&#128736;</div>

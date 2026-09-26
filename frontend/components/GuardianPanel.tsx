@@ -199,41 +199,46 @@ function CortexInsightPanel() {
 }
 
 export default function GuardianPanel({ pendingOps, onOpDecided }: Props) {
-  const firstPending = pendingOps.find((op) => op.status === "pending");
+  const pendingList = pendingOps.filter((op) => op.status === "pending");
 
   return (
-    <aside className="w-72 shrink-0 flex flex-col gap-3 overflow-y-auto p-3 bg-[#0d1117] border-l border-slate-800/60">
-      {/* Guardian header */}
-      <div className="rounded-xl border border-slate-700/60 bg-slate-800/40 p-3.5">
-        <div className="flex items-center justify-between mb-1.5">
-          <div className="flex items-center gap-2">
-            <span className="w-6 h-6 rounded-lg bg-green-500/20 border border-green-500/40 flex items-center justify-center text-xs">&#9672;</span>
-            <span className="text-sm font-semibold text-white">Guardian</span>
+    <aside className="w-72 shrink-0 flex flex-col bg-[#0d1117] border-l border-slate-800/60 overflow-hidden">
+      {/* Guardian header — fixed */}
+      <div className="p-3 shrink-0">
+        <div className="rounded-xl border border-slate-700/60 bg-slate-800/40 p-3.5">
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-2">
+              <span className="w-6 h-6 rounded-lg bg-green-500/20 border border-green-500/40 flex items-center justify-center text-xs">&#9672;</span>
+              <span className="text-sm font-semibold text-white">Guardian</span>
+            </div>
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 border border-green-500/30 font-bold tracking-wide">PROTECTED</span>
           </div>
-          <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 border border-green-500/30 font-bold tracking-wide">PROTECTED</span>
-        </div>
-        <div className="text-[11px] text-slate-400">
-          Monitoring operations &nbsp;&#183;&nbsp; Detecting risky changes
+          <div className="text-[11px] text-slate-400">
+            Monitoring operations &nbsp;&#183;&nbsp; Detecting risky changes
+          </div>
+          {pendingList.length > 0 && (
+            <div className="mt-1.5 text-[10px] text-yellow-400 font-semibold">
+              {pendingList.length} pending approval{pendingList.length > 1 ? "s" : ""}
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Pending approval card */}
-      {firstPending && (
-        <PendingApprovalCard
-          op={firstPending}
-          onDecided={onOpDecided}
-        />
-      )}
+      {/* Scrollable pending list */}
+      <div className="flex-1 overflow-y-auto px-3 space-y-3 pb-3">
+        {pendingList.length === 0 ? (
+          <div className="rounded-xl border border-slate-700/60 bg-slate-800/40 p-3.5 text-xs text-slate-500 text-center">
+            No pending approvals
+          </div>
+        ) : (
+          pendingList.map((op) => (
+            <PendingApprovalCard key={op.id} op={op} onDecided={onOpDecided} />
+          ))
+        )}
 
-      {/* If no pending */}
-      {!firstPending && (
-        <div className="rounded-xl border border-slate-700/60 bg-slate-800/40 p-3.5 text-xs text-slate-500 text-center">
-          No pending approvals
-        </div>
-      )}
-
-      {/* Cortex insight */}
-      <CortexInsightPanel />
+        {/* Cortex insight */}
+        <CortexInsightPanel />
+      </div>
     </aside>
   );
 }

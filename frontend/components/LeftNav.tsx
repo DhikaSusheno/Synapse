@@ -17,7 +17,7 @@ interface Props {
 const NAV_ITEMS: { id: NavPage; icon: string; label: string }[] = [
   { id: "overview",    icon: "&#9632;",  label: "Overview" },
   { id: "code-graph",  icon: "&#9903;",  label: "Code Graph" },
-  { id: "guardian",    icon: "&#9shieldtext;", label: "Guardian" },
+  { id: "guardian",    icon: "&#9672;",  label: "Guardian" },
   { id: "cortex",      icon: "&#9736;",  label: "Cortex" },
   { id: "approvals",   icon: "&#9745;",  label: "Approvals" },
   { id: "operations",  icon: "&#9881;",  label: "Operations" },
