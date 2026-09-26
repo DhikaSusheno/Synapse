@@ -51,7 +51,7 @@ invariants:
     applies_to: config.write
     check: file_exists
     params:
-      path_from: params.path    # path diambil dari params operasi
+      path_from: params.file_path    # path diambil dari params operasi
     on_fail: rollback
     description: >
       Setelah config.write, pastikan file target ada. Jika tidak (disk penuh,
@@ -61,7 +61,7 @@ invariants:
     applies_to: config.write
     check: file_size_gte
     params:
-      path_from: params.path
+      path_from: params.file_path
       min_bytes: 1
     on_fail: warn
     description: >
@@ -72,7 +72,7 @@ invariants:
     applies_to: file.delete
     check: file_not_exists
     params:
-      path_from: params.path
+      path_from: params.file_path
     on_fail: warn
     description: >
       Setelah file.delete, file target seharusnya tidak ada lagi.

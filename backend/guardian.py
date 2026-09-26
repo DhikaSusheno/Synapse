@@ -38,6 +38,27 @@ Bug fixes (dari security/TEST_SCENARIOS.md Bug Findings Log):
 
   GLITCH-5 [MEDIUM] _exec_file_delete() tidak validasi snapshot integrity
          FIX: cek bak.exists() dan bak.stat().st_size > 0 sebelum hapus original.
+
+  GLITCH-3 [MEDIUM] synapse.invariants.yaml tidak pernah dibaca
+         FIX: guardian.py sekarang MEMUAT dan MENJALANKAN invariant dari
+               synapse.invariants.yaml lewat _load_invariants()/_run_invariants(),
+               menggantikan if/else hardcoded di _verify_operation().
+               Setelah fix ini, klaim SYNAPSE.md section 1 ("runs the verification
+               checks from synapse.invariants.yaml") benar-benar terpenuhi.
+
+  GLITCH-4 [MEDIUM] get_conn() di database.py dead code
+         FIX: dihapus. Guardian/Cortex tetap membuka koneksi per unit kerja
+               lewat _db_path() yang dibaca ulang tiap panggilan.
+
+  BUG-F [HIGH] rollback diam-diam tidak mengubah apa pun (ditemukan saat verifikasi GLITCH-3)
+         Gejala: _do_rollback() mengembalikan True, tapi file DB tetap rusak.
+         Penyebab: Synapse DB jalan di mode WAL. shutil.copy2() hanya menyalin file
+               utama, sedangkan commit terbaru masih hidup di file -wal; lalu
+               koneksi execute_operation yang masih terbuka akan men-checkpoint
+               WAL basi itu kembali ke file utama setelah restore.
+         FIX: snapshot pakai sqlite3.Connection.backup() (salinan lengkap &
+               konsisten termasuk isi WAL), file -wal/-shm stale dihapus setelah
+               restore, dan koneksi ditutup sebelum _do_rollback() dijalankan.
 """
 
 import json
@@ -47,6 +68,8 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import yaml
+
 import database as _database_module
 from cortex import _emit  # pakai SSE bus milik Cortex
 
@@ -54,6 +77,293 @@ from cortex import _emit  # pakai SSE bus milik Cortex
 def _db_path() -> str:
     """Selalu baca DB_PATH terbaru dari module - support test override."""
     return str(_database_module.DB_PATH)
+
+# ---------------------------------------------------------------------------
+# GLITCH-3 FIX: pemuat synapse.invariants.yaml
+# ---------------------------------------------------------------------------
+
+INVARIANTS_PATH = Path(__file__).with_name("synapse.invariants.yaml")
+
+_invariants_cache: list[dict] | None = None
+
+
+def _load_invariants() -> list[dict]:
+    """
+    GLITCH-3 FIX: muat invariant dari synapse.invariants.yaml (di-cache per proses).
+
+    Fail-closed: kalau file hilang / YAML rusak / tidak berisi daftar invariant,
+    fungsi ini tetap mengembalikan daftar kosong (bukan crash), dan
+    _verify_operation() akan menolak operasi karena tidak ada check yang
+    terdefinisi. Keamanan jangan bergantung pada file spec yang bisa hilang.
+    """
+    global _invariants_cache
+    if _invariants_cache is not None:
+        return _invariants_cache
+
+    try:
+        raw = yaml.safe_load(INVARIANTS_PATH.read_text(encoding="utf-8")) or {}
+        items = raw.get("invariants") or []
+        _invariants_cache = [i for i in items if isinstance(i, dict) and i.get("check")]
+    except Exception:
+        _invariants_cache = []
+
+    return _invariants_cache
+
+
+def _invariant_applies(inv: dict, tool_name: str) -> bool:
+    """
+    Cocokkan applies_to dengan tool_name memakai dot-boundary prefix, sama seperti
+    _get_rule(): 'db.run_migration' juga match 'db.run_migration.v2'.
+    Arah ini aman untuk verifikasi (lebih banyak check, bukan lebih sedikit).
+    """
+    applies_to = str(inv.get("applies_to", "*"))
+    if applies_to == "*":
+        return True
+    return tool_name == applies_to or tool_name.startswith(applies_to + ".")
+
+
+def _resolve_path_from(inv_params: dict, op_params: dict) -> str:
+    """
+    Ambil path dari params operasi sesuai 'path_from: params.<key>' di YAML.
+    Key di YAML harus sama dengan key yang dipakai eksekutor ('file_path').
+    """
+    path_from = str(inv_params.get("path_from", ""))
+    if path_from.startswith("params."):
+        return str(op_params.get(path_from[len("params."):], "") or "")
+    return path_from
+
+
+def _resolve_db_path(inv_params: dict, op_params: dict) -> str:
+    """
+    Prioritas: params['db_path'] dari operasi > db_path default di YAML > DB_PATH.
+    params operasi menang supaya test override & multi-DB tetap benar.
+    """
+    return str(op_params.get("db_path") or inv_params.get("db_path") or _db_path())
+
+
+# ---------------------------------------------------------------------------
+# GLITCH-3 FIX: implementasi tiap jenis check
+# ---------------------------------------------------------------------------
+
+def _check_sqlite_tables_exist(inv_params: dict, op_params: dict) -> tuple[bool, str]:
+    db_path = _resolve_db_path(inv_params, op_params)
+    required = [str(t) for t in (inv_params.get("tables") or [])]
+    if not required:
+        return True, "tidak ada tabel yang diminta"
+    if not Path(db_path).exists():
+        return False, f"DB tidak ada: {db_path}"
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            present = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+    except Exception as e:
+        return False, f"DB tidak bisa dibaca: {e}"
+    missing = [t for t in required if t not in present]
+    if missing:
+        return False, f"tabel kontrak hilang: {missing}"
+    return True, f"{len(required)} tabel kontrak ada"
+
+
+def _check_sqlite_pragma(inv_params: dict, op_params: dict) -> tuple[bool, str]:
+    db_path = _resolve_db_path(inv_params, op_params)
+    pragma = str(inv_params.get("pragma", ""))
+    expected = str(inv_params.get("expected_value", ""))
+    if not pragma:
+        return True, "pragma tidak diminta"
+    if not pragma.replace("_", "").isalnum():
+        return False, f"nama pragma tidak valid: {pragma!r}"
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            actual = str(conn.execute(f"PRAGMA {pragma}").fetchone()[0])
+        finally:
+            conn.close()
+    except Exception as e:
+        return False, f"pragma '{pragma}' gagal dibaca: {e}"
+    if actual.strip().lower() != expected.strip().lower():
+        return False, f"pragma {pragma}={actual!r} (hope {expected!r})"
+    return True, f"pragma {pragma}={actual}"
+
+
+def _check_sqlite_row_count_gte(inv_params: dict, op_params: dict) -> tuple[bool, str]:
+    db_path = _resolve_db_path(inv_params, op_params)
+    table = str(inv_params.get("table", ""))
+    min_count = int(inv_params.get("min_count", 0) or 0)
+    if not table:
+        return True, "tabel tidak diminta"
+    if not table.replace("_", "").isalnum():
+        return False, f"nama tabel tidak valid: {table!r}"
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as e:
+        return False, f"tabel '{table}' tidak bisa di-query: {e}"
+    if count < min_count:
+        return False, f"tabel '{table}' punya {count} baris (min {min_count})"
+    return True, f"tabel '{table}' = {count} baris"
+
+
+def _check_file_exists(inv_params: dict, op_params: dict) -> tuple[bool, str]:
+    file_path = _resolve_path_from(inv_params, op_params)
+    if not file_path:
+        return False, "path tidak ada di params operasi"
+    if not Path(file_path).is_file():
+        return False, f"file tidak ditemukan: {file_path}"
+    return True, f"file ada: {file_path}"
+
+
+def _check_file_size_gte(inv_params: dict, op_params: dict) -> tuple[bool, str]:
+    file_path = _resolve_path_from(inv_params, op_params)
+    min_bytes = int(inv_params.get("min_bytes", 0) or 0)
+    if not file_path:
+        return False, "path tidak ada di params operasi"
+    try:
+        size = Path(file_path).stat().st_size
+    except OSError as e:
+        return False, f"file tidak bisa di-stat: {e}"
+    if size < min_bytes:
+        return False, f"file {size} byte (min {min_bytes}): {file_path}"
+    return True, f"file {size} byte: {file_path}"
+
+
+def _check_file_not_exists(inv_params: dict, op_params: dict) -> tuple[bool, str]:
+    file_path = _resolve_path_from(inv_params, op_params)
+    if not file_path:
+        return False, "path tidak ada di params operasi"
+    if Path(file_path).exists():
+        return False, f"file masih ada setelah delete: {file_path}"
+    return True, f"file sudah dihapus: {file_path}"
+
+
+def _check_always_pass(inv_params: dict, op_params: dict) -> tuple[bool, str]:
+    return True, "selalu lolos (stub)"
+
+
+def _check_operation_status_not(inv_params: dict, op_params: dict,
+                                operation_id: str | None) -> tuple[bool, str]:
+    forbidden = str(inv_params.get("forbidden_status", ""))
+    if not operation_id:
+        return True, "tanpa operation_id - dilewati"
+    try:
+        conn = sqlite3.connect(_db_path())
+        try:
+            row = conn.execute(
+                "SELECT status FROM operations WHERE id = ?", (operation_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as e:
+        return False, f"status operasi tidak bisa dibaca: {e}"
+    if not row:
+        return True, "operasi tidak ada (sudah dibersihkan)"
+    if row[0] == forbidden:
+        return False, f"status operasi masih '{forbidden}'"
+    return True, f"status operasi = {row[0]!r}"
+
+
+_INVARIANT_CHECKS = {
+    "sqlite_tables_exist": _check_sqlite_tables_exist,
+    "sqlite_pragma": _check_sqlite_pragma,
+    "sqlite_row_count_gte": _check_sqlite_row_count_gte,
+    "file_exists": _check_file_exists,
+    "file_size_gte": _check_file_size_gte,
+    "file_not_exists": _check_file_not_exists,
+    "always_pass": _check_always_pass,
+}
+
+
+def _run_invariants(tool_name: str, params: dict) -> list[dict]:
+    """
+    GLITCH-3 FIX: jalankan semua invariant yang berlaku untuk tool_name.
+
+    Return list {id, check, passed, on_fail, message}. Invariant global
+    (applies_to='*') TIDAK dievaluasi di sini — lihat _run_global_invariants().
+    """
+    results: list[dict] = []
+    for inv in _load_invariants():
+        if str(inv.get("applies_to", "*")) == "*":
+            continue
+        if not _invariant_applies(inv, tool_name):
+            continue
+
+        inv_id = str(inv.get("id", "?"))
+        check_name = str(inv.get("check", ""))
+        on_fail = str(inv.get("on_fail", "rollback"))
+        handler = _INVARIANT_CHECKS.get(check_name)
+
+        if handler is None:
+            # Tipe check tidak dikenal -> jangan diabaikan diam-diam.
+            results.append({
+                "id": inv_id, "check": check_name, "passed": False,
+                "on_fail": "rollback",
+                "message": f"tipe check '{check_name}' tidak dikenal (fail-closed)",
+            })
+            continue
+
+        try:
+            passed, message = handler(inv.get("params") or {}, params)
+        except Exception as e:
+            passed, message = False, f"invariant error: {e}"
+
+        results.append({
+            "id": inv_id, "check": check_name, "passed": bool(passed),
+            "on_fail": on_fail, "message": message,
+        })
+
+    return results
+
+
+def _run_global_invariants(operation_id: str) -> list[dict]:
+    """
+    Jalankan invariant applies_to='*' SESUDAH status terminal ditulis.
+    Invariant global menilai kebocoran state (mis. status masih 'executing'),
+    sehingga hanya bermakna setelah execute_operation selesai — kalau dijalankan
+    lebih awal, 'operation_status_not_executing' akan false-positive terus.
+    """
+    results: list[dict] = []
+    for inv in _load_invariants():
+        if str(inv.get("applies_to", "*")) != "*":
+            continue
+        inv_id = str(inv.get("id", "?"))
+        check_name = str(inv.get("check", ""))
+        on_fail = str(inv.get("on_fail", "warn"))
+        inv_params = inv.get("params") or {}
+
+        # 'operation_status_not' butuh operation_id, jadi tidak cocok dengan
+        # signature 2-argumen yang dipakai _INVARIANT_CHECKS.
+        if check_name == "operation_status_not":
+            handler = lambda p, _op: _check_operation_status_not(p, _op, operation_id)
+        else:
+            base = _INVARIANT_CHECKS.get(check_name)
+            handler = None if base is None else (lambda p, _op, _f=base: _f(p, _op))
+
+        if handler is None:
+            results.append({
+                "id": inv_id, "check": check_name, "passed": False,
+                "on_fail": "warn",
+                "message": f"tipe check '{check_name}' tidak dikenal",
+            })
+            continue
+
+        try:
+            passed, message = handler(inv_params, {})
+        except Exception as e:
+            passed, message = False, f"invariant error: {e}"
+
+        results.append({
+            "id": inv_id, "check": check_name, "passed": bool(passed),
+            "on_fail": on_fail, "message": message,
+        })
+    return results
 
 # ---------------------------------------------------------------------------
 # Konstanta
@@ -195,6 +505,13 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
     BUG-A FIX: rollback_command disimpan sebagai JSON {"bak": ..., "target": ...}
     sehingga tidak ada ambiguitas split pada Windows path dengan drive letter.
 
+    BUG-F FIX: untuk SQLite, snapshot memakai sqlite3.Connection.backup() dan
+    bukan shutil.copy2(). Synapse DB jalan di mode WAL, jadi commit terbaru bisa
+    masih hidup di file -wal dan belum masuk file DB utama. shutil.copy2() hanya
+    menyalin file utama sehingga .bak bisa kosong dari perubahan terakhir, dan
+    restore-nya tidak pernah mengembalikan data. Backup API menghasilkan salinan
+    yang lengkap & konsisten.
+
     Return (snapshot_ref, rollback_command_json)
     """
     if tool_name.startswith("db.run_migration"):
@@ -203,7 +520,15 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
         bak = f"{db_target}.bak.{ts}"
         try:
-            shutil.copy2(db_target, bak)
+            src = sqlite3.connect(db_target)
+            try:
+                dst = sqlite3.connect(bak)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
             # BUG-A FIX: JSON format, tidak ada ambiguitas colon di Windows path
             rollback_cmd = json.dumps({"bak": bak, "target": db_target})
             return bak, rollback_cmd
@@ -237,10 +562,45 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
     return None, None
 
 
+def _is_sqlite_file(path: str) -> bool:
+    """Cek magic header SQLite ('SQLite format 3\\0')."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
+def _restore_file(bak_path: str, target_path: str) -> bool:
+    """
+    BUG-F FIX: restore file lalu buang artefak WAL stale.
+
+    Kalau target berupa database SQLite, file -wal/-shm yang tersisa dari kondisi
+    SEBELUM rollback harus dihapus. Kalau tidak, SQLite akan me-replay WAL lama
+    saat file dibuka berikutnya dan menerapkan kembali perubahan yang seharusnya
+    sudah dibatalkan — restore terlihat sukses tapi datanya tetap rusak.
+    """
+    try:
+        shutil.copy2(bak_path, target_path)
+    except Exception:
+        return False
+
+    if _is_sqlite_file(target_path):
+        for suffix in ("-wal", "-shm"):
+            try:
+                Path(target_path + suffix).unlink()
+            except OSError:
+                pass
+    return True
+
+
 def _do_rollback(rollback_command: str | None) -> bool:
     """
     BUG-A FIX: rollback_command sekarang JSON {"bak": "...", "target": "..."}.
     Tidak ada lagi ambiguitas split pada Windows path (C:\\path punya colon).
+
+    BUG-F FIX: setelah file direstore, artefak -wal/-shm stale dibuang supaya
+    SQLite tidak me-replay perubahan lama di atas file yang sudah dipulihkan.
 
     Backward compat: jika format lama "restore_from:<bak>:<target>" masih ada
     di DB (dari commit sebelumnya), fallback ke split lama.
@@ -252,11 +612,7 @@ def _do_rollback(rollback_command: str | None) -> bool:
     try:
         data = json.loads(rollback_command)
         if isinstance(data, dict) and "bak" in data and "target" in data:
-            try:
-                shutil.copy2(data["bak"], data["target"])
-                return True
-            except Exception:
-                return False
+            return _restore_file(data["bak"], data["target"])
     except (json.JSONDecodeError, ValueError):
         pass  # bukan JSON, coba format lama
 
@@ -269,37 +625,100 @@ def _do_rollback(rollback_command: str | None) -> bool:
         else:
             bak_path = parts[1]
             target_path = parts[2]
-        try:
-            shutil.copy2(bak_path, target_path)
-            return True
-        except Exception:
-            return False
+        return _restore_file(bak_path, target_path)
 
     return False
 
 
-def _verify_operation(tool_name: str, params: dict) -> tuple[bool, str]:
-    """Verifikasi post-conditions setelah eksekusi."""
-    if tool_name.startswith("db.run_migration"):
-        db_target = params.get("db_path", _db_path())
-        try:
-            conn = sqlite3.connect(db_target)
-            conn.execute("SELECT 1")
-            conn.close()
-            return True, "DB accessible post-migration"
-        except Exception as e:
-            return False, f"DB tidak bisa dibuka: {e}"
+def _rollback_and_finalize(conn: sqlite3.Connection, operation_id: str,
+                           rollback_command: str | None,
+                           mark_verified_at: bool) -> bool:
+    """
+    BUG-F FIX: tutup koneksi ke Synapse DB SEBELUM restore file, lalu tulis status
+    terminal lewat koneksi BARU.
 
-    if tool_name.startswith("service.restart"):
-        return True, "service.restart verified (stub)"
+    Kenapa urutan ini wajib: kalau file .bak direstore sementara `conn` masih
+    terbuka, koneksi itu masih memegang WAL lama. Commit berikutnya (penulisan
+    status terminal) akan men-checkpoint WAL stale itu ke file utama dan
+    MENERAPKAN KEMBALI perubahan yang baru saja dibatalkan. Akibatnya
+    _do_rollback() mengembalikan True padahal data tidak pernah pulih — rollback
+    gagal diam-diam. Ini terpicu karena operasi demo memigrasikan Synapse DB itu
+    sendiri, jadi target rollback == DB yang sedang di-commit.
 
-    if tool_name.startswith("config.write"):
-        file_path = params.get("file_path", "")
-        if file_path and Path(file_path).exists():
-            return True, f"Config file exists: {file_path}"
-        return False, f"Config file tidak ditemukan: {file_path}"
+    Catatan: snapshot diambil SETELAH status 'executing' ditulis, jadi baris
+    operations untuk operasi ini ada di .bak dan status terminal bisa ditimpa
+    sesudah restore.
 
-    return True, "No verification available (stub)"
+    Return rollback_ok.
+    """
+    try:
+        conn.commit()
+    except Exception:
+        pass
+    conn.close()
+
+    rollback_ok = _do_rollback(rollback_command)
+    new_status = "rolled_back" if rollback_ok else "failed"
+
+    try:
+        conn2 = sqlite3.connect(_db_path())
+        if mark_verified_at:
+            conn2.execute(
+                "UPDATE operations SET status=?, verified_at=? WHERE id=?",
+                (new_status, datetime.utcnow().isoformat(), operation_id),
+            )
+        else:
+            conn2.execute(
+                "UPDATE operations SET status=? WHERE id=?",
+                (new_status, operation_id),
+            )
+        conn2.commit()
+        conn2.close()
+    except Exception:
+        # Status tidak bisa ditulis (mis. file DB rusak total). Rollback file
+        # tetap dianggap berhasil; kegagalan ada di log server.
+        pass
+
+    return rollback_ok
+
+
+def _verify_operation(tool_name: str, params: dict) -> tuple[bool, str, list[str]]:
+    """
+    GLITCH-3 FIX: verifikasi post-condition sekarang dijalankan dari
+    synapse.invariants.yaml, bukan dari if/else hardcoded.
+
+    Return (ok, message, warnings):
+      - ok=False  -> ada invariant 'on_fail: rollback' yang gagal, pemanggil
+                     harus auto-rollback.
+      - warnings  -> invariant 'on_fail: warn' yang gagal. TIDAK membatalkan
+                     operasi, hanya dilaporkan (mis. file 0 byte).
+    Fail-closed: tool yang tidak punya satu pun invariant di YAML ditolak,
+    karena 'tidak ada check' bukan berarti 'aman'.
+    """
+    results = _run_invariants(tool_name, params)
+
+    if not results:
+        return (
+            False,
+            f"Tidak ada invariant yang terdefinisi untuk tool '{tool_name}' "
+            f"di synapse.invariants.yaml (fail-closed)",
+            [],
+        )
+
+    failures = [r for r in results if not r["passed"]]
+    blocking = [r for r in failures if r["on_fail"] == "rollback"]
+    warnings = [f"{r['id']}: {r['message']}" for r in failures
+                if r["on_fail"] != "rollback"]
+
+    if blocking:
+        detail = "; ".join(f"{r['id']}: {r['message']}" for r in blocking)
+        return False, f"Invariant gagal: {detail}", warnings
+
+    passed = [r["id"] for r in results if r["passed"]]
+    message = f"{len(passed)}/{len(results)} invariant lolos ({', '.join(passed)})"
+    if warnings:
+        message += " | warning: " + "; ".join(warnings)
+    return True, message, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -526,13 +945,8 @@ def execute_operation(operation_id: str) -> dict:
         exec_ok, exec_msg = False, str(e)
 
     if not exec_ok:
-        rollback_ok = _do_rollback(rollback_command)
-        new_status = "rolled_back" if rollback_ok else "failed"
-        conn.execute(
-            "UPDATE operations SET status=? WHERE id=?", (new_status, operation_id)
-        )
-        conn.commit()
-        conn.close()
+        rollback_ok = _rollback_and_finalize(
+            conn, operation_id, rollback_command, mark_verified_at=False)
         _emit("operation_rolled_back" if rollback_ok else "operation_failed", {
             "operation_id": operation_id,
             "reason": exec_msg,
@@ -541,22 +955,16 @@ def execute_operation(operation_id: str) -> dict:
         return {
             "ok": False,
             "operation_id": operation_id,
-            "status": new_status,
+            "status": "rolled_back" if rollback_ok else "failed",
             "error": exec_msg,
             "rollback_ok": rollback_ok,
         }
 
-    verify_ok, verify_msg = _verify_operation(op["tool_name"], params)
+    verify_ok, verify_msg, verify_warnings = _verify_operation(op["tool_name"], params)
     if not verify_ok:
-        rollback_ok = _do_rollback(rollback_command)
-        new_status = "rolled_back" if rollback_ok else "failed"
-        conn.execute(
-            "UPDATE operations SET status=?, verified_at=? WHERE id=?",
-            (new_status, datetime.utcnow().isoformat(), operation_id),
-        )
-        conn.commit()
-        conn.close()
-        _emit("operation_rolled_back", {
+        rollback_ok = _rollback_and_finalize(
+            conn, operation_id, rollback_command, mark_verified_at=True)
+        _emit("operation_rolled_back" if rollback_ok else "operation_failed", {
             "operation_id": operation_id,
             "reason": f"Verification failed: {verify_msg}",
             "rollback_ok": rollback_ok,
@@ -564,7 +972,7 @@ def execute_operation(operation_id: str) -> dict:
         return {
             "ok": False,
             "operation_id": operation_id,
-            "status": new_status,
+            "status": "rolled_back" if rollback_ok else "failed",
             "error": f"Verification failed: {verify_msg}",
             "rollback_ok": rollback_ok,
         }
@@ -574,6 +982,14 @@ def execute_operation(operation_id: str) -> dict:
         (datetime.utcnow().isoformat(), operation_id),
     )
     conn.commit()
+
+    # GLITCH-3 FIX: invariant global (applies_to='*') dievaluasi SESUDAH status
+    # terminal ditulis — invariant ini menilai state akhir operasi, jadi
+    # menjalankannya sebelum commit akan menghasilkan false-positive.
+    global_failures = [
+        f"{r['id']}: {r['message']}"
+        for r in _run_global_invariants(operation_id) if not r["passed"]
+    ]
     conn.close()
 
     _emit("operation_verified", {
@@ -583,11 +999,20 @@ def execute_operation(operation_id: str) -> dict:
         "status": "verified",
     })
 
+    all_warnings = verify_warnings + global_failures
+    if all_warnings:
+        _emit("operation_warning", {
+            "operation_id": operation_id,
+            "tool_name": op["tool_name"],
+            "warnings": all_warnings,
+        })
+
     return {
         "ok": True,
         "operation_id": operation_id,
         "status": "verified",
         "verify_msg": verify_msg,
+        "verify_warnings": all_warnings,
     }
 
 
