@@ -81,6 +81,7 @@ Sumber kebenaran: [`SYNAPSE.md`](../SYNAPSE.md) section 2.5, 4.4, 4.5.
 | A6 | `target=""` (kosong) | tidak crash | `test_adversarial.py::TestEmptyTarget` |
 | A7 | Execute UUID palsu | `ok=False`, pesan error informatif | `test_adversarial.py::TestNonexistentOperation` |
 | A8 | Approve dua kali (approved→denied) | decision terupdate, tidak duplikat | `test_adversarial.py::TestDoubleApprove` |
+| A9 | Concurrent double-execute (2 thread bersamaan) | hanya 1 yang `ok=True`, yang lain ditolak | `test_adversarial.py::TestConcurrentDoubleExecute` _(pending fix BUG-07)_ |
 
 ---
 
@@ -125,17 +126,22 @@ Tujuan: membuktikan skenario demo reliable sebelum presentasi ke juri.
 
 ## Bug Findings Log
 
-> Checkpoint jam 30 — semua temuan sudah dilaporkan ke backend team via GitHub Issues.
+> Checkpoint jam 30 — temuan batch pertama (BUG-01..05) dilaporkan ke backend team.  
+> Checkpoint jam 36 — temuan batch kedua (BUG-07..08) dilaporkan setelah audit ulang kode post-fix.
 
 | Waktu | ID Bug | Skenario QC | Deskripsi | Issue | Severity | Status |
 |---|---|---|---|---|---|---|
-| Jam 30 | BUG-01 | A1 | `execute_operation` bypass approval via direct DB column manipulation — `requires_approval=0` di-inject langsung ke DB memungkinkan eksekusi tanpa approval | [#4](https://github.com/DhikaSusheno/Synapse/issues/4) | 🔴 CRITICAL | Open |
-| Jam 30 | BUG-02 | RB2 | `_do_rollback` selalu restore ke `DB_PATH` hardcoded, bukan ke target DB asli dari params — rollback ke DB yang salah | [#5](https://github.com/DhikaSusheno/Synapse/issues/5) | 🔴 HIGH | Open |
-| Jam 30 | BUG-03 | RB6, DR5 | Rollback `db.run_migration` restore seluruh file DB → operasi `verified` lain yang dibuat setelah snapshot ikut terhapus (historically impossible state, SYNAPSE.md 2.2) | [#6](https://github.com/DhikaSusheno/Synapse/issues/6) | 🔴 HIGH | Open |
-| Jam 30 | BUG-04 | RB1 | `_make_snapshot` dipanggil saat `propose` (terlalu awal, bukan saat execute) — jika file DB belum ada, snapshot gagal diam-diam dan rollback protection hilang tanpa warning | [#7](https://github.com/DhikaSusheno/Synapse/issues/7) | 🟡 MEDIUM | Open |
-| Jam 30 | BUG-05 | — | `main.py` duplicate class `ProposeOperationRequest` & `ApproveOperationRequest` — definisi kedua override pertama dengan skema berbeda, endpoint `/approve_operation` contract tidak konsisten | [#8](https://github.com/DhikaSusheno/Synapse/issues/8) | 🟡 MEDIUM | Open |
+| Jam 30 | BUG-01 | A1 | `execute_operation` bypass approval via direct DB column manipulation — `requires_approval=0` di-inject langsung ke DB memungkinkan eksekusi tanpa approval | [#4](https://github.com/DhikaSusheno/Synapse/issues/4) | 🔴 CRITICAL | ✅ Fixed (commit `2b1cf8b` Masrendra) |
+| Jam 30 | BUG-02 | RB2 | `_do_rollback` selalu restore ke `DB_PATH` hardcoded, bukan ke target DB asli dari params — rollback ke DB yang salah | [#5](https://github.com/DhikaSusheno/Synapse/issues/5) | 🔴 HIGH | ✅ Fixed (commit `2b1cf8b` Masrendra) |
+| Jam 30 | BUG-03 | RB6, DR5 | Rollback `db.run_migration` restore seluruh file DB → operasi `verified` lain yang dibuat setelah snapshot ikut terhapus (historically impossible state, SYNAPSE.md 2.2) | [#6](https://github.com/DhikaSusheno/Synapse/issues/6) | 🔴 HIGH | ✅ Fixed (commit `2b1cf8b` Masrendra — snapshot per-op `.bak`) |
+| Jam 30 | BUG-04 | RB1 | `_make_snapshot` dipanggil saat `propose` (terlalu awal, bukan saat execute) — jika file DB belum ada, snapshot gagal diam-diam dan rollback protection hilang tanpa warning | [#7](https://github.com/DhikaSusheno/Synapse/issues/7) | 🟡 MEDIUM | ✅ Fixed (commit `2b1cf8b` Masrendra — snapshot pindah ke `execute_operation`) |
+| Jam 30 | BUG-05 | — | `main.py` duplicate class `ProposeOperationRequest` & `ApproveOperationRequest` — definisi kedua override pertama dengan skema berbeda, endpoint `/approve_operation` contract tidak konsisten | [#8](https://github.com/DhikaSusheno/Synapse/issues/8) | 🟡 MEDIUM | ✅ Fixed (commit `2b1cf8b` Masrendra — duplikat dihapus) |
+| Jam 36 | BUG-07 | A9 (baru) | `execute_operation()` race condition — concurrent double-execute bisa lolos guard karena status check dan UPDATE tidak atomik. `UPDATE ... WHERE status IN (...)` + `rowcount` check diperlukan | [#12](https://github.com/DhikaSusheno/Synapse/issues/12) | 🔴 HIGH | 🔴 Open |
+| Jam 36 | BUG-08 | — | `cortex._emit()` tidak thread-safe — `asyncio.Queue.put_nowait()` dipanggil dari sync FastAPI thread pool. Saat approve/execute diklik, SSE stream bisa mati (demo-killer) | [#11](https://github.com/DhikaSusheno/Synapse/issues/11) | 🔴 HIGH | 🔴 Open |
 
 > **Catatan QC-2 (zuyss):** Test DR5 adalah **regression test** untuk BUG-03. Jika BUG-03 diperbaiki, DR5 harus pass. Jika DR5 masih fail setelah patch, berarti fix tidak lengkap.
+
+> **Catatan QC-1 (pidpid35):** BUG-08 adalah **demo-killer** — SSE real-time adalah fitur utama Synapse. Harus fix sebelum rehearsal jam 40. BUG-07 perlu ditambahkan test A9 (`TestConcurrentDoubleExecute`) setelah backend fix.
 
 ---
 
