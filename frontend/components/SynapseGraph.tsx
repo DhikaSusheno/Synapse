@@ -12,7 +12,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { MOCK_NODES, MOCK_LINKS } from "@/lib/mockData";
 import { getNodeColor, getNodeSize, getNodeLabel, getLinkColor, hexToRgba } from "@/lib/nodeVisuals";
 import { useMockSimulation } from "@/hooks/useMockSimulation";
-import { useSSE, type IngestProgress, type RawSSEEntry } from "@/hooks/useSSE";
+import { useSSE, type IngestProgress } from "@/hooks/useSSE";
 import type { GraphNode, GraphLink } from "@/lib/types";
 
 // react-force-graph-2d tidak support SSR
@@ -41,8 +41,6 @@ interface BackendEdge {
 interface Props {
   onNodeClick?: (node: GraphNode) => void;
   onNodeCount?: (nodes: number, links: number) => void;
-  /** #38: callback untuk event log — dipanggil dari useSSE, bukan koneksi SSE baru */
-  onRawEvent?: (entry: RawSSEEntry) => void;
 }
 
 // --- Canvas pulse/blink renderer ---
@@ -120,9 +118,10 @@ function drawNode(
   ctx.fillText(node.name, x, y + r + 2 / globalScale);
 }
 
-// --- Hook animasi waktu (#40 fix) ---
-// Simpan waktu di ref — TIDAK trigger re-render 60x/detik.
-// nodeCanvasObject baca animTimeRef.current langsung saat draw.
+// --- Hook animasi waktu ---
+// BUG-40: versi lama setState tiap frame (~60x/detik) → re-render SynapseGraph terus
+// mentoring dan objek graphData baru tiap frame. animTime hanya dipakai di canvas
+// draw callback, jadi cukup ref — tidak perlu memicu render sama sekali.
 function useAnimationTimeRef(): React.MutableRefObject<number> {
   const timeRef = useRef(0);
   const rafRef = useRef<number>(0);
@@ -132,7 +131,7 @@ function useAnimationTimeRef(): React.MutableRefObject<number> {
     const tick = (now: number) => {
       const dt = lastRef.current ? (now - lastRef.current) / 1000 : 0;
       lastRef.current = now;
-      timeRef.current += dt; // update ref, tidak trigger re-render
+      timeRef.current += dt;
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -199,14 +198,12 @@ const OP_LEGEND: [string, string][] = [
 ];
 
 // --- Komponen utama ---
-export default function SynapseGraph({ onNodeClick, onNodeCount, onRawEvent }: Props) {
+export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
   const [nodes, setNodes] = useState<GraphNode[]>(USE_LIVE ? [] : MOCK_NODES);
   const [links, setLinks] = useState<GraphLink[]>(USE_LIVE ? [] : MOCK_LINKS);
   const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
-
-  // #40 fix: ref-based animation time, tidak setState 60x/detik
   const animTimeRef = useAnimationTimeRef();
 
   // Kirim node/link count ke parent tiap kali berubah
@@ -255,7 +252,6 @@ export default function SynapseGraph({ onNodeClick, onNodeCount, onRawEvent }: P
     onNodeUpdate: handleNodeStatusUpdate,
     onGraphUpdate: handleGraphUpdate,
     onIngestProgress: setIngestProgress,
-    onRawEvent,  // #38: teruskan ke useSSE, bukan buka koneksi baru
     enabled: USE_LIVE,
   });
 
@@ -269,7 +265,6 @@ export default function SynapseGraph({ onNodeClick, onNodeCount, onRawEvent }: P
 
   const nodeCanvasObject = useCallback(
     (node: object, ctx: CanvasRenderingContext2D, globalScale: number) => {
-      // #40: baca ref langsung — aman, ref selalu fresh, deps kosong
       drawNode(node as RawNode, ctx, globalScale, animTimeRef.current);
     },
     [animTimeRef]

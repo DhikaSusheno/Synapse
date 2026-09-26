@@ -1,7 +1,7 @@
 // lib/types.ts
 // Kontrak data sesuai SYNAPSE.md section 4.2 dan backend/database.py
 
-export type NodeStatus = "idle" | "pending" | "approved" | "executing" | "verified" | "failed" | "rolled_back";
+export type NodeStatus = "idle" | "pending" | "approved" | "executing" | "verified" | "failed" | "rolled_back" | "denied";
 export type NodeType = "file" | "symbol" | "dependency" | "doc" | "operation";
 export type EdgeRelationship =
   | "DOCUMENTS"
@@ -54,6 +54,14 @@ export interface SSEEvent {
     | "health_report"
     | "refactor_suggestion";
   data: Record<string, unknown>;
+}
+
+// Baris log event SSE yang dirender di halaman Agents
+export interface SSELogEntry {
+  ts: string;
+  agent: string;
+  event: string;
+  message: string;
 }
 
 // Operasi dari backend operations table

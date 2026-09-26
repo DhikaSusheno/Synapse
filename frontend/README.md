@@ -46,7 +46,7 @@ curl -X POST http://localhost:8000/understand_repo \
   -d '{"repo_path": ".."}'  
 ```
 
-## 8 Halaman Dashboard
+## 9 Halaman Dashboard
 
 | Nav | Halaman | Owner | Status |
 |---|---|---|---|
@@ -75,22 +75,32 @@ curl -X POST http://localhost:8000/understand_repo \
 | GET | `/complexity_report` | Cortex |
 | POST | `/find_path` | Cortex |
 | POST | `/suggest_refactor` | Cortex |
-| GET | `/list_pending_approvals` | Guardian, Approvals |
-| POST | `/approve_operation` | Guardian, Approvals, GuardianPanel |
-| POST | `/execute_operation` | Guardian, Approvals, GuardianPanel |
-| GET | `/operations` | Operations, Approvals, Agents |
-| GET | `/health` | Settings |
+| GET | `/operations` | Operations, Approvals, Agents, Guardian, GuardianPanel, Security |
+| POST | `/approve_operation` | Guardian, Approvals, GuardianPanel (via `decideOperation`) |
+| POST | `/execute_operation` | Guardian, Approvals, GuardianPanel (via `decideOperation`) |
 
-## Endpoint Backend Baru yang Dibutuhkan
+`/list_pending_approvals` tidak dipakai lagi: endpoint itu tidak mengirim `conflicts`.
+Pending + History + conflict banner semuanya dari satu `GET /operations?limit=100`
+(`hooks/useOperations.ts`, filter `requires_approval === 1` untuk pending).
+Kontrak: `/approve_operation` → `{ ok, status, new_status }`; execute hanya boleh
+setelah approve `ok`, itu diurus satu helper `lib/operations.ts` (`decideOperation`).
 
-Frontend fallback ke mock data jika endpoint ini belum tersedia:
+## Endpoint Backend yang Dibutuhkan
 
-| Method | Endpoint | Response | Dibutuhkan untuk |
-|---|---|---|---|
-| GET | `/agents/status` | `{guardian,cortex,review: {tasks,healthy}}` | Agents page |
-| GET | `/security/report` | security stats + adversarial results | Security page |
-| GET | `/settings` | platform config object | Settings page |
-| POST | `/settings` | `{ok:true}` | Settings page |
+Tidak ada endpoint baru untuk halaman yang sudah ada. Semua halaman unmet dari endpoint yang sudah ada:
+
+| Halaman | Sumber data |
+|---|---|
+| Agents | `GET /operations?limit=100` (via `useLiveOps`) + `GET /graph/summary` + SSE `/stream` |
+| Security | `GET /operations?limit=100` + SSE `/stream` |
+| Settings | `GET /health` + `GET /graph/summary` |
+
+Statistik Agents/Security diturunkan di client (`lib/derive.ts`), bukan mock.
+Saat `NEXT_PUBLIC_USE_LIVE_SSE=false` halaman menampilkan badge "Env off" + empty state.
+
+SSE: satu koneksi `/stream` per app, bukan per halaman. Transport tunggal ada di
+`lib/sseStream.ts` (fanout + exponential backoff BUG-08), dipakai lewat
+`hooks/useSSEStream.ts`. Issue #38.
 
 ## SSE Events yang Ditangani
 
@@ -127,7 +137,6 @@ frontend/
 │   ├── GuardianPanel.tsx     ← FE-1+2
 │   ├── OverviewMain.tsx      ← FE-1
 │   ├── SynapseGraph.tsx      ← FE-1+2
-│   ├── OperationsSidebar.tsx ← FE-2
 │   ├── pages/
 │   │   ├── CodeGraphPage.tsx   ← FE-1 ✅
 │   │   ├── GuardianPage.tsx    ← FE-1 ✅
@@ -140,13 +149,18 @@ frontend/
 │       ├── StatusBadge.tsx     ← FE-1 ✅
 │       └── AgentBadge.tsx      ← FE-1 ✅
 ├── hooks/
-│   ├── useSSE.ts             ← SSE + exponential backoff
+│   ├── useSSE.ts             ← mapping event SSE -> callback
+│   ├── useSSEStream.ts       ← wrapper tipis di atas lib/sseStream
+│   ├── useOperations.ts      ← poll /operations (pending + history + conflicts)
+│   ├── useLiveOps.ts         ← poll /operations (Agents, Security)
 │   └── useMockSimulation.ts
 └── lib/
     ├── types.ts
     ├── mockData.ts
-    ├── mockAgents.ts         ← FE-1 ✅
-    ├── mockSecurity.ts       ← FE-1 ✅
+    ├── sseStream.ts          ← 1 koneksi /stream, fanout, backoff (#38)
+    ├── operations.ts         ← decideOperation: approve -> execute (#39)
+    ├── derive.ts             ← derivasi /operations -> UI (pure, diuji)
+    ├── derive.test.ts        ← node --test
     └── nodeVisuals.ts
 ```
 
@@ -154,8 +168,12 @@ frontend/
 
 | Bug | Backend Fix | Frontend Mitigation |
 |---|---|---|
-| BUG-08: SSE not thread-safe | `cc9bd5a` | `useSSE` exponential backoff |
+| BUG-08: SSE not thread-safe | `cc9bd5a` | `lib/sseStream.ts` exponential backoff |
 | BUG-07: double-execute race | `9d7456a` | N/A |
 | BUG-A: Windows path rollback | `6d1813f` | N/A |
 | BUG-B: partial migration | `6d1813f` | N/A |
 | BUG-D: approvals data leak | `6d1813f` | N/A |
+| #37 double `res.json()` | — | fixed di FE (`8c75932`) |
+| #38 4 koneksi `/stream` | — | `lib/sseStream.ts` singleton + `lib/sseStream.test.ts` |
+| #39 approve/execute inline | — | `lib/operations.ts` `decideOperation` + 6 test |
+| #40 re-render 60fps SynapseGraph | — | animasi lewat ref, bukan `setState` |

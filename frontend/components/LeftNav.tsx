@@ -6,7 +6,7 @@
 
 import { useState } from "react";
 
-export type NavPage = "overview" | "code-graph" | "guardian" | "cortex" | "approvals" | "operations" | "security" | "settings" | "agents";
+export type NavPage = "overview" | "code-graph" | "guardian" | "cortex" | "agents" | "approvals" | "operations" | "security" | "settings";
 
 interface Props {
   activePage: NavPage;
@@ -19,11 +19,11 @@ const NAV_ITEMS: { id: NavPage; icon: string; label: string }[] = [
   { id: "code-graph",  icon: "&#9903;",  label: "Code Graph" },
   { id: "guardian",    icon: "&#9672;",  label: "Guardian" },
   { id: "cortex",      icon: "&#9736;",  label: "Cortex" },
+  { id: "agents",      icon: "&#9673;",  label: "Agents" },
   { id: "approvals",   icon: "&#9745;",  label: "Approvals" },
   { id: "operations",  icon: "&#9881;",  label: "Operations" },
   { id: "security",    icon: "&#128737;", label: "Security" },
   { id: "settings",    icon: "&#9881;",  label: "Settings" },
-  { id: "agents",      icon: "&#9827;",  label: "Agents" },
 ];
 
 // Icon per nav item
@@ -33,11 +33,11 @@ function NavIcon({ id }: { id: NavPage }) {
     case "code-graph": return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9903;</span>;
     case "guardian":   return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9672;</span>;
     case "cortex":     return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9684;</span>;
+    case "agents":     return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9673;</span>;
     case "approvals":  return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9745;</span>;
     case "operations": return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9881;</span>;
     case "security":   return <span className="w-4 h-4 flex items-center justify-center text-xs">&#128737;</span>;
     case "settings":   return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9881;</span>;
-    case "agents":     return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9827;</span>;
     default:           return null;
   }
 }

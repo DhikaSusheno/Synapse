@@ -4,15 +4,15 @@
 // FE-1 @nabilfauzandafa
 
 import dynamic from "next/dynamic";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import type { GraphNode } from "@/lib/types";
+import { useSSEStream } from "@/hooks/useSSEStream";
 
 const SynapseGraph = dynamic(() => import("@/components/SynapseGraph"), {
   ssr: false,
   loading: () => <div className="flex items-center justify-center h-full text-slate-400 text-sm">Loading graph...</div>,
 });
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
 
 const FILTER_TYPES = ["All", "File", "Symbol", "Dependency", "Doc"] as const;
@@ -21,21 +21,13 @@ interface SSELine { ts: string; message: string; }
 
 function useLiveFeed(): SSELine[] {
   const [lines, setLines] = useState<SSELine[]>([]);
-  useEffect(() => {
-    if (!USE_LIVE) return;
-    const es = new EventSource(`${BACKEND_URL}/stream`);
-    es.onmessage = (e) => {
-      try {
-        const p = JSON.parse(e.data);
-        if (p.event === "heartbeat" || p.event === "connected") return;
-        const msg = p.data.operation_id
-          ? `op ${String(p.data.operation_id).slice(0, 10)}… ${p.data.tool_name ?? p.event}`
-          : p.data.current_doc ? `ingest: ${p.data.current_doc}` : p.event;
-        setLines((prev) => [{ ts: new Date().toLocaleTimeString(), message: msg }, ...prev.slice(0, 9)]);
-      } catch { /* ignore */ }
-    };
-    return () => es.close();
-  }, []);
+  useSSEStream((p) => {
+    if (p.event === "heartbeat" || p.event === "connected") return;
+    const msg = p.data.operation_id
+      ? `op ${String(p.data.operation_id).slice(0, 10)}… ${p.data.tool_name ?? p.event}`
+      : p.data.current_doc ? `ingest: ${p.data.current_doc}` : p.event;
+    setLines((prev) => [{ ts: new Date().toLocaleTimeString(), message: msg }, ...prev.slice(0, 9)]);
+  }, USE_LIVE);
   return lines;
 }
 

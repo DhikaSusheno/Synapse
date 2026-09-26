@@ -5,6 +5,8 @@
 
 import { useEffect, useState } from "react";
 import type { Operation } from "@/lib/types";
+import { stamp } from "@/lib/derive";
+import { decideOperation } from "@/lib/operations";
 import RiskBadge from "@/components/shared/RiskBadge";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
@@ -60,40 +62,12 @@ function PendingOpDetail({ op, onDecided }: PendingOpDetailProps) {
   const [error, setError]     = useState<string | null>(null);
   const params = (() => { try { return JSON.parse(op.params_json); } catch { return {}; } })();
 
-  // #39 fix: approve error ditangani dengan benar;
-  // execute hanya dipanggil kalau d.ok === true.
   async function decide(decision: "approved" | "denied") {
     setLoading(true); setError(null);
     try {
-      const r = await fetch(`${BACKEND_URL}/approve_operation`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ operation_id: op.id, decision }),
-      }).catch(() => null);
-
-      if (!r?.ok) {
-        setError("Approve gagal — coba lagi.");
-        return;
-      }
-
-      const d = await r.json().catch(() => null);
-
-      if (!d?.ok) {
-        setError(d?.error ?? "Approve gagal.");
-        return;
-      }
-
-      setStatus((d?.status ?? (decision === "approved" ? "approved" : "failed")) as typeof status);
-
-      if (decision === "approved") {
-        setStatus("executing");
-        const er = await fetch(`${BACKEND_URL}/execute_operation`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ operation_id: op.id }),
-        }).catch(() => null);
-        const ed = await er?.json().catch(() => null);
-        setStatus((ed?.status ?? "verified") as typeof status);
-        if (!ed?.ok) setError(ed?.error ?? "Execute failed.");
-      }
+      const r = await decideOperation(op.id, decision, BACKEND_URL);
+      if (r.status) setStatus(r.status);
+      if (r.error) { setError(r.error); return; }
       onDecided(op.id, decision);
     } finally { setLoading(false); }
   }
@@ -120,7 +94,7 @@ function PendingOpDetail({ op, onDecided }: PendingOpDetailProps) {
         </div>
 
         <div className="grid grid-cols-4 gap-2 text-xs">
-          {[ ["Agent", "Cortex Agent"], ["Target", op.target_node_id ?? "db"], ["Blast Radius", op.blast_radius], ["Time", new Date(op.created_at).toLocaleString()] ]
+          {[ ["Agent", "Cortex Agent"], ["Target", op.target_node_id ?? "db"], ["Blast Radius", op.blast_radius], ["Time", stamp(op.created_at)] ]
             .map(([k, v]) => (
               <div key={k}>
                 <div className="text-slate-500">{k}</div>

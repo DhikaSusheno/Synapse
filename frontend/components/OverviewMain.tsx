@@ -7,6 +7,7 @@
 import dynamic from "next/dynamic";
 import { useCallback, useState } from "react";
 import type { GraphNode, Operation } from "@/lib/types";
+import { stamp } from "@/lib/derive";
 
 const SynapseGraph = dynamic(() => import("@/components/SynapseGraph"), {
   ssr: false,
@@ -70,7 +71,7 @@ function OperationTimeline({ ops }: { ops: Operation[] }) {
   // Use live ops if available, else mock
   const events: TimelineEvent[] = ops.length > 0
     ? ops.slice(0, 5).map((op) => ({
-        time: new Date(op.created_at).toLocaleString(),
+        time: stamp(op.created_at),
         type: "PROPOSE" as const,
         agent: "Agent",
         description: op.tool_name,

@@ -22,6 +22,7 @@ const STATUS_COLOR: Record<NodeStatus, string> = {
   verified:    "#22c55e", // hijau - sukses
   failed:      "#ef4444", // merah - gagal
   rolled_back: "#ef4444", // merah (akan pulse lalu hijau di animasi)
+  denied:      "#64748b", // abu - ditolak manusia, tidak dijalankan
 };
 
 // Ukuran node (nilai ini menentukan radius lingkaran di canvas)

@@ -7,7 +7,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import type { GraphNode, Operation } from "@/lib/types";
 import type { NavPage } from "@/components/LeftNav";
-import type { RawSSEEntry } from "@/hooks/useSSE";
+import { mapPending, stamp } from "@/lib/derive";
+import { decideOperation } from "@/lib/operations";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -17,7 +18,6 @@ const LeftNav          = dynamic(() => import("@/components/LeftNav"),          
 const TopNavbar        = dynamic(() => import("@/components/TopNavbar"),        { ssr: false });
 const GuardianPanel    = dynamic(() => import("@/components/GuardianPanel"),    { ssr: false });
 const OverviewMain     = dynamic(() => import("@/components/OverviewMain"),     { ssr: false, loading: () => <PageLoading /> });
-const OperationsSidebar= dynamic(() => import("@/components/OperationsSidebar"),{ ssr: false });
 const SynapseGraph     = dynamic(() => import("@/components/SynapseGraph"),     { ssr: false, loading: () => <PageLoading /> });
 
 // Pages
@@ -61,53 +61,20 @@ const MOCK_OPERATIONS: Operation[] = [
   },
 ];
 
-// Normalise satu operation row dari backend ke tipe Operation
-function normalizeOp(op: Record<string, unknown>): Operation {
-  const rawConflicts = op.conflicts as Array<string | { id: string }> | undefined;
-  return {
-    id: op.id as string,
-    tool_name: op.tool_name as string,
-    params_json: (op.params_json as string) ?? "{}",
-    target_node_id: (op.target_node_id as string) ?? null,
-    blast_radius: (op.blast_radius as Operation["blast_radius"]) ?? "unknown",
-    status: (op.status as GraphNode["status"]) ?? "pending",
-    requires_approval: (op.requires_approval as number) ?? 1,
-    conflicts: rawConflicts
-      ? rawConflicts.map((c) => (typeof c === "string" ? c : c.id))
-      : undefined,
-    created_at: (op.created_at as string) ?? new Date().toISOString(),
-  };
-}
-
 // --- Hook: load operations from backend or mock ---
 function useOperations(): [Operation[], (id: string, d: "approved" | "denied") => void] {
-  const [ops, setOps] = useState<Operation[]>(MOCK_OPERATIONS);
+  const [ops, setOps] = useState<Operation[]>(USE_LIVE ? [] : MOCK_OPERATIONS);
 
   useEffect(() => {
     if (!USE_LIVE) return;
     async function load() {
       try {
-        const [allRes, pendingRes] = await Promise.all([
-          fetch(`${BACKEND_URL}/operations?limit=100`, { cache: "no-store" }),
-          fetch(`${BACKEND_URL}/list_pending_approvals`, { cache: "no-store" }),
-        ]);
-        const allOps: Operation[] = [];
-        if (allRes.ok) {
-          const rows = (await allRes.json()) as Record<string, unknown>[];
-          allOps.push(...(Array.isArray(rows) ? rows.map(normalizeOp) : []));
-        }
-        if (pendingRes.ok) {
-          const data = await pendingRes.json();
-          const pending = ((data.pending ?? []) as Record<string, unknown>[]).map(normalizeOp);
-          for (const p of pending) {
-            if (!allOps.find((o) => o.id === p.id)) allOps.push(p);
-            else {
-              const idx = allOps.findIndex((o) => o.id === p.id);
-              allOps[idx] = { ...allOps[idx], ...p };
-            }
-          }
-        }
-        if (allOps.length > 0) setOps(allOps);
+        // /operations sudah join conflicts dari edges (CONFLICTS_WITH), jadi satu
+        // request cukup untuk pending + history. Endpoint /list_pending_approvals
+        // tidak mengirim conflicts, jadi tidak dipakai di sini.
+        const res = await fetch(`${BACKEND_URL}/operations?limit=100`, { cache: "no-store" }).catch(() => null);
+        if (!res?.ok) return;
+        setOps(mapPending(await res.json()).filter((op) => op.requires_approval === 1));
       } catch { /* backend not ready */ }
     }
     load();
@@ -117,7 +84,7 @@ function useOperations(): [Operation[], (id: string, d: "approved" | "denied") =
 
   const handleDecided = useCallback((opId: string, decision: "approved" | "denied") => {
     setOps((prev) =>
-      prev.map((op) => op.id === opId ? { ...op, status: decision === "approved" ? "approved" : "failed" } : op)
+      prev.map((op) => op.id === opId ? { ...op, status: decision === "approved" ? "approved" : "denied" } : op)
     );
   }, []);
 
@@ -146,45 +113,15 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
   const [loading, setLoading] = useState(false);
   const [localStatus, setLocalStatus] = useState(op.status);
   const [errorMsg, setErrorMsg]       = useState<string | null>(null);
-
-  // #39 fix: approve error ditangani dengan benar;
-  // execute hanya dipanggil kalau d.ok === true.
   async function decide(decision: "approved" | "denied") {
     setLoading(true); setErrorMsg(null);
     try {
-      const r = await fetch(`${BACKEND_URL}/approve_operation`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ operation_id: op.id, decision }),
-      }).catch(() => null);
-
-      if (!r?.ok) {
-        setErrorMsg("Approve gagal — coba lagi.");
-        return;
-      }
-
-      const d = await r.json().catch(() => null);
-
-      if (!d?.ok) {
-        setErrorMsg(d?.error ?? "Approve gagal.");
-        return;
-      }
-
-      setLocalStatus((d?.status ?? (decision === "approved" ? "approved" : "failed")) as Operation["status"]);
-
-      if (decision === "approved") {
-        setLocalStatus("executing");
-        const er = await fetch(`${BACKEND_URL}/execute_operation`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ operation_id: op.id }),
-        }).catch(() => null);
-        const ed = await er?.json().catch(() => null);
-        setLocalStatus((ed?.status ?? "verified") as Operation["status"]);
-        if (!ed?.ok) setErrorMsg(ed?.error ?? "Execute failed.");
-      }
+      const r = await decideOperation(op.id, decision, BACKEND_URL);
+      if (r.status) setLocalStatus(r.status);
+      if (r.error) { setErrorMsg(r.error); return; }
       onDecided?.(op.id, decision);
     } finally { setLoading(false); }
   }
-
   const params = (() => { try { return JSON.parse(op.params_json); } catch { return {}; } })();
   const isDone = localStatus !== "pending";
   return (
@@ -202,7 +139,7 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
       </div>
       <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
         <span className="text-slate-500">ID</span><span className="text-slate-400 font-mono truncate">{op.id.slice(0, 16)}…</span>
-        <span className="text-slate-500">Time</span><span className="text-slate-400">{new Date(op.created_at).toLocaleString()}</span>
+        <span className="text-slate-500">Time</span><span className="text-slate-400">{stamp(op.created_at)}</span>
       </div>
       {op.conflicts && op.conflicts.length > 0 && (
         <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-3 py-2 flex items-center gap-1.5">
@@ -268,8 +205,8 @@ function OperationsPage() {
       const url = statusFilter === "all" ? `${BACKEND_URL}/operations?limit=50` : `${BACKEND_URL}/operations?status=${statusFilter}&limit=50`;
       const res = await fetch(url, { cache: "no-store" });
       if (res.ok) {
-        const data = await res.json();
-        setOps(Array.isArray(data) ? data : []);
+        const data = (await res.json()) as unknown;
+        setOps(Array.isArray(data) ? (data as BackendOp[]) : []);
       } else setError("Backend tidak dapat dijangkau");
     } catch { setError("Backend offline"); }
   }, [statusFilter]);
@@ -312,7 +249,7 @@ function OperationsPage() {
                   <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border w-fit ${BLAST_BADGE[op.blast_radius] ?? BLAST_BADGE.unknown}`}>{op.blast_radius.toUpperCase()}</span>
                   <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border w-fit ${STATUS_BADGE[op.status] ?? STATUS_BADGE.idle}`}>{op.status}</span>
                   <span className="text-[10px] text-slate-400">{op.requires_approval ? "Required" : "Auto"}</span>
-                  <span className="text-[10px] text-slate-500 font-mono">{new Date(op.created_at).toLocaleString()}</span>
+                  <span className="text-[10px] text-slate-500 font-mono">{stamp(op.created_at)}</span>
                 </div>
               );
             })}
@@ -329,13 +266,6 @@ export default function HomePage() {
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [graphCount, setGraphCount]     = useState({ nodes: 0, links: 0 });
   const [ops, handleOpDecided]          = useOperations();
-
-  // #38: satu event log di level atas, dikumpulkan via onRawEvent dari useSSE
-  // OperationsSidebar terima sebagai prop — tidak buka koneksi SSE tersendiri
-  const [sseEventLog, setSseEventLog] = useState<RawSSEEntry[]>([]);
-  const handleRawEvent = useCallback((entry: RawSSEEntry) => {
-    setSseEventLog((prev) => [entry, ...prev.slice(0, 49)]);
-  }, []);
 
   const handleNodeCount = useCallback((nodes: number, links: number) => {
     setGraphCount({ nodes, links });

@@ -6,6 +6,8 @@
 
 import { useState } from "react";
 import type { Operation, GraphNode } from "@/lib/types";
+import { stamp } from "@/lib/derive";
+import { decideOperation } from "@/lib/operations";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
@@ -40,39 +42,9 @@ function PendingApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id
     setLoading(true);
     setErrorMsg(null);
     try {
-      const approveRes = await fetch(`${BACKEND_URL}/approve_operation`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ operation_id: op.id, decision }),
-      }).catch(() => null);
-
-      if (!approveRes || !approveRes.ok) {
-        setLocalStatus(decision === "approved" ? "approved" : "failed");
-        onDecided?.(op.id, decision);
-        return;
-      }
-
-      const approveData = await approveRes.json().catch(() => null);
-      setLocalStatus(
-        ((approveData?.status ?? approveData?.new_status) as GraphNode["status"]) ??
-        (decision === "approved" ? "approved" : "failed")
-      );
-
-      if (decision === "approved") {
-        setLocalStatus("executing");
-        const execRes = await fetch(`${BACKEND_URL}/execute_operation`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ operation_id: op.id }),
-        }).catch(() => null);
-        if (execRes?.ok) {
-          const execData = await execRes.json().catch(() => null);
-          setLocalStatus((execData?.status ?? "verified") as GraphNode["status"]);
-        } else {
-          setLocalStatus("failed");
-          setErrorMsg("Execute failed — check backend log.");
-        }
-      }
+      const r = await decideOperation(op.id, decision, BACKEND_URL);
+      if (r.status) setLocalStatus(r.status);
+      if (r.error) { setErrorMsg(r.error); return; }
       onDecided?.(op.id, decision);
     } finally {
       setLoading(false);
@@ -117,7 +89,7 @@ function PendingApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id
           {op.blast_radius === "high" ? "8.7 / 10" : op.blast_radius === "medium" ? "5.0 / 10" : "2.1 / 10"}
         </span>
         <span className="text-slate-500">Time</span>
-        <span className="text-slate-300">{new Date(op.created_at).toLocaleString()}</span>
+        <span className="text-slate-300">{stamp(op.created_at)}</span>
       </div>
 
       {op.conflicts && op.conflicts.length > 0 && (
@@ -160,14 +132,15 @@ function PendingApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id
   );
 }
 
-const CORTEX_INSIGHTS = [
-  { text: "Found 7 modules, 12 cross-dependencies", ok: true },
-  { text: "Guardian protects 3 critical files", ok: true },
-  { text: "Potential refactor in graph.py (complexity: high)", ok: true },
-  { text: "2 files have unused imports", ok: true },
-];
-
-function CortexInsightPanel() {
+function CortexInsightPanel({ pendingOps }: { pendingOps: Operation[] }) {
+  const highRisk = pendingOps.filter((op) => op.blast_radius === "high").length;
+  const conflicts = pendingOps.filter((op) => (op.conflicts?.length ?? 0) > 0).length;
+  const insights = [
+    `${pendingOps.length} operasi menunggu approval`,
+    `${highRisk} berisiko high blast radius`,
+    `${conflicts} operasi konflik dengan operasi lain`,
+    "Guardian fail-closed: verifikasi gagal = rollback",
+  ];
   return (
     <div className="rounded-xl border border-slate-700/60 bg-slate-800/40 p-3.5 space-y-2.5">
       {/* Header */}
@@ -182,10 +155,10 @@ function CortexInsightPanel() {
       <div className="text-xs font-medium text-slate-300">Codebase Understanding</div>
 
       <div className="space-y-1.5">
-        {CORTEX_INSIGHTS.map((item, i) => (
-          <div key={i} className="flex items-start gap-2 text-xs">
+        {insights.map((text) => (
+          <div key={text} className="flex items-start gap-2 text-xs">
             <span className="text-green-400 mt-0.5 shrink-0">&#9679;</span>
-            <span className="text-slate-300">{item.text}</span>
+            <span className="text-slate-300">{text}</span>
           </div>
         ))}
       </div>
@@ -237,7 +210,7 @@ export default function GuardianPanel({ pendingOps, onOpDecided }: Props) {
         )}
 
         {/* Cortex insight */}
-        <CortexInsightPanel />
+        <CortexInsightPanel pendingOps={pendingOps} />
       </div>
     </aside>
   );
