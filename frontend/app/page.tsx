@@ -7,7 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import type { GraphNode, Operation } from "@/lib/types";
 import type { NavPage } from "@/components/LeftNav";
-import { mapPending, stamp, withConflicts } from "@/lib/derive";
+import { mapPending, stamp } from "@/lib/derive";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -68,17 +68,12 @@ function useOperations(): [Operation[], (id: string, d: "approved" | "denied") =
     if (!USE_LIVE) return;
     async function load() {
       try {
-        // Pending dari /list_pending_approvals, decided dari /operations (biar History tidak hilang tiap poll).
-        const [pendingRes, allRes] = await Promise.all([
-          fetch(`${BACKEND_URL}/list_pending_approvals`, { cache: "no-store" }).catch(() => null),
-          fetch(`${BACKEND_URL}/operations?limit=100`, { cache: "no-store" }).catch(() => null),
-        ]);
-        if (!pendingRes?.ok && !allRes?.ok) return;
-        const pendingData = pendingRes?.ok ? ((await pendingRes.json()) as { pending?: unknown }) : null;
-        const decided = mapPending(allRes?.ok ? await allRes.json() : null).filter(
-          (op) => op.requires_approval === 1 && op.status !== "pending"
-        );
-        setOps(withConflicts([...mapPending(pendingData?.pending ?? []), ...decided]));
+        // /operations sudah join conflicts dari edges (CONFLICTS_WITH), jadi satu
+        // request cukup untuk pending + history. Endpoint /list_pending_approvals
+        // tidak mengirim conflicts, jadi tidak dipakai di sini.
+        const res = await fetch(`${BACKEND_URL}/operations?limit=100`, { cache: "no-store" }).catch(() => null);
+        if (!res?.ok) return;
+        setOps(mapPending(await res.json()).filter((op) => op.requires_approval === 1));
       } catch { /* backend not ready */ }
     }
     load();

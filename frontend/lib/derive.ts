@@ -207,7 +207,9 @@ export function opSummary(op: LiveOp): string {
   return op.target_node_id ?? op.tool_name;
 }
 
-// FE-2: payload /list_pending_approvals -> Operation[] untuk kartu approval.
+// FE-2: payload /operations -> Operation[] untuk kartu approval, sidebar, dan history.
+// Backend sudah join field `conflicts` dari edges (CONFLICTS_WITH) di /operations —
+///it/list_pending_approvals tidak mengirimnya, jadi jangan pakai endpoint itu untuk UI.
 export function mapPending(raw: unknown): Operation[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((item) => {
@@ -223,35 +225,5 @@ export function mapPending(raw: unknown): Operation[] {
       conflicts: Array.isArray(o.conflicts) ? (o.conflicts as string[]) : undefined,
       created_at: (o.created_at as string) ?? new Date().toISOString(),
     };
-  });
-}
-
-// Backend tidak punya kolom conflicts (conflict disimpan sebagai edge CONFLICTS_WITH),
-// jadi list approve/deny tidak pernah mengirim field itu. Hitung di FE dengan aturan
-// yang sama dengan guardian._check_conflict: status aktif + window 10 menit.
-// ponytail: grouping per target_node_id di memory. Upgrade ke kolom backend kalau
-// conflict jadi lifecycle-nya sendiri.
-const CONFLICT_WINDOW_MS = 10 * 60 * 1000;
-
-export function withConflicts(
-  ops: readonly Operation[],
-  now: number = Date.now(),
-): Operation[] {
-  const isLiveOp = (op: Operation) =>
-    op.target_node_id !== null &&
-    isOpen(op.status) &&
-    now - parseTs(op.created_at) <= CONFLICT_WINDOW_MS;
-
-  const byTarget = new Map<string, string[]>();
-  for (const op of ops) {
-    if (!isLiveOp(op)) continue;
-    const list = byTarget.get(op.target_node_id!) ?? [];
-    list.push(op.id);
-    byTarget.set(op.target_node_id!, list);
-  }
-  return ops.map((op) => {
-    if (op.conflicts?.length || !isLiveOp(op)) return op;
-    const others = (byTarget.get(op.target_node_id!) ?? []).filter((id) => id !== op.id);
-    return others.length > 0 ? { ...op, conflicts: others } : op;
   });
 }
