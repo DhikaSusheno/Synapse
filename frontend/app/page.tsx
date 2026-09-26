@@ -7,7 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import type { GraphNode, Operation } from "@/lib/types";
 import type { NavPage } from "@/components/LeftNav";
-import { mapPending, stamp } from "@/lib/derive";
+import { mapPending, stamp, withConflicts } from "@/lib/derive";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -17,7 +17,6 @@ const LeftNav          = dynamic(() => import("@/components/LeftNav"),          
 const TopNavbar        = dynamic(() => import("@/components/TopNavbar"),        { ssr: false });
 const GuardianPanel    = dynamic(() => import("@/components/GuardianPanel"),    { ssr: false });
 const OverviewMain     = dynamic(() => import("@/components/OverviewMain"),     { ssr: false, loading: () => <PageLoading /> });
-const OperationsSidebar= dynamic(() => import("@/components/OperationsSidebar"),{ ssr: false });
 const SynapseGraph     = dynamic(() => import("@/components/SynapseGraph"),     { ssr: false, loading: () => <PageLoading /> });
 
 // Pages
@@ -69,11 +68,17 @@ function useOperations(): [Operation[], (id: string, d: "approved" | "denied") =
     if (!USE_LIVE) return;
     async function load() {
       try {
-        const res = await fetch(`${BACKEND_URL}/list_pending_approvals`, { cache: "no-store" });
-        if (res.ok) {
-          const data = (await res.json()) as { pending?: unknown };
-          setOps(mapPending(data.pending ?? []));
-        }
+        const [pendingRes, historyRes] = await Promise.all([
+          fetch(`${BACKEND_URL}/list_pending_approvals`, { cache: "no-store" }).catch(() => null),
+          fetch(`${BACKEND_URL}/operations?limit=50`, { cache: "no-store" }).catch(() => null),
+        ]);
+        if (!pendingRes?.ok && !historyRes?.ok) return;
+        const pendingData = pendingRes?.ok ? ((await pendingRes.json()) as { pending?: unknown }) : null;
+        const historyData = historyRes?.ok ? await historyRes.json() : null;
+        const history = mapPending(historyData).filter(
+          (op) => op.requires_approval === 1 && op.status !== "pending"
+        );
+        setOps(withConflicts([...mapPending(pendingData?.pending ?? []), ...history]));
       } catch { /* backend not ready */ }
     }
     load();

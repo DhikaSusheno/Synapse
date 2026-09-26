@@ -53,7 +53,7 @@ function eventDetail(data: Record<string, unknown>): string {
   return JSON.stringify(data).slice(0, 60);
 }
 
-// Live event feed dari SSE — sama dengan event log di OperationsSidebar
+// Live event feed dari SSE
 function useSecurityEvents(enabled: boolean): SecurityEvent[] {
   const [events, setEvents] = useState<SecurityEvent[]>([]);
   useEffect(() => {

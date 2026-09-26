@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import {
   bucketActivity, buildFileTree, conflictCandidates, isOpen, mapPending,
   opSummary, parseTs, pct, relativeTime, rollbackStats, securityOverview,
-  type LiveOp,
+  withConflicts, type LiveOp,
 } from "./derive.ts";
 
 const op = (over: Partial<LiveOp> = {}): LiveOp => ({
@@ -167,4 +167,45 @@ test("mapPending mempertahankan status denied (bukan jadi failed)", () => {
   const [op] = mapPending([{ id: "op::2", tool_name: "fs.write", status: "denied", conflicts: ["op::1"] }]);
   assert.equal(op.status, "denied");
   assert.deepEqual(op.conflicts, ["op::1"]);
+});
+
+// Backend tidak kirim kolom conflicts, jadi FE harus hitung dengan aturan yang sama
+// dengan guardian._check_conflict: status aktif + window 10 menit.
+test("withConflicts menandai operasi aktif yang berbagi target", () => {
+  const ops = mapPending([
+    { id: "op::1", target_node_id: "t::nodes" },
+    { id: "op::2", target_node_id: "t::nodes" },
+    { id: "op::3", target_node_id: "t::edges" },
+    { id: "op::4", target_node_id: null },
+  ]);
+  const byId = Object.fromEntries(withConflicts(ops).map((o) => [o.id, o.conflicts]));
+  assert.deepEqual(byId["op::1"], ["op::2"]);
+  assert.deepEqual(byId["op::2"], ["op::1"]);
+  assert.equal(byId["op::3"], undefined);
+  assert.equal(byId["op::4"], undefined);
+});
+
+test("withConflicts mengabaikanPartner yang sudah selesai (verified)", () => {
+  const ops = mapPending([
+    { id: "op::verified", target_node_id: "t::nodes", status: "verified" },
+    { id: "op::pending", target_node_id: "t::nodes", status: "pending" },
+  ]);
+  const byId = Object.fromEntries(withConflicts(ops).map((o) => [o.id, o.conflicts]));
+  assert.equal(byId["op::pending"], undefined, "verified bukan konflik aktif");
+});
+
+test("withConflicts mengabaikan operasi di luar window 10 menit", () => {
+  const old = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+  const ops = mapPending([
+    { id: "op::lama", target_node_id: "t::nodes", created_at: old },
+    { id: "op::baru", target_node_id: "t::nodes" },
+  ]);
+  const byId = Object.fromEntries(withConflicts(ops).map((o) => [o.id, o.conflicts]));
+  assert.equal(byId["op::baru"], undefined);
+  assert.equal(byId["op::lama"], undefined);
+});
+
+test("withConflicts tidak menimpa conflicts dari backend", () => {
+  const [op] = withConflicts(mapPending([{ id: "op::1", target_node_id: "t::n", conflicts: ["op::be"] }]));
+  assert.deepEqual(op.conflicts, ["op::be"]);
 });
