@@ -114,8 +114,9 @@ def _check_conflict(conn: sqlite3.Connection, target_node_id: str) -> list[dict]
 
 def _make_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None]:
     """
-    Buat snapshot sebelum eksekusi.
-    MVP: hanya db.run_migration yang di-snapshot (copy file .db).
+    Buat snapshot TEPAT sebelum eksekusi (dipanggil dari execute_operation, bukan propose).
+    FIX BUG-04: snapshot dibuat saat execute, bukan saat propose — lebih akurat dan
+    gagal-dengan-pesan jika file tidak ada untuk high-risk operations.
     Return (snapshot_ref, rollback_command).
     """
     if tool_name.startswith("db.run_migration"):
@@ -123,9 +124,10 @@ def _make_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
         bak = f"{db_target}.bak.{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
         try:
             shutil.copy2(db_target, bak)
-            return bak, f"restore_from:{bak}"
+            return bak, f"restore_from:{bak}::{db_target}"
         except Exception as e:
-            return None, None
+            # Kembalikan error eksplisit agar caller bisa fail-safe
+            return None, f"snapshot_failed::{e}"
 
     if tool_name.startswith("config.write"):
         target_file = params.get("file_path", "")
@@ -133,7 +135,7 @@ def _make_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
             bak = f"{target_file}.bak.{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
             try:
                 shutil.copy2(target_file, bak)
-                return bak, f"restore_from:{bak}"
+                return bak, f"restore_from:{bak}::{target_file}"
             except Exception:
                 pass
 
@@ -141,18 +143,87 @@ def _make_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
 
 
 def _do_rollback(rollback_command: str | None) -> bool:
-    """Eksekusi rollback command. Sekarang hanya support restore_from:<path>."""
+    """
+    Eksekusi rollback command.
+    FIX BUG-02: derive destination dari rollback_command (format restore_from:<bak>::<dst>)
+    bukan hardcode ke DB_PATH.
+    """
     if not rollback_command:
         return False
     if rollback_command.startswith("restore_from:"):
-        bak_path = rollback_command.split(":", 1)[1]
+        # Format baru: restore_from:<bak_path>::<original_path>
+        parts = rollback_command.split("::")
+        bak_path = parts[0].split(":", 1)[1]  # hapus "restore_from:" prefix
+        # Gunakan original_path jika ada, fallback derive dari nama file backup
+        if len(parts) >= 2 and parts[1]:
+            dst = parts[1]
+        else:
+            # Fallback untuk format lama: strip ".bak.<timestamp>"
+            import re
+            dst = re.sub(r"\.bak\.\d{8}T\d{6}$", "", bak_path)
         try:
-            db_target = str(DB_PATH)
-            shutil.copy2(bak_path, db_target)
+            shutil.copy2(bak_path, dst)
             return True
         except Exception:
             return False
     return False
+
+
+def _restore_verified_operations(conn_after_rollback: sqlite3.Connection,
+                                  bak_path: str) -> int:
+    """
+    FIX BUG-03: Setelah rollback file DB, re-apply operasi yang status 'verified'
+    yang tercatat di backup (tapi mungkin hilang dari file yang di-restore).
+    Pendekatan pragmatis: copy baris operations+approvals yang sudah verified
+    dari backup DB ke DB yang baru di-restore, agar audit trail tidak hilang.
+    Return jumlah operasi yang di-re-insert.
+    """
+    try:
+        bak_conn = sqlite3.connect(bak_path)
+        bak_conn.row_factory = sqlite3.Row
+        # Ambil operasi verified di snapshot (yang sudah ada sebelum migration rusak)
+        verified_ops = bak_conn.execute(
+            "SELECT * FROM operations WHERE status = 'verified'"
+        ).fetchall()
+        verified_approvals = bak_conn.execute(
+            "SELECT * FROM approvals"
+        ).fetchall()
+        bak_conn.close()
+
+        restored = 0
+        for op in verified_ops:
+            try:
+                conn_after_rollback.execute(
+                    """INSERT INTO operations
+                       (id, tool_name, params_json, target_node_id, blast_radius,
+                        reversibility_class, status, snapshot_ref, rollback_command,
+                        requires_approval, created_at, executed_at, verified_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (op["id"], op["tool_name"], op["params_json"], op["target_node_id"],
+                     op["blast_radius"], op["reversibility_class"], op["status"],
+                     op["snapshot_ref"], op["rollback_command"], op["requires_approval"],
+                     op["created_at"], op["executed_at"], op["verified_at"])
+                )
+                restored += 1
+            except Exception:
+                pass
+
+        for appr in verified_approvals:
+            try:
+                conn_after_rollback.execute(
+                    """INSERT INTO approvals (operation_id, decision, decided_at, note)
+                       VALUES (?,?,?,?) ON CONFLICT(operation_id) DO NOTHING""",
+                    (appr["operation_id"], appr["decision"],
+                     appr["decided_at"], appr["note"])
+                )
+            except Exception:
+                pass
+
+        conn_after_rollback.commit()
+        return restored
+    except Exception:
+        return 0
 
 
 def _verify_operation(tool_name: str, params: dict) -> tuple[bool, str]:
@@ -224,8 +295,10 @@ def propose_operation(tool_name: str, params: dict, target: str) -> dict:
     if conflicts:
         requires_approval = True  # paksa approval kalau ada konflik
 
-    # 4. Rencana snapshot
-    snapshot_ref, rollback_command = _make_snapshot(tool_name, params)
+    # 4. Catat rencana snapshot (snapshot TIDAK dibuat di sini — FIX BUG-04)
+    # Snapshot dibuat tepat sebelum eksekusi di execute_operation()
+    snapshot_ref = None
+    rollback_command = None
 
     # 5. Simpan ke DB
     operation_id = str(uuid.uuid4())
@@ -331,8 +404,12 @@ def execute_operation(operation_id: str) -> dict:
 
     op = dict(row)
 
-    # Cek approval
-    if op["requires_approval"]:
+    # FIX BUG-01: Re-derive requires_approval dari rule table (sumber kebenaran),
+    # bukan hanya dari kolom DB yang bisa dimanipulasi.
+    rule = _get_rule(op["tool_name"])
+    effective_requires_approval = rule["require_approval"] or bool(op["requires_approval"])
+
+    if effective_requires_approval:
         approval = conn.execute(
             "SELECT decision FROM approvals WHERE operation_id = ?",
             (operation_id,)
@@ -353,6 +430,28 @@ def execute_operation(operation_id: str) -> dict:
         }
 
     params = json.loads(op["params_json"] or "{}")
+
+    # FIX BUG-04: Buat snapshot SEKARANG, tepat sebelum eksekusi
+    snapshot_ref, rollback_command = _make_snapshot(op["tool_name"], params)
+
+    # Fail-safe: operasi high-risk tanpa snapshot tidak boleh dilanjutkan
+    needs_snapshot = rule["reversibility"] == "needs_snapshot"
+    if needs_snapshot and snapshot_ref is None:
+        if rollback_command and rollback_command.startswith("snapshot_failed::"):
+            err = rollback_command.split("::", 1)[1]
+            conn.execute("UPDATE operations SET status='failed' WHERE id=?", (operation_id,))
+            conn.commit()
+            conn.close()
+            return {"ok": False, "error": f"Snapshot gagal — eksekusi dibatalkan (fail-safe): {err}",
+                    "operation_id": operation_id}
+
+    # Simpan snapshot ref ke DB jika berhasil dibuat
+    if snapshot_ref:
+        conn.execute(
+            "UPDATE operations SET snapshot_ref=?, rollback_command=? WHERE id=?",
+            (snapshot_ref, rollback_command, operation_id)
+        )
+        conn.commit()
 
     # State: executing
     conn.execute(
@@ -385,8 +484,13 @@ def execute_operation(operation_id: str) -> dict:
         exec_msg = str(e)
 
     if not exec_ok:
-        # Auto-rollback
-        rollback_ok = _do_rollback(op["rollback_command"])
+        # Auto-rollback + FIX BUG-03: re-insert verified ops setelah rollback file DB
+        rollback_ok = _do_rollback(rollback_command)
+        if rollback_ok and snapshot_ref:
+            conn_restored = sqlite3.connect(DB_PATH)
+            conn_restored.row_factory = sqlite3.Row
+            _restore_verified_operations(conn_restored, snapshot_ref)
+            conn_restored.close()
         new_status = "rolled_back" if rollback_ok else "failed"
         conn.execute(
             "UPDATE operations SET status=? WHERE id=?",
@@ -411,7 +515,13 @@ def execute_operation(operation_id: str) -> dict:
     verify_ok, verify_msg = _verify_operation(op["tool_name"], params)
 
     if not verify_ok:
-        rollback_ok = _do_rollback(op["rollback_command"])
+        # Auto-rollback + FIX BUG-03: re-insert verified ops setelah rollback file DB
+        rollback_ok = _do_rollback(rollback_command)
+        if rollback_ok and snapshot_ref:
+            conn_restored = sqlite3.connect(DB_PATH)
+            conn_restored.row_factory = sqlite3.Row
+            _restore_verified_operations(conn_restored, snapshot_ref)
+            conn_restored.close()
         new_status = "rolled_back" if rollback_ok else "failed"
         conn.execute(
             "UPDATE operations SET status=?, verified_at=? WHERE id=?",
@@ -582,4 +692,5 @@ def approve_operation(operation_id: str, decision: str, note: str = "") -> dict:
         "operation_id": operation_id,
         "decision": decision,
         "status": new_status,
+        "new_status": new_status,
     }
