@@ -1,80 +1,72 @@
 # Synapse Frontend
 
-**Owner FE-1**: [@nabilfauzandafa](https://github.com/nabilfauzandafa) — Force-directed live graph  
-**Owner FE-2**: [@ShannWasHere](https://github.com/ShannWasHere) — Dashboard sidebar + approve/deny
+Owner FE-1: [@nabilfauzandafa](https://github.com/nabilfauzandafa) — Force-directed live graph  
+Owner FE-2: [@ShannWasHere](https://github.com/ShannWasHere) — Dashboard sidebar
 
----
+Stack: **Next.js 14** + **react-force-graph-2d** + **Tailwind CSS**
 
-## Stack
-
-- **Next.js 14** (App Router, TypeScript)
-- **react-force-graph-2d** — live force-directed graph
-- **Tailwind CSS**
-- Konsumsi **SSE stream** dari backend (`/stream`)
-
-## Jalankan
+## Cara Run
 
 ```bash
+cd frontend
 npm install
+
+# Salin env vars
+cp .env.local.example .env.local
+# Edit .env.local sesuai kebutuhan
+
 npm run dev
 # → http://localhost:3000
 ```
 
-Backend harus jalan di `http://localhost:8000` (lihat `backend/`).
+## Mode Operasi
 
-## Mode Mock vs Live
-
-| Env var | Nilai | Efek |
+| `NEXT_PUBLIC_USE_LIVE_SSE` | Mode | Keterangan |
 |---|---|---|
-| `NEXT_PUBLIC_USE_LIVE_SSE` | `false` (default) | Pakai mock data + simulasi status |
-| `NEXT_PUBLIC_USE_LIVE_SSE` | `true` | Konek ke SSE stream backend |
-| `NEXT_PUBLIC_BACKEND_URL` | `http://localhost:8000` | URL backend |
+| `false` (default) | **MOCK** | Graph + sidebar pakai data simulasi. Tidak butuh backend. Demo animasi berjalan otomatis. |
+| `true` | **LIVE** | Graph load dari `GET /graph/nodes` + `/graph/edges`. Sidebar load dari `GET /list_pending_approvals`. SSE dari `GET /stream`. |
 
-Buat file `.env.local` untuk override:
+## Endpoints Backend yang Dipakai
+
+| Method | Endpoint | Dipakai oleh |
+|---|---|---|
+| `GET` | `/stream` | `useSSE` — real-time SSE stream |
+| `GET` | `/graph/nodes` | `useInitialGraph` — load awal nodes |
+| `GET` | `/graph/edges` | `useInitialGraph` — load awal edges |
+| `GET` | `/list_pending_approvals` | `useOperations` — daftar operasi pending |
+| `POST` | `/approve_operation` | `OperationCard.decide()` — approve/deny |
+| `POST` | `/execute_operation` | `OperationCard.decide()` — auto-execute setelah approve |
+
+## SSE Events yang Ditangani
+
+| Event | Handler |
+|---|---|
+| `graph_update` | Tambah nodes baru ke graph |
+| `ingest_progress` | Tampilkan progress overlay di canvas |
+| `operation_proposed` | Node baru status `pending` |
+| `operation_approved` | Node → `approved` |
+| `operation_executing` | Node → `executing` (glow oranye) |
+| `operation_verified` | Node → `verified` (hijau) |
+| `operation_failed` | Node → `failed` (blink merah) |
+| `operation_rolled_back` | Node → `rolled_back` (blink merah → hijau) |
+
+## Struktur File
+
 ```
-NEXT_PUBLIC_USE_LIVE_SSE=false
-NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
-```
-
-## Struktur
-
-```
-app/
-  page.tsx              ← Halaman utama (graph + sidebar)
-  layout.tsx            ← Root layout
-  globals.css
-  api/graph/route.ts    ← Proxy ke backend /graph/nodes + /graph/edges
-components/
-  SynapseGraph.tsx      ← FE-1: force-directed graph (react-force-graph-2d)
-  OperationsSidebar.tsx ← FE-2: sidebar operasi + approve/deny
-hooks/
-  useSSE.ts             ← Konsumsi SSE stream backend
-  useMockSimulation.ts  ← Simulasi status mock (dev only)
-lib/
-  types.ts              ← Type definitions (GraphNode, GraphLink, SSEEvent)
-  mockData.ts           ← Data mock (nodes + links + timeline simulasi)
-  nodeVisuals.ts        ← Warna & ukuran node per type/status
-```
-
-## Deliverables FE-1
-
-- [x] Force-directed graph dengan mock data
-- [x] Warna node per type & status (pending=kuning, verified=hijau, rolled_back=merah)
-- [x] Animasi status berubah otomatis (simulasi 3 langkah)
-- [x] Hook `useSSE` siap terima event dari backend
-- [ ] Wire ke SSE stream asli (tunggu backend deliverable #5)
-- [ ] Polish animasi pulse untuk node `pending`
-
-## Kontrak SSE (sepakati dengan BE-2 jam 0-2)
-
-Event yang dikirim backend via `/stream`:
-
-```json
-{ "event": "operation_proposed",  "data": { "operation_id": "op::xxx" } }
-{ "event": "operation_approved",  "data": { "operation_id": "op::xxx" } }
-{ "event": "operation_executing", "data": { "operation_id": "op::xxx" } }
-{ "event": "operation_verified",  "data": { "operation_id": "op::xxx" } }
-{ "event": "operation_failed",    "data": { "operation_id": "op::xxx" } }
-{ "event": "operation_rolled_back","data": { "operation_id": "op::xxx" } }
-{ "event": "graph_update",        "data": { "nodes": [...] } }
+frontend/
+├── app/
+│   ├── api/graph/route.ts   # Proxy → backend /graph/nodes + /graph/edges
+│   ├── globals.css
+│   ├── layout.tsx
+│   └── page.tsx             # Halaman utama (graph + sidebar)
+├── components/
+│   ├── SynapseGraph.tsx     # FE-1: force-graph + canvas animation
+│   └── OperationsSidebar.tsx # FE-2: approve/deny panel
+├── hooks/
+│   ├── useSSE.ts            # SSE EventSource consumer
+│   └── useMockSimulation.ts # Timeline simulasi (mode MOCK)
+└── lib/
+    ├── types.ts             # Kontrak GraphNode, GraphLink, SSEEvent, Operation
+    ├── mockData.ts          # Data mock + skenario demo (2 ops, conflict, rollback)
+    └── nodeVisuals.ts       # Warna, ukuran, label, hexToRgba helper
 ```

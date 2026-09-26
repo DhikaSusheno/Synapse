@@ -39,12 +39,12 @@ interface Props {
   selectedNode: GraphNode | null;
 }
 
-// ─── Badge warna blast radius ────────────────────────────────────────────────
+// ─── Badge blast radius ────────────────────────────────────────────────────────────
 function BlastBadge({ level }: { level: Operation["blast_radius"] }) {
   const styles: Record<string, string> = {
-    high:    "bg-red-900 text-red-300",
-    medium:  "bg-yellow-900 text-yellow-300",
-    low:     "bg-green-900 text-green-300",
+    high: "bg-red-900 text-red-300",
+    medium: "bg-yellow-900 text-yellow-300",
+    low: "bg-green-900 text-green-300",
     unknown: "bg-slate-700 text-slate-300",
   };
   return (
@@ -57,13 +57,13 @@ function BlastBadge({ level }: { level: Operation["blast_radius"] }) {
 // ─── Badge status ─────────────────────────────────────────────────────────────
 function StatusBadge({ status }: { status: GraphNode["status"] }) {
   const styles: Record<string, string> = {
-    pending:     "bg-yellow-900 text-yellow-300",
-    approved:    "bg-blue-900 text-blue-300",
-    executing:   "bg-orange-900 text-orange-300",
-    verified:    "bg-green-900 text-green-300",
-    failed:      "bg-red-900 text-red-300",
+    pending: "bg-yellow-900 text-yellow-300",
+    approved: "bg-blue-900 text-blue-300",
+    executing: "bg-orange-900 text-orange-300",
+    verified: "bg-green-900 text-green-300",
+    failed: "bg-red-900 text-red-300",
     rolled_back: "bg-red-900 text-red-300",
-    idle:        "bg-slate-700 text-slate-400",
+    idle: "bg-slate-700 text-slate-400",
   };
   return (
     <span className={`text-xs px-2 py-0.5 rounded-full font-mono ${styles[status] ?? styles.idle}`}>
@@ -76,28 +76,47 @@ function StatusBadge({ status }: { status: GraphNode["status"] }) {
 function OperationCard({ op }: { op: Operation }) {
   const [loading, setLoading] = useState(false);
   const [localStatus, setLocalStatus] = useState(op.status);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   async function decide(decision: "approved" | "denied") {
     setLoading(true);
+    setErrorMsg(null);
     try {
-      // Coba ke backend asli; fallback ke simulasi jika gagal
-      const res = await fetch(`${BACKEND_URL}/approve_operation`, {
+      // 1. Approve / deny di backend
+      const approveRes = await fetch(`${BACKEND_URL}/approve_operation`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ operation_id: op.id, decision }),
       }).catch(() => null);
 
-      if (res && res.ok) {
-        const data = await res.json().catch(() => null);
-        if (data?.status) {
-          setLocalStatus(data.status);
-        } else {
-          setLocalStatus(decision === "approved" ? "approved" : "failed");
-        }
-      } else {
-        // Backend offline → simulasi lokal
+      const approveData = approveRes?.ok ? await approveRes.json().catch(() => null) : null;
+
+      if (!approveRes || !approveRes.ok) {
+        // Backend offline — simulasi lokal
         await new Promise((r) => setTimeout(r, 600));
         setLocalStatus(decision === "approved" ? "approved" : "failed");
+        return;
+      }
+
+      setLocalStatus(approveData?.status ?? (decision === "approved" ? "approved" : "failed"));
+
+      // 2. Jika approve → langsung execute di backend
+      //    (backend akan emit SSE operation_executing → operation_verified / rolled_back)
+      if (decision === "approved") {
+        setLocalStatus("executing");
+        const execRes = await fetch(`${BACKEND_URL}/execute_operation`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operation_id: op.id }),
+        }).catch(() => null);
+
+        if (execRes?.ok) {
+          const execData = await execRes.json().catch(() => null);
+          setLocalStatus(execData?.status ?? "verified");
+        } else {
+          setLocalStatus("failed");
+          setErrorMsg("Execute gagal — lihat log backend.");
+        }
       }
     } finally {
       setLoading(false);
@@ -105,11 +124,7 @@ function OperationCard({ op }: { op: Operation }) {
   }
 
   const params = (() => {
-    try {
-      return JSON.parse(op.params_json);
-    } catch {
-      return {};
-    }
+    try { return JSON.parse(op.params_json); } catch { return {}; }
   })();
 
   return (
@@ -141,6 +156,10 @@ function OperationCard({ op }: { op: Operation }) {
         <div className="text-xs text-slate-400">
           Target: <span className="text-slate-300">{op.target_node_id}</span>
         </div>
+      )}
+
+      {errorMsg && (
+        <div className="text-xs text-red-400">{errorMsg}</div>
       )}
 
       {localStatus === "pending" && op.requires_approval === 1 && (
@@ -188,7 +207,7 @@ function NodeInfoPanel({ node }: { node: GraphNode }) {
   );
 }
 
-// ─── Hook: fetch operasi dari backend, fallback ke mock ───────────────────────
+// ─── Hook: fetch operasi dari /list_pending_approvals, fallback ke mock ────────────
 function useOperations() {
   const [ops, setOps] = useState<Operation[]>(MOCK_OPERATIONS);
 
@@ -198,12 +217,27 @@ function useOperations() {
 
     async function load() {
       try {
-        const res = await fetch(`${BACKEND_URL}/operations?status=pending`, {
+        // Endpoint resmi backend: GET /list_pending_approvals
+        const res = await fetch(`${BACKEND_URL}/list_pending_approvals`, {
           cache: "no-store",
         });
         if (res.ok) {
-          const data: Operation[] = await res.json();
-          if (data.length > 0) setOps(data);
+          const data = await res.json();
+          // Backend return { ok, count, pending: [...] }
+          const pending: Operation[] = (data.pending ?? []).map(
+            (op: Record<string, unknown>) => ({
+              id: op.id as string,
+              tool_name: op.tool_name as string,
+              params_json: (op.params_json as string) ?? "{}",
+              target_node_id: (op.target_node_id as string) ?? null,
+              blast_radius: (op.blast_radius as Operation["blast_radius"]) ?? "unknown",
+              status: (op.status as GraphNode["status"]) ?? "pending",
+              requires_approval: (op.requires_approval as number) ?? 1,
+              conflicts: op.conflicts ? (op.conflicts as string[]) : undefined,
+              created_at: (op.created_at as string) ?? new Date().toISOString(),
+            })
+          );
+          if (pending.length > 0) setOps(pending);
         }
       } catch {
         // backend belum siap — tetap pakai mock
@@ -211,7 +245,7 @@ function useOperations() {
     }
 
     load();
-    const interval = setInterval(load, 5000); // polling tiap 5 detik
+    const interval = setInterval(load, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -233,10 +267,8 @@ export default function OperationsSidebar({ selectedNode }: Props) {
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
-        {/* Info node terpilih */}
         {selectedNode && <NodeInfoPanel node={selectedNode} />}
 
-        {/* Daftar operasi */}
         <div className="text-xs text-slate-400 uppercase tracking-wide px-0.5">
           Pending approvals
         </div>
@@ -247,7 +279,6 @@ export default function OperationsSidebar({ selectedNode }: Props) {
         )}
       </div>
 
-      {/* Footer hint */}
       <div className="px-4 py-2 border-t border-slate-700 text-xs text-slate-500">
         Klik node di graph untuk detail
       </div>

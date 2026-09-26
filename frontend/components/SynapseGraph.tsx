@@ -3,16 +3,18 @@
 // components/SynapseGraph.tsx
 // FE-1 @nabilfauzandafa - Force-directed live graph
 //
-// Mode mock  : useMockSimulation aktif, useSSE nonaktif
-// Mode live  : set env NEXT_PUBLIC_USE_LIVE_SSE=true
+// Mode mock : useMockSimulation aktif, useSSE nonaktif
+// Mode live : set env NEXT_PUBLIC_USE_LIVE_SSE=true
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MOCK_NODES, MOCK_LINKS } from "@/lib/mockData";
 import { getNodeColor, getNodeSize, getNodeLabel, getLinkColor, hexToRgba } from "@/lib/nodeVisuals";
 import { useMockSimulation } from "@/hooks/useMockSimulation";
-import { useSSE } from "@/hooks/useSSE";
+import { useSSE, type IngestProgress } from "@/hooks/useSSE";
 import type { GraphNode, GraphLink } from "@/lib/types";
+
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
 // react-force-graph-2d tidak support SSR
 const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), {
@@ -26,10 +28,15 @@ const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), {
 
 const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
 
-// Tipe internal yang diterima ForceGraph2D
 interface RawNode extends GraphNode {
   x?: number;
   y?: number;
+}
+
+interface BackendEdge {
+  source_id: string;
+  target_id: string;
+  relationship: GraphLink["relationship"];
 }
 
 interface Props {
@@ -37,9 +44,6 @@ interface Props {
 }
 
 // ─── Canvas pulse/blink renderer ────────────────────────────────────────────
-// Dipanggil setiap frame oleh ForceGraph2D untuk menggambar node secara custom.
-// `globalAnimTime` dikembalikan dari useAnimationTime() agar semua node
-// berbagi timeline animasi yang sama.
 function drawNode(
   node: RawNode,
   ctx: CanvasRenderingContext2D,
@@ -51,9 +55,8 @@ function drawNode(
   const r = getNodeSize(node) / globalScale;
   const color = getNodeColor(node);
 
-  // ── Pulse glow untuk `pending` (kuning berkedenyut) ──────────────────────
+  // Pulse glow untuk pending (kuning)
   if (node.status === "pending") {
-    // Sinus 0–1 dengan periode ~2 detik
     const pulse = (Math.sin(animTime * Math.PI) + 1) / 2;
     const glowR = r * (1.8 + pulse * 1.2);
     const grad = ctx.createRadialGradient(x, y, r * 0.5, x, y, glowR);
@@ -65,9 +68,8 @@ function drawNode(
     ctx.fill();
   }
 
-  // ── Blink merah untuk `failed` & `rolled_back` ───────────────────────────
+  // Blink merah untuk failed & rolled_back
   if (node.status === "failed" || node.status === "rolled_back") {
-    // Berkedip lebih cepat: 4 Hz
     const blink = (Math.sin(animTime * 2 * Math.PI * 2) + 1) / 2;
     const glowR = r * (2.0 + blink * 0.8);
     const grad = ctx.createRadialGradient(x, y, r * 0.5, x, y, glowR);
@@ -79,7 +81,7 @@ function drawNode(
     ctx.fill();
   }
 
-  // ── Executing: glow oranye lembut ────────────────────────────────────────
+  // Glow oranye untuk executing
   if (node.status === "executing") {
     const pulse = (Math.sin(animTime * 1.5 * Math.PI) + 1) / 2;
     const glowR = r * (1.5 + pulse * 0.8);
@@ -92,13 +94,13 @@ function drawNode(
     ctx.fill();
   }
 
-  // ── Lingkaran utama node ─────────────────────────────────────────────────
+  // Lingkaran utama
   ctx.beginPath();
   ctx.arc(x, y, r, 0, 2 * Math.PI);
   ctx.fillStyle = color;
   ctx.fill();
 
-  // ── Ring tipis untuk operation node ──────────────────────────────────────
+  // Ring tipis untuk operation node
   if (node.type === "operation") {
     ctx.beginPath();
     ctx.arc(x, y, r + 1.5 / globalScale, 0, 2 * Math.PI);
@@ -107,7 +109,7 @@ function drawNode(
     ctx.stroke();
   }
 
-  // ── Label di bawah node (hanya saat zoom cukup besar) ────────────────────
+  // Label
   const fontSize = Math.max(8 / globalScale, 1.5);
   ctx.font = `${fontSize}px Inter, sans-serif`;
   ctx.textAlign = "center";
@@ -116,7 +118,7 @@ function drawNode(
   ctx.fillText(node.name, x, y + r + 2 / globalScale);
 }
 
-// ─── Hook animasi waktu (maju setiap frame) ──────────────────────────────────
+// ─── Hook animasi waktu ─────────────────────────────────────────────────
 function useAnimationTime(): number {
   const [t, setT] = useState(0);
   const rafRef = useRef<number>(0);
@@ -136,10 +138,55 @@ function useAnimationTime(): number {
   return t;
 }
 
+// ─── Hook: load initial graph dari backend ───────────────────────────────────
+function useInitialGraph(
+  setNodes: React.Dispatch<React.SetStateAction<GraphNode[]>>,
+  setLinks: React.Dispatch<React.SetStateAction<GraphLink[]>>,
+  enabled: boolean
+) {
+  useEffect(() => {
+    if (!enabled) return;
+    async function load() {
+      try {
+        const res = await fetch("/api/graph");
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // nodes dari backend: { id, type, name, meta_json }
+        if (Array.isArray(data.nodes) && data.nodes.length > 0) {
+          setNodes(
+            data.nodes.map((n: { id: string; type: GraphNode["type"]; name: string }) => ({
+              id: n.id,
+              name: n.name,
+              type: n.type ?? "file",
+              status: "idle" as const,
+            }))
+          );
+        }
+
+        // edges dari backend: { source_id, target_id, relationship }
+        if (Array.isArray(data.edges) && data.edges.length > 0) {
+          setLinks(
+            data.edges.map((e: BackendEdge) => ({
+              source: e.source_id,
+              target: e.target_id,
+              relationship: e.relationship,
+            }))
+          );
+        }
+      } catch {
+        // backend offline — tetap pakai mock
+      }
+    }
+    load();
+  }, [enabled, setNodes, setLinks]);
+}
+
 // ─── Komponen utama ──────────────────────────────────────────────────────────
 export default function SynapseGraph({ onNodeClick }: Props) {
-  const [nodes, setNodes] = useState<GraphNode[]>(MOCK_NODES);
-  const [links, setLinks] = useState<GraphLink[]>(MOCK_LINKS);
+  const [nodes, setNodes] = useState<GraphNode[]>(USE_LIVE ? [] : MOCK_NODES);
+  const [links, setLinks] = useState<GraphLink[]>(USE_LIVE ? [] : MOCK_LINKS);
+  const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
   const animTime = useAnimationTime();
@@ -160,17 +207,28 @@ export default function SynapseGraph({ onNodeClick }: Props) {
     return () => ro.disconnect();
   }, []);
 
-  // Fungsi update status node - dipakai oleh mock & SSE
+  // Initial load dari backend (hanya saat LIVE)
+  useInitialGraph(setNodes, setLinks, USE_LIVE);
+
+  // Fungsi update status node
   const handleNodeStatusUpdate = useCallback(
     (nodeId: string, status: GraphNode["status"]) => {
-      setNodes((prev) =>
-        prev.map((n) => (n.id === nodeId ? { ...n, status } : n))
-      );
+      setNodes((prev) => {
+        const exists = prev.find((n) => n.id === nodeId);
+        if (exists) {
+          return prev.map((n) => (n.id === nodeId ? { ...n, status } : n));
+        }
+        // Node baru dari SSE (operasi baru yang diproposekan)
+        return [
+          ...prev,
+          { id: nodeId, name: nodeId, type: "operation" as const, status },
+        ];
+      });
     },
     []
   );
 
-  // Fungsi tambah node baru dari SSE graph_update
+  // Fungsi tambah/update node dari SSE graph_update
   const handleGraphUpdate = useCallback((newNodes: GraphNode[]) => {
     setNodes((prev) => {
       const existingIds = new Set(prev.map((n) => n.id));
@@ -182,21 +240,27 @@ export default function SynapseGraph({ onNodeClick }: Props) {
   // Mock simulation (aktif saat USE_LIVE = false)
   useMockSimulation(handleNodeStatusUpdate, !USE_LIVE);
 
-  // Live SSE (aktif saat USE_LIVE = true)
+  // Live SSE
   useSSE({
     onNodeUpdate: handleNodeStatusUpdate,
     onGraphUpdate: handleGraphUpdate,
+    onIngestProgress: setIngestProgress,
     enabled: USE_LIVE,
   });
 
+  // Hapus progress overlay setelah 3 detik tidak ada update
+  useEffect(() => {
+    if (!ingestProgress) return;
+    const t = setTimeout(() => setIngestProgress(null), 3000);
+    return () => clearTimeout(t);
+  }, [ingestProgress]);
+
   const graphData = { nodes, links };
 
-  // nodeCanvasObject meneruskan animTime lewat ref agar tidak ada re-render closure stale
   const nodeCanvasObject = useCallback(
     (node: object, ctx: CanvasRenderingContext2D, globalScale: number) => {
       drawNode(node as RawNode, ctx, globalScale, animTimeRef.current);
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     []
   );
 
@@ -214,10 +278,7 @@ export default function SynapseGraph({ onNodeClick }: Props) {
           ] as [string, string][]
         ).map(([color, label]) => (
           <span key={label} className="flex items-center gap-1.5">
-            <span
-              className="inline-block w-2.5 h-2.5 rounded-full"
-              style={{ background: color }}
-            />
+            <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: color }} />
             {label}
           </span>
         ))}
@@ -232,10 +293,7 @@ export default function SynapseGraph({ onNodeClick }: Props) {
           ] as [string, string][]
         ).map(([color, label]) => (
           <span key={label} className="flex items-center gap-1.5">
-            <span
-              className="inline-block w-2.5 h-2.5 rounded-full"
-              style={{ background: color }}
-            />
+            <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: color }} />
             {label}
           </span>
         ))}
@@ -245,34 +303,50 @@ export default function SynapseGraph({ onNodeClick }: Props) {
       <div className="absolute top-3 right-3 z-10">
         <span
           className={`text-xs px-2 py-0.5 rounded-full font-mono ${
-            USE_LIVE
-              ? "bg-green-900 text-green-300"
-              : "bg-yellow-900 text-yellow-300"
+            USE_LIVE ? "bg-green-900 text-green-300" : "bg-yellow-900 text-yellow-300"
           }`}
         >
           {USE_LIVE ? "🟢 LIVE" : "🟡 MOCK"}
         </span>
       </div>
 
+      {/* Ingest progress overlay */}
+      {ingestProgress && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 bg-slate-800/90 backdrop-blur rounded-lg px-4 py-2 text-xs text-slate-300 flex items-center gap-2 shadow-lg">
+          <span className="animate-spin inline-block">⧗</span>
+          <span>
+            Ingesting <span className="text-slate-100 font-mono">{ingestProgress.current_doc}</span>
+            {ingestProgress.stats.files !== undefined && (
+              <span className="text-slate-400">
+                {" "}({ingestProgress.stats.files} files, {ingestProgress.stats.symbols} symbols)
+              </span>
+            )}
+          </span>
+        </div>
+      )}
+
+      {/* Empty state saat live mode dan graph kosong */}
+      {USE_LIVE && nodes.length === 0 && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-slate-500">
+          <span className="text-2xl">🧠</span>
+          <span className="text-sm">Graph kosong. Panggil <code className="bg-slate-800 px-1 rounded">POST /understand_repo</code> untuk mulai ingest.</span>
+        </div>
+      )}
+
       <ForceGraph2D
         graphData={graphData}
         width={dimensions.width}
         height={dimensions.height}
         backgroundColor="#0f172a"
-        // Custom canvas rendering (pulse/blink)
         nodeCanvasObject={nodeCanvasObject}
         nodeCanvasObjectMode={() => "replace"}
-        // Fallback label untuk tooltip (masih dipakai)
         nodeLabel={(node) => getNodeLabel(node as RawNode)}
-        // Edge rendering
         linkLabel={(link) => (link as unknown as GraphLink).relationship}
         linkColor={(link) => getLinkColor((link as unknown as GraphLink).relationship)}
         linkDirectionalArrowLength={4}
         linkDirectionalArrowRelPos={1}
         linkWidth={1.2}
-        // Interaksi
         onNodeClick={(node) => onNodeClick?.(node as GraphNode)}
-        // Fisika
         d3AlphaDecay={0.02}
         d3VelocityDecay={0.3}
       />
