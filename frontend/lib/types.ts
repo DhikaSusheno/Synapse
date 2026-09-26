@@ -36,6 +36,7 @@ export interface GraphLink {
 }
 
 // Payload SSE event dari backend /stream
+// Sesuai dengan semua _emit() calls di cortex.py dan guardian.py
 export interface SSEEvent {
   event:
     | "connected"
@@ -44,6 +45,7 @@ export interface SSEEvent {
     | "ingest_progress"
     | "operation_proposed"
     | "operation_approved"
+    | "operation_denied"      // approve_operation decision=denied
     | "operation_executing"
     | "operation_verified"
     | "operation_failed"
