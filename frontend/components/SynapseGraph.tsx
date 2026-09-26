@@ -119,8 +119,11 @@ function drawNode(
 }
 
 // --- Hook animasi waktu ---
-function useAnimationTime(): number {
-  const [t, setT] = useState(0);
+// BUG-40: versi lama setState tiap frame (~60x/detik) → re-render SynapseGraph terus
+// mentoring dan objek graphData baru tiap frame. animTime hanya dipakai di canvas
+// draw callback, jadi cukup ref — tidak perlu memicu render sama sekali.
+function useAnimationTimeRef(): React.MutableRefObject<number> {
+  const timeRef = useRef(0);
   const rafRef = useRef<number>(0);
   const lastRef = useRef<number>(0);
 
@@ -128,14 +131,14 @@ function useAnimationTime(): number {
     const tick = (now: number) => {
       const dt = lastRef.current ? (now - lastRef.current) / 1000 : 0;
       lastRef.current = now;
-      setT((prev) => prev + dt);
+      timeRef.current += dt;
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
   }, []);
 
-  return t;
+  return timeRef;
 }
 
 // --- Hook: load initial graph dari backend ---
@@ -201,9 +204,7 @@ export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
   const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
-  const animTime = useAnimationTime();
-  const animTimeRef = useRef(animTime);
-  animTimeRef.current = animTime;
+  const animTimeRef = useAnimationTimeRef();
 
   // Kirim node/link count ke parent tiap kali berubah
   useEffect(() => {
@@ -266,7 +267,7 @@ export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
     (node: object, ctx: CanvasRenderingContext2D, globalScale: number) => {
       drawNode(node as RawNode, ctx, globalScale, animTimeRef.current);
     },
-    []
+    [animTimeRef]
   );
 
   return (

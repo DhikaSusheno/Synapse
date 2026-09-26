@@ -8,6 +8,7 @@
 
 import { useEffect, useState } from "react";
 import { useLiveOps } from "@/hooks/useLiveOps";
+import { useSSEStream } from "@/hooks/useSSEStream";
 import {
   bucketActivity, clock, conflictCandidates, isOpen, opSummary, pct, relativeTime,
   type ConflictCandidate, type LiveOp,
@@ -55,24 +56,16 @@ function useGraphSummary(enabled: boolean): GraphSummary | null {
 
 function useLiveSSELog(): SSELogEntry[] {
   const [log, setLog] = useState<SSELogEntry[]>([]);
-  useEffect(() => {
-    if (!USE_LIVE) return;
-    const es = new EventSource(`${BACKEND_URL}/stream`);
-    es.onmessage = (e) => {
-      try {
-        const p = JSON.parse(e.data) as { event: string; data: Record<string, unknown> };
-        if (p.event === "heartbeat" || p.event === "connected") return;
-        const agent = p.event.startsWith("operation") ? "Guardian" : "Cortex";
-        setLog((prev) => [{
-          ts: new Date().toLocaleTimeString("id", { hour: "2-digit", minute: "2-digit" }),
-          agent,
-          event: p.event,
-          message: p.event.replace(/_/g, " "),
-        }, ...prev.slice(0, 19)]);
-      } catch { /* ignore */ }
-    };
-    return () => es.close();
-  }, []);
+  useSSEStream((p) => {
+    if (p.event === "heartbeat" || p.event === "connected") return;
+    const agent = p.event.startsWith("operation") ? "Guardian" : "Cortex";
+    setLog((prev) => [{
+      ts: new Date().toLocaleTimeString("id", { hour: "2-digit", minute: "2-digit" }),
+      agent,
+      event: p.event,
+      message: p.event.replace(/_/g, " "),
+    }, ...prev.slice(0, 19)]);
+  }, USE_LIVE);
   return log;
 }
 

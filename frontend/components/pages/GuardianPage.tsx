@@ -6,6 +6,7 @@
 import { useEffect, useState } from "react";
 import type { Operation } from "@/lib/types";
 import { stamp } from "@/lib/derive";
+import { decideOperation } from "@/lib/operations";
 import RiskBadge from "@/components/shared/RiskBadge";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
@@ -64,23 +65,9 @@ function PendingOpDetail({ op, onDecided }: PendingOpDetailProps) {
   async function decide(decision: "approved" | "denied") {
     setLoading(true); setError(null);
     try {
-      const r = await fetch(`${BACKEND_URL}/approve_operation`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ operation_id: op.id, decision }),
-      }).catch(() => null);
-      if (!r?.ok) { setStatus(decision === "approved" ? "approved" : "failed"); onDecided(op.id, decision); return; }
-      const d = await r.json().catch(() => null);
-      setStatus((d?.status ?? (decision === "approved" ? "approved" : "failed")) as typeof status);
-      if (decision === "approved") {
-        setStatus("executing");
-        const er = await fetch(`${BACKEND_URL}/execute_operation`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ operation_id: op.id }),
-        }).catch(() => null);
-        const ed = await er?.json().catch(() => null);
-        setStatus((ed?.status ?? "verified") as typeof status);
-        if (!ed?.ok) setError(ed?.error ?? "Execute failed.");
-      }
+      const r = await decideOperation(op.id, decision, BACKEND_URL);
+      if (r.status) setStatus(r.status);
+      if (r.error) { setError(r.error); return; }
       onDecided(op.id, decision);
     } finally { setLoading(false); }
   }

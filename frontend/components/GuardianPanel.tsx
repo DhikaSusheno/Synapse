@@ -7,6 +7,7 @@
 import { useState } from "react";
 import type { Operation, GraphNode } from "@/lib/types";
 import { stamp } from "@/lib/derive";
+import { decideOperation } from "@/lib/operations";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
@@ -41,40 +42,9 @@ function PendingApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id
     setLoading(true);
     setErrorMsg(null);
     try {
-      const approveRes = await fetch(`${BACKEND_URL}/approve_operation`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ operation_id: op.id, decision }),
-      }).catch(() => null);
-
-      const approveData = (await approveRes?.json().catch(() => null)) as
-        { status?: string; new_status?: string; detail?: string } | null;
-
-      if (!approveRes || !approveRes.ok) {
-        setErrorMsg(approveData?.detail ?? "Approve ditolak backend.");
-        return;
-      }
-
-      setLocalStatus(
-        ((approveData?.status ?? approveData?.new_status) as GraphNode["status"]) ??
-        (decision === "approved" ? "approved" : "denied")
-      );
-
-      if (decision === "approved") {
-        setLocalStatus("executing");
-        const execRes = await fetch(`${BACKEND_URL}/execute_operation`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ operation_id: op.id }),
-        }).catch(() => null);
-        if (execRes?.ok) {
-          const execData = await execRes.json().catch(() => null);
-          setLocalStatus((execData?.status ?? "verified") as GraphNode["status"]);
-        } else {
-          setLocalStatus("failed");
-          setErrorMsg("Execute failed — check backend log.");
-        }
-      }
+      const r = await decideOperation(op.id, decision, BACKEND_URL);
+      if (r.status) setLocalStatus(r.status);
+      if (r.error) { setErrorMsg(r.error); return; }
       onDecided?.(op.id, decision);
     } finally {
       setLoading(false);

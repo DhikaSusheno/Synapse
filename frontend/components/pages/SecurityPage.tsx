@@ -8,14 +8,14 @@
 // itu konfigurasi statis, bukan data runtime. Jika backend menambah
 // /security/rules, ganti RULES dengan fetch.
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useLiveOps } from "@/hooks/useLiveOps";
+import { useSSEStream } from "@/hooks/useSSEStream";
 import {
   clock, conflictCandidates, pct, rollbackStats, securityOverview,
   type ConflictCandidate, type LiveOp, type RollbackStats, type SecurityOverview,
 } from "@/lib/derive";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
 
 const RULES = [
@@ -56,24 +56,16 @@ function eventDetail(data: Record<string, unknown>): string {
 // Live event feed dari SSE
 function useSecurityEvents(enabled: boolean): SecurityEvent[] {
   const [events, setEvents] = useState<SecurityEvent[]>([]);
-  useEffect(() => {
-    if (!enabled) return;
-    const es = new EventSource(`${BACKEND_URL}/stream`);
-    es.onmessage = (e) => {
-      try {
-        const p = JSON.parse(e.data) as { event: string; data: Record<string, unknown> };
-        const severity = SEVERITY_BY_EVENT[p.event];
-        if (!severity) return;
-        setEvents((prev) => [{
-          timestamp: new Date().toLocaleTimeString("id", { hour: "2-digit", minute: "2-digit" }),
-          event: p.event,
-          detail: eventDetail(p.data),
-          severity,
-        }, ...prev.slice(0, 49)]);
-      } catch { /* ignore */ }
-    };
-    return () => es.close();
-  }, [enabled]);
+  useSSEStream((p) => {
+    const severity = SEVERITY_BY_EVENT[p.event];
+    if (!severity) return;
+    setEvents((prev) => [{
+      timestamp: new Date().toLocaleTimeString("id", { hour: "2-digit", minute: "2-digit" }),
+      event: p.event,
+      detail: eventDetail(p.data),
+      severity,
+    }, ...prev.slice(0, 49)]);
+  }, enabled);
   return events;
 }
 

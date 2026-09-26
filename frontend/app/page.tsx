@@ -8,6 +8,7 @@ import dynamic from "next/dynamic";
 import type { GraphNode, Operation } from "@/lib/types";
 import type { NavPage } from "@/components/LeftNav";
 import { mapPending, stamp } from "@/lib/derive";
+import { decideOperation } from "@/lib/operations";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -115,24 +116,9 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
   async function decide(decision: "approved" | "denied") {
     setLoading(true); setErrorMsg(null);
     try {
-      const r = await fetch(`${BACKEND_URL}/approve_operation`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ operation_id: op.id, decision }),
-      }).catch(() => null);
-      const ad = (await r?.json().catch(() => null)) as { status?: string; detail?: string } | null;
-      if (!r?.ok) { setErrorMsg(ad?.detail ?? "Approve ditolak backend."); return; }
-      setLocalStatus((ad?.status as Operation["status"]) ?? (decision === "approved" ? "approved" : "denied"));
-      if (decision === "approved") {
-        setLocalStatus("executing");
-        const er = await fetch(`${BACKEND_URL}/execute_operation`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ operation_id: op.id }),
-        }).catch(() => null);
-        const ed = (await er?.json().catch(() => null)) as { status?: string; error?: string; detail?: string; ok?: boolean } | null;
-        if (!er?.ok) { setLocalStatus("failed"); setErrorMsg(ed?.detail ?? "Execute gagal."); return; }
-        setLocalStatus((ed?.status as Operation["status"]) ?? "verified");
-        if (ed?.ok === false) { setLocalStatus("failed"); setErrorMsg(ed.error ?? "Execute gagal."); }
-      }
+      const r = await decideOperation(op.id, decision, BACKEND_URL);
+      if (r.status) setLocalStatus(r.status);
+      if (r.error) { setErrorMsg(r.error); return; }
       onDecided?.(op.id, decision);
     } finally { setLoading(false); }
   }
