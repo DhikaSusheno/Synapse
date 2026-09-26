@@ -151,7 +151,146 @@ def init_db() -> None:
     conn = get_conn()
     conn.executescript(SCHEMA)
     conn.commit()
+    _migrate_engine_columns(conn)
     print("[storage] Schema v2 siap di", DB_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Kolom metrics untuk engine.py
+# ---------------------------------------------------------------------------
+# attributes_json tetap jadi sumber kebenaran (satu blob JSON), tapi kolom di
+# bawah adalah proyeksi yang bisa di-QUERY. engine.py butuh
+# rank_complexity() dan health_report() menyaring berdasarkan kompleksitas;
+# memfilter JSON di Python berarti scan seluruh tabel tiap request.
+
+_ENGINE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("complexity",   "INTEGER DEFAULT 0"),   # cyclomatic complexity (McCabe approx)
+    ("line_start",   "INTEGER DEFAULT 0"),   # baris 1-based dalam file
+    ("line_count",   "INTEGER DEFAULT 0"),
+    ("parent_id",    "TEXT"),                # file::rel untuk kind='symbol'
+    ("symbol_kind",  "TEXT"),                # function | class | import
+    ("source_path",  "TEXT"),                # path relatif, untuk ambil snippet
+)
+
+_ENGINE_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_entities_complexity ON entities(complexity)",
+    "CREATE INDEX IF NOT EXISTS idx_entities_parent     ON entities(parent_id)",
+    "CREATE INDEX IF NOT EXISTS idx_entities_label      ON entities(label)",
+    "CREATE INDEX IF NOT EXISTS idx_entities_symbolkind ON entities(symbol_kind)",
+)
+
+
+def _migrate_engine_columns(conn: sqlite3.Connection) -> None:
+    """
+    Tambah kolom metrics ke tabel entities yang dibuat sebelum engine.py ada.
+
+    CREATE TABLE IF NOT EXISTS tidak mengubah tabel yang sudah ada, jadi DB
+    yang dibuat sebelum kolom ini ada tetap perlu ALTER. Dijalankan setiap
+    init_db() dan idempoten (sudah ada -> lewati).
+    """
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(entities)")}
+    added = False
+    for col, ddl in _ENGINE_COLUMNS:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE entities ADD COLUMN {col} {ddl}")
+            added = True
+    for idx in _ENGINE_INDEXES:
+        conn.execute(idx)
+    if added:
+        conn.commit()
+
+
+def upsert_entity(
+    entity_id: str,
+    kind: str,
+    label: str,
+    attributes: dict | None = None,
+    *,
+    complexity: int = 0,
+    line_start: int = 0,
+    line_count: int = 0,
+    parent_id: str | None = None,
+    symbol_kind: str | None = None,
+    source_path: str | None = None,
+) -> bool:
+    """
+    Tulis satu entity. Kembalikan True kalau kontennya berubah (version naik).
+
+    Versi hanya naik bila label/attributes_json benar-benar berbeda, supaya
+    re-ingest repo yang tidak berubah tidak membikin version melonjak terus.
+    """
+    import json
+
+    payload = json.dumps(attributes or {}, sort_keys=True)
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT label, attributes_json FROM entities WHERE id=?", (entity_id,)
+    ).fetchone()
+
+    if row is None:
+        conn.execute(
+            """INSERT INTO entities
+                   (id, kind, label, attributes_json, complexity, line_start,
+                    line_count, parent_id, symbol_kind, source_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (entity_id, kind, label, payload, complexity, line_start,
+             line_count, parent_id, symbol_kind, source_path),
+        )
+        conn.commit()
+        return True
+
+    if row["label"] == label and (row["attributes_json"] or "") == payload:
+        # Konten tidak berubah — hanya segarkan kolom metrics (mis. line_start
+        # bergeser kalau ada file di atasnya yang berubah) tanpa menaikkan version.
+        conn.execute(
+            """UPDATE entities
+                  SET complexity=?, line_start=?, line_count=?, parent_id=?,
+                      symbol_kind=?, source_path=?, updated_at=datetime('now')
+                WHERE id=?""",
+            (complexity, line_start, line_count, parent_id, symbol_kind,
+             source_path, entity_id),
+        )
+        conn.commit()
+        return False
+
+    conn.execute(
+        """UPDATE entities
+              SET kind=?, label=?, attributes_json=?, version=version+1,
+                  complexity=?, line_start=?, line_count=?, parent_id=?,
+                  symbol_kind=?, source_path=?, updated_at=datetime('now')
+            WHERE id=?""",
+        (kind, label, payload, complexity, line_start, line_count, parent_id,
+         symbol_kind, source_path, entity_id),
+    )
+    conn.commit()
+    return True
+
+
+def upsert_relation(
+    from_id: str, to_id: str, relation_type: str, weight: float = 1.0
+) -> str | None:
+    """
+    Tulis satu sisi graph. Kembalikan id relasi, atau None kalau tidak valid.
+
+    Dilewati diam-diam kalau salah satu ujung tidak ada sebagai entity, supaya
+    ingest tidak gagal utuh gara-gara satu referensi menggantung.
+    """
+    conn = get_conn()
+    for endpoint in (from_id, to_id):
+        if conn.execute(
+            "SELECT 1 FROM entities WHERE id=?", (endpoint,)
+        ).fetchone() is None:
+            return None
+
+    rel_id = f"{from_id}::{relation_type}::{to_id}"
+    conn.execute(
+        """INSERT INTO relations (id, from_id, to_id, relation_type, weight)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET weight=excluded.weight""",
+        (rel_id, from_id, to_id, relation_type, weight),
+    )
+    conn.commit()
+    return rel_id
 
 
 def record_audit(entity_id: str | None, event: str, detail: dict | None = None) -> str:
