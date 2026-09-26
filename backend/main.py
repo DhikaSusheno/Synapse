@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 from database import init_db
 import cortex
+import guardian
 
 # ---------------------------------------------------------------------------
 # App
@@ -284,6 +285,65 @@ def get_graph_summary():
         "nodes_by_type": node_counts,
         "edges_by_relationship": edge_counts,
     }
+
+
+# ---------------------------------------------------------------------------
+# GUARDIAN endpoints (BE-1 — DhikaSusheno, integrated by Masrendra)
+# ---------------------------------------------------------------------------
+
+class ProposeOperationRequest(BaseModel):
+    tool_name: str
+    params: dict = {}
+    target: str
+
+
+class ApproveOperationRequest(BaseModel):
+    decision: str  # 'approved' | 'denied'
+    note: str = ""
+
+
+@app.post("/propose_operation", tags=["Guardian"])
+def propose_operation(req: ProposeOperationRequest):
+    """
+    🛡️ Guardian Step 1: Klasifikasi risiko + conflict check + rencana rollback.
+    - blast_radius: low | medium | high | unknown
+    - Conflict detection: cek operasi lain di target yang sama (window 10 menit)
+    - Snapshot otomatis sebelum eksekusi
+    - Return: operation_id, requires_approval, conflicts, plan
+    """
+    return guardian.propose_operation(req.tool_name, req.params, req.target)
+
+
+@app.post("/execute_operation/{operation_id}", tags=["Guardian"])
+def execute_operation(operation_id: str):
+    """
+    🛡️ Guardian Step 2: Eksekusi operasi yang sudah disetujui.
+    - Auto-rollback jika eksekusi atau verifikasi gagal
+    - Emit SSE di setiap state transition
+    - Status: executing → verified | rolled_back | failed
+    """
+    result = guardian.execute_operation(operation_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@app.get("/pending_approvals", tags=["Guardian"])
+def list_pending_approvals():
+    """🛡️ Daftar operasi yang menunggu approval manusia."""
+    return guardian.list_pending_approvals()
+
+
+@app.post("/approve_operation/{operation_id}", tags=["Guardian"])
+def approve_operation(operation_id: str, req: ApproveOperationRequest):
+    """
+    🛡️ Approve atau deny sebuah operasi.
+    decision: 'approved' | 'denied'
+    """
+    result = guardian.approve_operation(operation_id, req.decision, req.note)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
 
 
 # ---------------------------------------------------------------------------
