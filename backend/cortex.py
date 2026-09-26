@@ -1,22 +1,27 @@
 """
 cortex.py — BE-2 Masrendra
 Tanggung jawab:
-  - understand_repo(repo_path): ingest repo via tree-sitter AST + baca docs
-  - explain_topic(topic): query graph + jawab dengan konteks file
-  - review_artifact(path_or_diff): scoring 4 dimensi (nice-to-have)
+  - understand_repo(repo_path)   : ingest repo via tree-sitter AST + baca docs
+  - explain_topic(topic)         : query graph + jawab dengan konteks file
+  - review_artifact(path_or_diff): scoring 4 dimensi
+  - repo_health()                : laporan kesehatan repo (unik: dead code + complexity)
+  - find_path(from_node, to_node): cari jalur antar dua entitas di graph
+  - complexity_report()          : ranking fungsi paling kompleks di repo
+  - suggest_refactor(node_id)    : saran refactor berbasis graph connectivity
 """
 import json
 import uuid
 import sqlite3
+import re
 from pathlib import Path
-from typing import Generator
+from datetime import datetime
 
 import networkx as nx
 
-from database import get_conn, DB_PATH
+from database import DB_PATH
 
 # ---------------------------------------------------------------------------
-# In-memory graph (networkx) — di-rebuild dari SQLite setiap kali needed
+# In-memory graph (networkx)
 # ---------------------------------------------------------------------------
 
 _graph: nx.DiGraph = nx.DiGraph()
@@ -30,7 +35,9 @@ def _rebuild_graph() -> nx.DiGraph:
     for row in conn.execute("SELECT id, type, name, meta_json FROM nodes"):
         g.add_node(row["id"], type=row["type"], name=row["name"],
                    meta=json.loads(row["meta_json"] or "{}"))
-    for row in conn.execute("SELECT source_id, target_id, relationship, confidence FROM edges"):
+    for row in conn.execute(
+        "SELECT source_id, target_id, relationship, confidence FROM edges"
+    ):
         g.add_edge(row["source_id"], row["target_id"],
                    relationship=row["relationship"],
                    confidence=row["confidence"])
@@ -39,30 +46,28 @@ def _rebuild_graph() -> nx.DiGraph:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Konstanta
 # ---------------------------------------------------------------------------
 
 SUPPORTED_EXTENSIONS = {
-    ".py": "python",
-    ".js": "javascript",
-    ".ts": "typescript",
-    ".java": "java",
-    ".go": "go",
-    ".rb": "ruby",
-    ".c": "c",
-    ".cpp": "cpp",
-    ".rs": "rust",
+    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".java": "java", ".go": "go", ".rb": "ruby",
+    ".c": "c", ".cpp": "cpp", ".rs": "rust",
 }
 
 DOC_EXTENSIONS = {".md", ".txt", ".rst", ".yaml", ".yml", ".toml", ".json"}
 
+SKIP_DIRS = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    "dist", "build", ".next", ".mypy_cache",
+}
 
-def _new_id() -> str:
-    return str(uuid.uuid4())
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def _upsert_node(conn: sqlite3.Connection, node_id: str, ntype: str,
-                 name: str, meta: dict) -> None:
+def _upsert_node(conn, node_id, ntype, name, meta):
     conn.execute(
         """INSERT INTO nodes (id, type, name, meta_json)
            VALUES (?, ?, ?, ?)
@@ -71,8 +76,7 @@ def _upsert_node(conn: sqlite3.Connection, node_id: str, ntype: str,
     )
 
 
-def _upsert_edge(conn: sqlite3.Connection, source_id: str, target_id: str,
-                 relationship: str, confidence: float = 1.0) -> str:
+def _upsert_edge(conn, source_id, target_id, relationship, confidence=1.0):
     edge_id = f"{source_id}::{relationship}::{target_id}"
     conn.execute(
         """INSERT INTO edges (id, source_id, target_id, relationship, confidence)
@@ -84,17 +88,15 @@ def _upsert_edge(conn: sqlite3.Connection, source_id: str, target_id: str,
 
 
 # ---------------------------------------------------------------------------
-# SSE event bus (in-memory queue, dibaca oleh /stream endpoint)
+# SSE event bus
 # ---------------------------------------------------------------------------
 
 import asyncio
-from collections import deque
 
 _sse_subscribers: list[asyncio.Queue] = []
 
 
 def _emit(event_type: str, data: dict) -> None:
-    """Kirim event SSE ke semua subscriber."""
     payload = json.dumps({"event": event_type, "data": data})
     dead = []
     for q in _sse_subscribers:
@@ -118,20 +120,16 @@ def unsubscribe_sse(q: asyncio.Queue) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. understand_repo
+# 1. understand_repo  (+ auto complexity scoring saat ingest)
 # ---------------------------------------------------------------------------
 
 def understand_repo(repo_path: str) -> dict:
     """
-    Ingest sebuah repo ke SQLite graph.
-
-    Langkah:
-      1. Walk seluruh file repo
-      2. Untuk setiap file kode yang didukung → parse AST via tree-sitter
-         → extract file-node, symbol-nodes (fungsi/kelas), import-nodes
-      3. Untuk setiap file doc (.md/.txt/.rst) → buat doc-node,
-         coba buat edge DOCUMENTS ke file kode yang namanya disebut di dalamnya
-      4. Emit SSE "graph_update" per batch
+    Ingest repo ke SQLite graph.
+    Tambahan unik vs standar:
+      - Hitung complexity score tiap fungsi saat parsing (McCabe-approx)
+      - Deteksi file tanpa doc-link (kandidat dead/undocumented code)
+      - Emit SSE progress per-direktori, bukan hanya di akhir
     """
     root = Path(repo_path)
     if not root.exists():
@@ -141,35 +139,59 @@ def understand_repo(repo_path: str) -> dict:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
 
-    stats = {"files": 0, "symbols": 0, "docs": 0, "edges": 0}
+    stats = {"files": 0, "symbols": 0, "docs": 0, "edges": 0,
+             "undocumented_files": 0, "high_complexity_symbols": 0}
     graph_diff: list[dict] = []
+    documented_files: set[str] = set()
 
-    # --- Pass 1: file kode ---
+    # Pass 1: file kode
     for fpath in root.rglob("*"):
         if not fpath.is_file():
             continue
+        if any(skip in fpath.parts for skip in SKIP_DIRS):
+            continue
+
         ext = fpath.suffix.lower()
         rel = str(fpath.relative_to(root))
 
         if ext in SUPPORTED_EXTENSIONS:
             lang = SUPPORTED_EXTENSIONS[ext]
             file_id = f"file::{rel}"
-            _upsert_node(conn, file_id, "file", rel,
-                         {"path": rel, "lang": lang, "abs_path": str(fpath)})
+
+            try:
+                src = fpath.read_text(encoding="utf-8", errors="ignore")
+                file_lines = len(src.splitlines())
+            except Exception:
+                src = ""
+                file_lines = 0
+
+            _upsert_node(conn, file_id, "file", rel, {
+                "path": rel, "lang": lang,
+                "abs_path": str(fpath),
+                "lines": file_lines,
+            })
             graph_diff.append({"id": file_id, "type": "file", "name": rel})
             stats["files"] += 1
 
-            # Parse AST
-            symbols = _parse_ast(fpath, lang)
+            symbols = _parse_ast(fpath, lang, src)
             for sym in symbols:
                 sym_id = f"symbol::{rel}::{sym['name']}"
-                _upsert_node(conn, sym_id, "symbol", sym["name"],
-                             {"kind": sym["kind"], "line": sym["line"],
-                              "file": rel})
+                cx = sym.get("complexity", 1)
+                if cx >= 5:
+                    stats["high_complexity_symbols"] += 1
+                _upsert_node(conn, sym_id, "symbol", sym["name"], {
+                    "kind": sym["kind"],
+                    "line": sym["line"],
+                    "file": rel,
+                    "complexity": cx,
+                    "lines": sym.get("lines", 0),
+                })
                 _upsert_edge(conn, file_id, sym_id, "IMPLEMENTED_BY")
-                graph_diff.append({"id": sym_id, "type": "symbol",
-                                   "name": sym["name"],
-                                   "parent": file_id})
+                graph_diff.append({
+                    "id": sym_id, "type": "symbol",
+                    "name": sym["name"], "parent": file_id,
+                    "complexity": cx,
+                })
                 stats["symbols"] += 1
                 stats["edges"] += 1
 
@@ -180,26 +202,38 @@ def understand_repo(repo_path: str) -> dict:
             graph_diff.append({"id": doc_id, "type": "doc", "name": rel})
             stats["docs"] += 1
 
-            # Coba buat edge DOCUMENTS ke file kode yang namanya disebut
             try:
                 content = fpath.read_text(encoding="utf-8", errors="ignore")
-                edges_added = _link_doc_to_code(conn, doc_id, content, root)
+                edges_added = _link_doc_to_code(conn, doc_id, content, root,
+                                                documented_files)
                 stats["edges"] += edges_added
             except Exception:
                 pass
 
+            _emit("ingest_progress", {
+                "repo": repo_path,
+                "current_doc": rel,
+                "stats_so_far": stats.copy(),
+            })
+
+    all_file_ids = {
+        row["id"] for row in
+        conn.execute("SELECT id FROM nodes WHERE type='file'").fetchall()
+    }
+    stats["undocumented_files"] = len(all_file_ids - documented_files)
+
     conn.commit()
     conn.close()
 
-    # Emit SSE
+    global _graph
+    _graph = _rebuild_graph()
+
     _emit("graph_update", {
         "repo": repo_path,
         "nodes": graph_diff,
-        "stats": stats
+        "stats": stats,
+        "ingested_at": datetime.utcnow().isoformat(),
     })
-
-    global _graph
-    _graph = _rebuild_graph()
 
     return {
         "ok": True,
@@ -207,18 +241,16 @@ def understand_repo(repo_path: str) -> dict:
         "stats": stats,
         "node_count": len(_graph.nodes),
         "edge_count": len(_graph.edges),
+        "ingested_at": datetime.utcnow().isoformat(),
     }
 
 
-def _parse_ast(fpath: Path, lang: str) -> list[dict]:
+def _parse_ast(fpath: Path, lang: str, src: str = "") -> list[dict]:
     """
-    Parse file kode dengan tree-sitter.
-    Return list of { name, kind, line }.
-    Fallback ke parser Python bawaan kalau tree-sitter gagal.
+    Parse file kode + hitung complexity score per fungsi.
     """
     symbols: list[dict] = []
 
-    # --- tree-sitter ---
     try:
         from tree_sitter_languages import get_language, get_parser
         language = get_language(lang)
@@ -227,7 +259,6 @@ def _parse_ast(fpath: Path, lang: str) -> list[dict]:
         tree = parser.parse(source)
         root_node = tree.root_node
 
-        # Query: function_definition dan class_definition (Python/JS/TS/Go)
         QUERIES = {
             "python": """
                 (function_definition name: (identifier) @fname)
@@ -251,88 +282,102 @@ def _parse_ast(fpath: Path, lang: str) -> list[dict]:
             q = language.query(query_src)
             captures = q.captures(root_node)
             for node, cap_name in captures:
-                text = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
-                kind = "function" if "fname" in cap_name else \
-                       "class" if "cname" in cap_name else "import"
+                text = source[node.start_byte:node.end_byte].decode(
+                    "utf-8", errors="ignore"
+                )
+                kind = ("function" if "fname" in cap_name else
+                        "class" if "cname" in cap_name else "import")
+                func_src = source[node.start_byte:node.end_byte].decode(
+                    "utf-8", errors="ignore"
+                )
                 symbols.append({
                     "name": text.strip('"\''),
                     "kind": kind,
                     "line": node.start_point[0] + 1,
+                    "complexity": _calc_complexity(func_src),
+                    "lines": func_src.count("\n") + 1,
                 })
-        else:
-            # Generic: hanya extract nama node level atas
-            for child in root_node.children:
-                if hasattr(child, "child_by_field_name"):
-                    name_node = child.child_by_field_name("name")
-                    if name_node:
-                        text = source[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="ignore")
-                        symbols.append({
-                            "name": text,
-                            "kind": child.type,
-                            "line": child.start_point[0] + 1,
-                        })
         return symbols
-
     except Exception:
         pass
 
-    # --- Fallback: Python ast module (hanya untuk .py) ---
     if lang == "python":
         try:
             import ast as pyast
-            source_str = fpath.read_text(encoding="utf-8", errors="ignore")
+            source_str = src or fpath.read_text(encoding="utf-8", errors="ignore")
             tree = pyast.parse(source_str)
+            src_lines = source_str.splitlines()
             for node in pyast.walk(tree):
                 if isinstance(node, (pyast.FunctionDef, pyast.AsyncFunctionDef)):
-                    symbols.append({"name": node.name, "kind": "function",
-                                    "line": node.lineno})
+                    end = getattr(node, "end_lineno", node.lineno)
+                    func_src = "\n".join(src_lines[node.lineno - 1: end])
+                    symbols.append({
+                        "name": node.name, "kind": "function",
+                        "line": node.lineno,
+                        "complexity": _calc_complexity(func_src),
+                        "lines": end - node.lineno + 1,
+                    })
                 elif isinstance(node, pyast.ClassDef):
-                    symbols.append({"name": node.name, "kind": "class",
-                                    "line": node.lineno})
+                    symbols.append({
+                        "name": node.name, "kind": "class",
+                        "line": node.lineno, "complexity": 1, "lines": 1,
+                    })
                 elif isinstance(node, pyast.Import):
                     for alias in node.names:
-                        symbols.append({"name": alias.name, "kind": "import",
-                                        "line": node.lineno})
+                        symbols.append({
+                            "name": alias.name, "kind": "import",
+                            "line": node.lineno, "complexity": 0, "lines": 1,
+                        })
                 elif isinstance(node, pyast.ImportFrom):
                     if node.module:
-                        symbols.append({"name": node.module, "kind": "import",
-                                        "line": node.lineno})
+                        symbols.append({
+                            "name": node.module, "kind": "import",
+                            "line": node.lineno, "complexity": 0, "lines": 1,
+                        })
         except Exception:
             pass
 
     return symbols
 
 
-def _link_doc_to_code(conn: sqlite3.Connection, doc_id: str,
-                      content: str, root: Path) -> int:
-    """
-    Cari nama file kode yang disebut dalam konten doc,
-    buat edge DOCUMENTS kalau ketemu.
-    Return jumlah edge yang dibuat.
-    """
+def _calc_complexity(src: str) -> int:
+    """McCabe Cyclomatic Complexity approx: 1 + jumlah branch keyword."""
+    branch_keywords = [
+        r"\bif\b", r"\belif\b", r"\belse\b", r"\bfor\b", r"\bwhile\b",
+        r"\bexcept\b", r"\band\b", r"\bor\b", r"\bcase\b", r"\bcatch\b",
+        r"\bswitch\b",
+    ]
+    count = 1
+    for kw in branch_keywords:
+        count += len(re.findall(kw, src))
+    return count
+
+
+def _link_doc_to_code(conn, doc_id, content, root, documented_files: set) -> int:
     edges = 0
-    rows = conn.execute(
-        "SELECT id, name FROM nodes WHERE type='file'"
-    ).fetchall()
+    rows = conn.execute("SELECT id, name FROM nodes WHERE type='file'").fetchall()
     content_lower = content.lower()
     for row in rows:
         fname = Path(row["name"]).name.lower()
         if fname and fname in content_lower:
             _upsert_edge(conn, doc_id, row["id"], "DOCUMENTS", confidence=0.8)
+            documented_files.add(row["id"])
             edges += 1
     return edges
 
 
 # ---------------------------------------------------------------------------
-# 2. explain_topic
+# 2. explain_topic  (+ callers + how_to_use + relevance scoring)
 # ---------------------------------------------------------------------------
 
 def explain_topic(topic: str) -> dict:
     """
-    Cari entitas graph yang relevan dengan `topic`,
-    baca isi file yang terkait, return penjelasan terstruktur.
-
-    Output: { definition, mental_model, example, related_nodes }
+    Cari entitas di graph, baca snippet, return penjelasan.
+    Tambahan unik:
+      - Relevance scoring per node hasil pencarian
+      - Sertakan "callers" (siapa yang memanggil entitas ini)
+      - Sertakan "how_to_use" yang diinfer dari graph
+      - Tampilkan complexity note
     """
     global _graph
     if len(_graph.nodes) == 0:
@@ -342,43 +387,55 @@ def explain_topic(topic: str) -> dict:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
 
-    # --- Cari node yang namanya mengandung topic ---
     matched_nodes = []
     for row in conn.execute(
         "SELECT id, type, name, meta_json FROM nodes WHERE LOWER(name) LIKE ?",
         (f"%{topic_lower}%",)
     ):
-        matched_nodes.append(dict(row))
+        node = dict(row)
+        name_l = node["name"].lower()
+        node["relevance"] = (1.0 if name_l == topic_lower else
+                             0.8 if name_l.startswith(topic_lower) else 0.5)
+        matched_nodes.append(node)
+
+    matched_nodes.sort(key=lambda x: x["relevance"], reverse=True)
 
     if not matched_nodes:
         conn.close()
         return {
-            "ok": False,
-            "topic": topic,
+            "ok": False, "topic": topic,
             "message": f"Tidak ditemukan entitas yang cocok dengan '{topic}' di graph."
         }
 
-    # Ambil node utama (paling relevan: exact match atau tertinggi)
-    exact = [n for n in matched_nodes if n["name"].lower() == topic_lower]
-    primary = exact[0] if exact else matched_nodes[0]
+    primary = matched_nodes[0]
 
-    # --- Kumpulkan tetangga langsung dari graph ---
     related: list[dict] = []
+    callers: list[dict] = []
     if primary["id"] in _graph:
-        for neighbor_id in list(_graph.successors(primary["id"])) + \
-                           list(_graph.predecessors(primary["id"])):
-            if neighbor_id in _graph.nodes:
-                ndata = _graph.nodes[neighbor_id]
-                edge_data = _graph.get_edge_data(primary["id"], neighbor_id) or \
-                            _graph.get_edge_data(neighbor_id, primary["id"]) or {}
+        for nb_id in list(_graph.successors(primary["id"])):
+            if nb_id in _graph.nodes:
+                nd = _graph.nodes[nb_id]
+                ed = _graph.get_edge_data(primary["id"], nb_id) or {}
                 related.append({
-                    "id": neighbor_id,
-                    "name": ndata.get("name", neighbor_id),
-                    "type": ndata.get("type", "unknown"),
-                    "relationship": edge_data.get("relationship", "")
+                    "id": nb_id, "name": nd.get("name", nb_id),
+                    "type": nd.get("type", "unknown"),
+                    "relationship": ed.get("relationship", ""),
+                    "direction": "outgoing",
                 })
+        for nb_id in list(_graph.predecessors(primary["id"])):
+            if nb_id in _graph.nodes:
+                nd = _graph.nodes[nb_id]
+                ed = _graph.get_edge_data(nb_id, primary["id"]) or {}
+                entry = {
+                    "id": nb_id, "name": nd.get("name", nb_id),
+                    "type": nd.get("type", "unknown"),
+                    "relationship": ed.get("relationship", ""),
+                    "direction": "incoming",
+                }
+                related.append(entry)
+                if nd.get("type") == "symbol":
+                    callers.append(entry)
 
-    # --- Baca isi file yang relevan ---
     snippet = ""
     meta = json.loads(primary.get("meta_json") or "{}")
     abs_path = meta.get("abs_path") or meta.get("path", "")
@@ -387,67 +444,68 @@ def explain_topic(topic: str) -> dict:
             lines = Path(abs_path).read_text(
                 encoding="utf-8", errors="ignore"
             ).splitlines()
-            start_line = meta.get("line", 1)
-            # Ambil 20 baris setelah definisi
-            snippet_lines = lines[max(0, start_line - 1): start_line + 19]
-            snippet = "\n".join(snippet_lines)
+            start = max(0, meta.get("line", 1) - 1)
+            snippet = "\n".join(lines[start: start + 25])
         except Exception:
             pass
-    elif primary["type"] == "file":
-        file_path = meta.get("abs_path") or meta.get("path", "")
-        if file_path and Path(file_path).exists():
-            try:
-                snippet = Path(file_path).read_text(
-                    encoding="utf-8", errors="ignore"
-                )[:1500]
-            except Exception:
-                pass
 
     conn.close()
 
-    # --- Susun penjelasan terstruktur ---
     type_label = {
         "file": "file kode",
-        "symbol": f"{meta.get('kind', 'symbol')} (simbol kode)",
-        "doc": "dokumen",
-        "dependency": "dependensi",
-        "operation": "operasi",
+        "symbol": f"{meta.get('kind','symbol')} (simbol kode)",
+        "doc": "dokumen", "dependency": "dependensi", "operation": "operasi",
     }.get(primary["type"], primary["type"])
 
-    definition = (
-        f"**{primary['name']}** adalah sebuah {type_label} "
-        f"yang ditemukan di graph Synapse."
-    )
+    how_to_use = ""
+    if callers:
+        how_to_use = (
+            f"Dipakai oleh: {', '.join(c['name'] for c in callers[:3])}. "
+            f"Lihat file-file tersebut sebagai contoh penggunaan."
+        )
+    elif primary["type"] == "symbol" and meta.get("kind") == "function":
+        how_to_use = f"Panggil dengan: `{primary['name']}(...)`"
 
-    mental_model = (
-        f"Bayangkan graph sebagai peta kode: "
-        f"'{primary['name']}' adalah satu titik (node) bertipe '{primary['type']}'. "
-        f"Node ini terhubung ke {len(related)} entitas lain, "
-        f"termasuk: {', '.join(r['name'] for r in related[:5]) or 'tidak ada'}."
+    cx = meta.get("complexity", None)
+    complexity_note = (
+        f"⚠️ Complexity tinggi ({cx}) — kandidat refactor." if cx and cx >= 10 else
+        f"⚡ Complexity sedang ({cx})." if cx and cx >= 5 else
+        f"✅ Complexity rendah ({cx})." if cx else ""
     )
-
-    example = snippet if snippet else "(Tidak ada snippet tersedia)"
 
     return {
         "ok": True,
         "topic": topic,
         "primary_node": primary,
-        "definition": definition,
-        "mental_model": mental_model,
-        "example": example,
+        "definition": f"**{primary['name']}** adalah {type_label} di graph Synapse.",
+        "mental_model": (
+            f"'{primary['name']}' adalah node bertipe '{primary['type']}', "
+            f"terhubung ke {len(related)} entitas. Caller langsung: {len(callers)}."
+        ),
+        "complexity_note": complexity_note,
+        "how_to_use": how_to_use,
+        "example": snippet or "(Tidak ada snippet tersedia)",
         "related_nodes": related[:10],
+        "callers": callers[:5],
+        "all_matches": [
+            {"id": n["id"], "name": n["name"],
+             "type": n["type"], "relevance": n["relevance"]}
+            for n in matched_nodes[:5]
+        ],
     }
 
 
 # ---------------------------------------------------------------------------
-# 3. review_artifact (nice-to-have)
+# 3. review_artifact  (+ diff-aware + pattern-based risk detection)
 # ---------------------------------------------------------------------------
 
 def review_artifact(path_or_diff: str) -> dict:
     """
-    Scoring artifact (path file atau diff teks) pada 4 dimensi:
-    completeness, clarity, correctness_vs_spec, risk.
-    Return verdict: pass | needs_work | block.
+    Scoring artifact 4 dimensi.
+    Tambahan unik:
+      - Deteksi apakah ini git diff (baris +/-)
+      - Hitung churn (added vs removed lines)
+      - Pattern-based risk detection (bukan hanya keyword)
     """
     global _graph
     if len(_graph.nodes) == 0:
@@ -455,55 +513,62 @@ def review_artifact(path_or_diff: str) -> dict:
 
     content = ""
     is_file = Path(path_or_diff).exists()
+
     if is_file:
         try:
             content = Path(path_or_diff).read_text(
                 encoding="utf-8", errors="ignore"
-            )[:4000]
+            )[:5000]
         except Exception as e:
             return {"ok": False, "error": str(e)}
     else:
-        content = path_or_diff  # anggap ini diff teks
+        content = path_or_diff
 
     lines = content.splitlines()
-    total_lines = len(lines)
+    added_lines = [l for l in lines if l.startswith("+") and not l.startswith("+++")]
+    removed_lines = [l for l in lines if l.startswith("-") and not l.startswith("---")]
+    is_diff = len(added_lines) > 0 and len(removed_lines) > 0
+    effective_lines = added_lines if is_diff else lines
+    total_lines = len(effective_lines)
 
-    # --- Scoring heuristik (rule-based, bukan ML) ---
-
-    # 1. Completeness: apakah ada TODO/FIXME/pass/... yang belum selesai?
+    # 1. Completeness
     incomplete_markers = sum(
-        1 for l in lines
-        if any(m in l.upper() for m in ["TODO", "FIXME", "HACK", "XXX", "PASS", "..."])
+        1 for l in effective_lines
+        if any(m in l.upper() for m in ["TODO", "FIXME", "HACK", "XXX", "PASS ", "..."])
     )
     completeness = max(0.0, 1.0 - (incomplete_markers / max(total_lines, 1)) * 10)
 
-    # 2. Clarity: rata-rata panjang baris (terlalu panjang = kurang jelas)
-    avg_len = sum(len(l) for l in lines) / max(total_lines, 1)
+    # 2. Clarity
+    avg_len = sum(len(l.lstrip("+-")) for l in effective_lines) / max(total_lines, 1)
     clarity = 1.0 if avg_len < 80 else max(0.3, 1.0 - (avg_len - 80) / 200)
 
-    # 3. Correctness vs spec: apakah nama fungsi/kelas ada di graph?
+    # 3. Correctness vs spec
     graph_names = {
         data.get("name", "").lower()
         for _, data in _graph.nodes(data=True)
     }
-    referenced = sum(
-        1 for name in graph_names
-        if name and name in content.lower()
-    )
+    referenced = sum(1 for name in graph_names if name and name in content.lower())
     correctness = min(1.0, 0.5 + referenced * 0.1)
 
-    # 4. Risk: apakah ada keyword berisiko tinggi?
-    risk_keywords = [
-        "drop table", "delete from", "truncate", "rm -rf",
-        "os.remove", "shutil.rmtree", "subprocess", "exec(",
-        "eval(", "migration", "rollback"
+    # 4. Risk — pattern spesifik
+    risk_patterns = [
+        (r"drop\s+table", "DROP TABLE terdeteksi"),
+        (r"delete\s+from\s+\w+\s*;", "DELETE tanpa WHERE"),
+        (r"rm\s+-rf", "rm -rf terdeteksi"),
+        (r"os\.remove|shutil\.rmtree", "File delete terdeteksi"),
+        (r"subprocess\.call|subprocess\.run", "Subprocess execution"),
+        (r"\beval\s*\(", "eval() — potensi code injection"),
+        (r"password\s*=\s*['\"][^'\"]+['\"]", "Hardcoded password"),
+        (r"secret\s*=\s*['\"][^'\"]+['\"]", "Hardcoded secret"),
+        (r"ALTER\s+TABLE", "ALTER TABLE terdeteksi"),
+        (r"TRUNCATE", "TRUNCATE terdeteksi"),
     ]
-    risk_hits = sum(
-        1 for kw in risk_keywords if kw in content.lower()
-    )
-    risk_score = min(1.0, risk_hits * 0.2)  # 0 = aman, 1 = sangat berisiko
+    risk_findings = [
+        label for pattern, label in risk_patterns
+        if re.search(pattern, content, re.IGNORECASE)
+    ]
+    risk_score = min(1.0, len(risk_findings) * 0.2)
 
-    # --- Verdict ---
     avg_positive = (completeness + clarity + correctness) / 3
     if risk_score >= 0.6 or avg_positive < 0.4:
         verdict = "block"
@@ -520,20 +585,361 @@ def review_artifact(path_or_diff: str) -> dict:
     }
 
     _emit("review_done", {
-        "artifact": path_or_diff,
-        "scores": scores,
-        "verdict": verdict,
+        "artifact": path_or_diff if is_file else "(diff)",
+        "scores": scores, "verdict": verdict, "risk_findings": risk_findings,
     })
 
     return {
         "ok": True,
-        "artifact": path_or_diff,
+        "artifact": path_or_diff if is_file else "(inline diff)",
+        "is_diff": is_diff,
+        "churn": {"added": len(added_lines), "removed": len(removed_lines)}
+        if is_diff else None,
         "scores": scores,
         "verdict": verdict,
+        "risk_findings": risk_findings,
         "notes": {
             "incomplete_markers": incomplete_markers,
             "avg_line_length": round(avg_len, 1),
             "graph_references_found": referenced,
-            "risk_keywords_found": risk_hits,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4. repo_health()  — FITUR UNIK
+# ---------------------------------------------------------------------------
+
+def repo_health() -> dict:
+    """
+    Laporan kesehatan repo:
+      - Coverage dokumentasi (% file punya edge DOCUMENTS)
+      - Dead code candidates (simbol tanpa incoming edge)
+      - High complexity symbols (complexity >= 10)
+      - Isolated nodes
+      - Hub nodes (node dengan koneksi terbanyak)
+      - Health score 0-100
+    """
+    global _graph
+    if len(_graph.nodes) == 0:
+        _graph = _rebuild_graph()
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    total_files = conn.execute(
+        "SELECT COUNT(*) FROM nodes WHERE type='file'"
+    ).fetchone()[0]
+
+    documented_file_ids = {
+        row["target_id"] for row in conn.execute(
+            "SELECT DISTINCT target_id FROM edges WHERE relationship='DOCUMENTS'"
+        ).fetchall()
+    }
+    doc_coverage = (
+        round(len(documented_file_ids) / total_files * 100, 1)
+        if total_files > 0 else 0.0
+    )
+
+    all_symbols = conn.execute(
+        "SELECT id, name, meta_json FROM nodes WHERE type='symbol'"
+    ).fetchall()
+    dead_candidates = []
+    for sym in all_symbols:
+        meta = json.loads(sym["meta_json"] or "{}")
+        if meta.get("kind") == "import":
+            continue
+        in_degree = _graph.in_degree(sym["id"]) if sym["id"] in _graph else 0
+        if in_degree == 0:
+            dead_candidates.append({
+                "id": sym["id"], "name": sym["name"],
+                "file": meta.get("file", ""), "kind": meta.get("kind", ""),
+                "line": meta.get("line", 0),
+            })
+
+    high_cx = []
+    for row in conn.execute(
+        "SELECT id, name, meta_json FROM nodes WHERE type='symbol'"
+    ).fetchall():
+        meta = json.loads(row["meta_json"] or "{}")
+        cx = meta.get("complexity", 0)
+        if cx >= 10:
+            high_cx.append({
+                "id": row["id"], "name": row["name"],
+                "complexity": cx, "file": meta.get("file", ""),
+                "line": meta.get("line", 0),
+            })
+    high_cx.sort(key=lambda x: x["complexity"], reverse=True)
+
+    isolated = [
+        {"id": n, "name": _graph.nodes[n].get("name", n),
+         "type": _graph.nodes[n].get("type", "")}
+        for n in nx.isolates(_graph)
+        if _graph.nodes[n].get("type") not in ("import",)
+    ]
+
+    hub_nodes = sorted(
+        [
+            {"id": n, "name": _graph.nodes[n].get("name", n),
+             "type": _graph.nodes[n].get("type", ""),
+             "degree": _graph.degree(n)}
+            for n in _graph.nodes
+        ],
+        key=lambda x: x["degree"], reverse=True
+    )[:5]
+
+    conn.close()
+
+    health_score = round(
+        (doc_coverage * 0.4)
+        + (max(0, 100 - len(dead_candidates) * 2) * 0.3)
+        + (max(0, 100 - len(high_cx) * 5) * 0.3),
+        1
+    )
+
+    summary = (
+        f"{'🟢 Sehat' if health_score >= 80 else '🟡 Perlu perhatian' if health_score >= 60 else '🔴 Butuh perbaikan'}"
+        f" — Skor {health_score}/100. Dokumentasi {doc_coverage}%, "
+        f"{len(dead_candidates)} kandidat dead code, {len(high_cx)} fungsi kompleks."
+    )
+
+    _emit("health_report", {
+        "health_score": health_score,
+        "doc_coverage_percent": doc_coverage,
+        "dead_code_count": len(dead_candidates),
+        "high_complexity_count": len(high_cx),
+    })
+
+    return {
+        "ok": True,
+        "health_score": health_score,
+        "summary": summary,
+        "doc_coverage_percent": doc_coverage,
+        "total_files": total_files,
+        "documented_files": len(documented_file_ids),
+        "dead_code_candidates": dead_candidates[:20],
+        "high_complexity_symbols": high_cx[:10],
+        "isolated_nodes_count": len(isolated),
+        "isolated_nodes": isolated[:10],
+        "hub_nodes": hub_nodes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. find_path()  — FITUR UNIK
+# ---------------------------------------------------------------------------
+
+def find_path(from_node_name: str, to_node_name: str) -> dict:
+    """
+    Cari jalur terpendek antara dua entitas di knowledge graph.
+    Menjawab: 'bagaimana A mempengaruhi B?'
+    """
+    global _graph
+    if len(_graph.nodes) == 0:
+        _graph = _rebuild_graph()
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    def _find_id(name: str):
+        row = conn.execute(
+            "SELECT id FROM nodes WHERE LOWER(name) LIKE ? LIMIT 1",
+            (f"%{name.lower()}%",)
+        ).fetchone()
+        return row["id"] if row else None
+
+    from_id = _find_id(from_node_name)
+    to_id = _find_id(to_node_name)
+    conn.close()
+
+    if not from_id:
+        return {"ok": False, "error": f"Node '{from_node_name}' tidak ditemukan"}
+    if not to_id:
+        return {"ok": False, "error": f"Node '{to_node_name}' tidak ditemukan"}
+
+    try:
+        path_ids = nx.shortest_path(_graph, source=from_id, target=to_id)
+        path_nodes = [
+            {"id": nid, "name": _graph.nodes[nid].get("name", nid),
+             "type": _graph.nodes[nid].get("type", "")}
+            for nid in path_ids
+        ]
+        edges_in_path = [
+            {
+                "from": _graph.nodes[path_ids[i]].get("name", path_ids[i]),
+                "to": _graph.nodes[path_ids[i + 1]].get("name", path_ids[i + 1]),
+                "relationship": (_graph.get_edge_data(
+                    path_ids[i], path_ids[i + 1]) or {}).get("relationship", "->"),
+            }
+            for i in range(len(path_ids) - 1)
+        ]
+        return {
+            "ok": True,
+            "from": from_node_name, "to": to_node_name,
+            "path_length": len(path_ids) - 1,
+            "path": path_nodes, "edges": edges_in_path,
         }
+    except nx.NetworkXNoPath:
+        return {"ok": False,
+                "error": f"Tidak ada jalur dari '{from_node_name}' ke '{to_node_name}'"}
+    except nx.NodeNotFound as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# 6. complexity_report()  — FITUR UNIK
+# ---------------------------------------------------------------------------
+
+def complexity_report(top_n: int = 10) -> dict:
+    """
+    Ranking N fungsi dengan complexity score tertinggi.
+    Berguna untuk menentukan prioritas refactor.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, name, meta_json FROM nodes WHERE type='symbol'"
+    ).fetchall()
+    conn.close()
+
+    results = []
+    for row in rows:
+        meta = json.loads(row["meta_json"] or "{}")
+        cx = meta.get("complexity", 0)
+        if meta.get("kind") in ("function", "class") and cx > 0:
+            results.append({
+                "id": row["id"], "name": row["name"],
+                "kind": meta.get("kind", ""),
+                "file": meta.get("file", ""),
+                "line": meta.get("line", 0),
+                "complexity": cx,
+                "lines": meta.get("lines", 0),
+                "risk_level": (
+                    "critical" if cx >= 15 else
+                    "high" if cx >= 10 else
+                    "medium" if cx >= 5 else "low"
+                ),
+            })
+
+    results.sort(key=lambda x: x["complexity"], reverse=True)
+
+    return {
+        "ok": True,
+        "top_n": top_n,
+        "results": results[:top_n],
+        "total_analyzed": len(results),
+        "critical_count": sum(1 for r in results if r["risk_level"] == "critical"),
+        "high_count": sum(1 for r in results if r["risk_level"] == "high"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. suggest_refactor()  — FITUR UNIK
+# ---------------------------------------------------------------------------
+
+def suggest_refactor(node_name: str) -> dict:
+    """
+    Saran refactor berbasis graph:
+      - Complexity terlalu tinggi → split function
+      - Degree terlalu banyak → God Object
+      - Lines terlalu panjang → split file
+      - Tidak ada dokumentasi → tambah docstring
+      - Tidak ada caller → dead code
+    """
+    global _graph
+    if len(_graph.nodes) == 0:
+        _graph = _rebuild_graph()
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT id, name, type, meta_json FROM nodes WHERE LOWER(name) LIKE ? LIMIT 1",
+        (f"%{node_name.lower()}%",)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return {"ok": False, "error": f"Node '{node_name}' tidak ditemukan"}
+
+    meta = json.loads(row["meta_json"] or "{}")
+    node_id = row["id"]
+    cx = meta.get("complexity", 1)
+    lines = meta.get("lines", 0)
+    degree = _graph.degree(node_id) if node_id in _graph else 0
+    in_deg = _graph.in_degree(node_id) if node_id in _graph else 0
+    out_deg = _graph.out_degree(node_id) if node_id in _graph else 0
+
+    has_doc = any(
+        (_graph.get_edge_data(pred, node_id) or {}).get("relationship") == "DOCUMENTS"
+        for pred in _graph.predecessors(node_id)
+    )
+
+    suggestions = []
+
+    if cx >= 15:
+        suggestions.append({
+            "type": "split_function", "priority": "critical",
+            "message": (
+                f"Complexity {cx} sangat tinggi. Pecah menjadi beberapa "
+                f"fungsi kecil (Single Responsibility Principle)."
+            ),
+        })
+    elif cx >= 10:
+        suggestions.append({
+            "type": "reduce_branches", "priority": "high",
+            "message": (
+                f"Complexity {cx} tinggi. Kurangi if/else/for bersarang. "
+                f"Gunakan early return atau guard clause."
+            ),
+        })
+
+    if lines >= 100:
+        suggestions.append({
+            "type": "split_file_or_function", "priority": "high",
+            "message": f"Fungsi ini {lines} baris — terlalu panjang. Idealnya < 50 baris.",
+        })
+
+    if degree >= 15:
+        suggestions.append({
+            "type": "god_object", "priority": "high",
+            "message": (
+                f"Node ini punya {degree} koneksi — kemungkinan 'God Object'. "
+                f"Pecah menjadi modul lebih kecil."
+            ),
+        })
+
+    if not has_doc:
+        suggestions.append({
+            "type": "add_documentation", "priority": "medium",
+            "message": "Tidak ada dokumentasi terhubung. Tambahkan docstring atau file .md.",
+        })
+
+    if in_deg == 0 and row["type"] == "symbol" and meta.get("kind") == "function":
+        suggestions.append({
+            "type": "dead_code", "priority": "medium",
+            "message": "Tidak ada caller di graph — kemungkinan dead code. Pertimbangkan dihapus.",
+        })
+
+    if not suggestions:
+        suggestions.append({
+            "type": "no_action", "priority": "low",
+            "message": "Entitas ini sehat — tidak ada saran refactor.",
+        })
+
+    _emit("refactor_suggestion", {
+        "node": row["name"],
+        "suggestion_count": len(suggestions),
+        "top_priority": suggestions[0]["priority"],
+    })
+
+    return {
+        "ok": True,
+        "node": row["name"],
+        "type": row["type"],
+        "metrics": {
+            "complexity": cx, "lines": lines,
+            "degree": degree, "in_degree": in_deg,
+            "out_degree": out_deg, "has_documentation": has_doc,
+        },
+        "suggestions": suggestions,
     }

@@ -1,15 +1,22 @@
 """
 main.py — Synapse MCP Server
-BE-2 Masrendra: Cortex endpoints + SSE stream
+BE-2 Masrendra: Cortex endpoints + SSE stream + fitur unik
 BE-1 DhikaSusheno: Guardian endpoints (propose_operation, execute_operation, approvals)
 
 Jalankan: uvicorn main:app --reload
+Docs    : http://localhost:8000/docs
+
+Fitur unik BE-2 (Masrendra):
+  GET  /repo_health          — skor kesehatan repo: dead code, coverage, complexity
+  GET  /complexity_report    — ranking fungsi paling kompleks
+  POST /find_path            — jalur terpendek antar dua entitas di graph
+  POST /suggest_refactor     — saran refactor berbasis graph connectivity
 """
 import asyncio
 import json
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -57,6 +64,15 @@ class ReviewArtifactRequest(BaseModel):
     path_or_diff: str
 
 
+class FindPathRequest(BaseModel):
+    from_node: str
+    to_node: str
+
+
+class SuggestRefactorRequest(BaseModel):
+    node_name: str
+
+
 # ---------------------------------------------------------------------------
 # CORTEX endpoints (BE-2 — Masrendra)
 # ---------------------------------------------------------------------------
@@ -97,6 +113,59 @@ def review_artifact(req: ReviewArtifactRequest):
     result = cortex.review_artifact(req.path_or_diff)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# FITUR UNIK BE-2 endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/repo_health", tags=["Cortex - Unik"])
+def repo_health():
+    """
+    📊 Laporan kesehatan repo berbasis graph.
+    - Health score 0-100
+    - Coverage dokumentasi (% file yang punya dokumentasi)
+    - Dead code candidates (simbol tanpa caller)
+    - Fungsi dengan complexity tinggi
+    - Hub nodes (entitas paling banyak terhubung)
+    - Isolated nodes (entitas tidak terhubung ke siapapun)
+    """
+    return cortex.repo_health()
+
+
+@app.get("/complexity_report", tags=["Cortex - Unik"])
+def complexity_report(top_n: int = Query(default=10, ge=1, le=50)):
+    """
+    📈 Ranking fungsi/kelas paling kompleks di repo.
+    Berguna untuk menentukan prioritas refactor.
+    Risk level: low | medium | high | critical
+    """
+    return cortex.complexity_report(top_n=top_n)
+
+
+@app.post("/find_path", tags=["Cortex - Unik"])
+def find_path(req: FindPathRequest):
+    """
+    🔍 Cari jalur terpendek antara dua entitas di knowledge graph.
+    Menjawab: "Bagaimana modul A mempengaruhi modul B?"
+    Contoh: from_node="main", to_node="database"
+    """
+    result = cortex.find_path(req.from_node, req.to_node)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error"))
+    return result
+
+
+@app.post("/suggest_refactor", tags=["Cortex - Unik"])
+def suggest_refactor(req: SuggestRefactorRequest):
+    """
+    🔧 Saran refactor berbasis graph untuk sebuah entitas.
+    Analisis: complexity, God Object, dead code, missing docs.
+    """
+    result = cortex.suggest_refactor(req.node_name)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error"))
     return result
 
 
