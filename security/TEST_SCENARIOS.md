@@ -82,11 +82,15 @@ Sumber kebenaran: [`SYNAPSE.md`](../SYNAPSE.md) section 2.5, 4.4, 4.5.
 
 ## Bug Findings Log
 
-> Diisi saat test dijalankan. Format: `[JAM] ID | Deskripsi | Status`
+> Checkpoint jam 30 — semua temuan sudah dilaporkan ke backend team via GitHub Issues.
 
-| Waktu | Skenario ID | Deskripsi Bug | Dilaporkan ke | Status |
-|---|---|---|---|---|
-| — | — | — | — | — |
+| Waktu | ID Bug | Skenario QC | Deskripsi | Issue | Severity | Status |
+|---|---|---|---|---|---|---|
+| Jam 30 | BUG-01 | A1 | `execute_operation` bypass approval via direct DB column manipulation — `requires_approval=0` di-inject langsung ke DB memungkinkan eksekusi tanpa approval | [#4](../issues/4) | 🔴 CRITICAL | Open |
+| Jam 30 | BUG-02 | RB2 | `_do_rollback` selalu restore ke `DB_PATH` hardcoded, bukan ke target DB asli dari params — rollback ke DB yang salah | [#5](../issues/5) | 🔴 HIGH | Open |
+| Jam 30 | BUG-03 | RB6 | Rollback `db.run_migration` restore seluruh file DB → operasi `verified` lain yang dibuat setelah snapshot ikut terhapus (historically impossible state, SYNAPSE.md 2.2) | [#6](../issues/6) | 🔴 HIGH | Open |
+| Jam 30 | BUG-04 | RB1 | `_make_snapshot` dipanggil saat `propose` (terlalu awal, bukan saat execute) — jika file DB belum ada, snapshot gagal diam-diam dan rollback protection hilang tanpa warning | [#7](../issues/7) | 🟡 MEDIUM | Open |
+| Jam 30 | BUG-05 | — | `main.py` duplicate class `ProposeOperationRequest` & `ApproveOperationRequest` — definisi kedua override pertama dengan skema berbeda, endpoint `/approve_operation` contract tidak konsisten | [#8](../issues/8) | 🟡 MEDIUM | Open |
 
 ---
 
