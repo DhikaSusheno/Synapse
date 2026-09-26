@@ -1,7 +1,7 @@
 // lib/types.ts
 // Kontrak data sesuai SYNAPSE.md section 4.2 dan backend/database.py
 
-export type NodeStatus = "idle" | "pending" | "approved" | "executing" | "verified" | "failed" | "rolled_back";
+export type NodeStatus = "idle" | "pending" | "approved" | "executing" | "verified" | "failed" | "rolled_back" | "denied";
 export type NodeType = "file" | "symbol" | "dependency" | "doc" | "operation";
 export type EdgeRelationship =
   | "DOCUMENTS"

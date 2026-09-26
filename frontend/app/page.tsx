@@ -1,13 +1,13 @@
 "use client";
 // app/page.tsx
 // Shell layout 3-kolom + routing 8 halaman sesuai DESIGN_SYSTEM.md
-// FE-1 @nabilfauzandafa Â· FE-2 @ShannWasHere
+// FE-1 @nabilfauzandafa · FE-2 @ShannWasHere
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import type { GraphNode, Operation } from "@/lib/types";
 import type { NavPage } from "@/components/LeftNav";
-import { stamp } from "@/lib/derive";
+import { mapPending, stamp } from "@/lib/derive";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -63,7 +63,7 @@ const MOCK_OPERATIONS: Operation[] = [
 
 // --- Hook: load operations from backend or mock ---
 function useOperations(): [Operation[], (id: string, d: "approved" | "denied") => void] {
-  const [ops, setOps] = useState<Operation[]>(MOCK_OPERATIONS);
+  const [ops, setOps] = useState<Operation[]>(USE_LIVE ? [] : MOCK_OPERATIONS);
 
   useEffect(() => {
     if (!USE_LIVE) return;
@@ -71,19 +71,8 @@ function useOperations(): [Operation[], (id: string, d: "approved" | "denied") =
       try {
         const res = await fetch(`${BACKEND_URL}/list_pending_approvals`, { cache: "no-store" });
         if (res.ok) {
-          const data = await res.json();
-          const pending: Operation[] = (data.pending ?? []).map((op: Record<string, unknown>) => ({
-            id: op.id as string,
-            tool_name: op.tool_name as string,
-            params_json: (op.params_json as string) ?? "{}",
-            target_node_id: (op.target_node_id as string) ?? null,
-            blast_radius: (op.blast_radius as Operation["blast_radius"]) ?? "unknown",
-            status: (op.status as GraphNode["status"]) ?? "pending",
-            requires_approval: (op.requires_approval as number) ?? 1,
-            conflicts: op.conflicts ? (op.conflicts as string[]) : undefined,
-            created_at: (op.created_at as string) ?? new Date().toISOString(),
-          }));
-          if (pending.length > 0) setOps(pending);
+          const data = (await res.json()) as { pending?: unknown };
+          setOps(mapPending(data.pending ?? []));
         }
       } catch { /* backend not ready */ }
     }
@@ -94,7 +83,7 @@ function useOperations(): [Operation[], (id: string, d: "approved" | "denied") =
 
   const handleDecided = useCallback((opId: string, decision: "approved" | "denied") => {
     setOps((prev) =>
-      prev.map((op) => op.id === opId ? { ...op, status: decision === "approved" ? "approved" : "failed" } : op)
+      prev.map((op) => op.id === opId ? { ...op, status: decision === "approved" ? "approved" : "denied" } : op)
     );
   }, []);
 
@@ -130,17 +119,19 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ operation_id: op.id, decision }),
       }).catch(() => null);
-      if (!r?.ok) { setLocalStatus(decision === "approved" ? "approved" : "failed"); onDecided?.(op.id, decision); return; }
-      setLocalStatus(decision === "approved" ? "approved" : "failed");
+      const ad = (await r?.json().catch(() => null)) as { status?: string; detail?: string } | null;
+      if (!r?.ok) { setErrorMsg(ad?.detail ?? "Approve ditolak backend."); return; }
+      setLocalStatus((ad?.status as Operation["status"]) ?? (decision === "approved" ? "approved" : "denied"));
       if (decision === "approved") {
         setLocalStatus("executing");
         const er = await fetch(`${BACKEND_URL}/execute_operation`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ operation_id: op.id }),
         }).catch(() => null);
-        const ed = await er?.json().catch(() => null);
-        setLocalStatus((ed?.status ?? "verified") as Operation["status"]);
-        if (!ed?.ok) setErrorMsg(ed?.error ?? "Execute failed.");
+        const ed = (await er?.json().catch(() => null)) as { status?: string; error?: string; detail?: string; ok?: boolean } | null;
+        if (!er?.ok) { setLocalStatus("failed"); setErrorMsg(ed?.detail ?? "Execute gagal."); return; }
+        setLocalStatus((ed?.status as Operation["status"]) ?? "verified");
+        if (ed?.ok === false) { setLocalStatus("failed"); setErrorMsg(ed.error ?? "Execute gagal."); }
       }
       onDecided?.(op.id, decision);
     } finally { setLoading(false); }
@@ -161,7 +152,7 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
         </div>
       </div>
       <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-        <span className="text-slate-500">ID</span><span className="text-slate-400 font-mono truncate">{op.id.slice(0, 16)}â€¦</span>
+        <span className="text-slate-500">ID</span><span className="text-slate-400 font-mono truncate">{op.id.slice(0, 16)}…</span>
         <span className="text-slate-500">Time</span><span className="text-slate-400">{stamp(op.created_at)}</span>
       </div>
       {op.conflicts && op.conflicts.length > 0 && (
@@ -172,8 +163,8 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
       {errorMsg && <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-3 py-2">{errorMsg}</div>}
       {!isDone ? (
         <div className="flex gap-2">
-          <button onClick={() => decide("approved")} disabled={loading} className="flex-1 py-2 rounded-lg bg-green-600 hover:bg-green-500 text-white text-xs font-bold disabled:opacity-50 transition-colors">{loading ? "â€¦" : "Approve"}</button>
-          <button onClick={() => decide("denied")}   disabled={loading} className="flex-1 py-2 rounded-lg bg-red-700/80 hover:bg-red-600 text-white text-xs font-bold disabled:opacity-50 transition-colors">{loading ? "â€¦" : "Deny"}</button>
+          <button onClick={() => decide("approved")} disabled={loading} className="flex-1 py-2 rounded-lg bg-green-600 hover:bg-green-500 text-white text-xs font-bold disabled:opacity-50 transition-colors">{loading ? "…" : "Approve"}</button>
+          <button onClick={() => decide("denied")}   disabled={loading} className="flex-1 py-2 rounded-lg bg-red-700/80 hover:bg-red-600 text-white text-xs font-bold disabled:opacity-50 transition-colors">{loading ? "…" : "Deny"}</button>
         </div>
       ) : (
         <div className={`text-xs text-center py-2 rounded-lg font-semibold ${
@@ -227,8 +218,10 @@ function OperationsPage() {
     try {
       const url = statusFilter === "all" ? `${BACKEND_URL}/operations?limit=50` : `${BACKEND_URL}/operations?status=${statusFilter}&limit=50`;
       const res = await fetch(url, { cache: "no-store" });
-      if (res.ok) setOps(Array.isArray(await res.json() as unknown) ? await res.clone().json() : []);
-      else setError("Backend tidak dapat dijangkau");
+      if (res.ok) {
+        const data = (await res.json()) as unknown;
+        setOps(Array.isArray(data) ? (data as BackendOp[]) : []);
+      } else setError("Backend tidak dapat dijangkau");
     } catch { setError("Backend offline"); }
   }, [statusFilter]);
 
@@ -326,7 +319,7 @@ export default function HomePage() {
         {activePage === "security"   && <SecurityPage />}
         {activePage === "settings"   && <SettingsPage />}
 
-        {/* GuardianPanel kanan â€” hanya overview + guardian */}
+        {/* GuardianPanel kanan — hanya overview + guardian */}
         {!hideRightPanel && (
           <GuardianPanel pendingOps={ops} onOpDecided={handleOpDecided} />
         )}

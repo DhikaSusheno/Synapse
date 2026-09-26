@@ -47,16 +47,17 @@ function PendingApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id
         body: JSON.stringify({ operation_id: op.id, decision }),
       }).catch(() => null);
 
+      const approveData = (await approveRes?.json().catch(() => null)) as
+        { status?: string; new_status?: string; detail?: string } | null;
+
       if (!approveRes || !approveRes.ok) {
-        setLocalStatus(decision === "approved" ? "approved" : "failed");
-        onDecided?.(op.id, decision);
+        setErrorMsg(approveData?.detail ?? "Approve ditolak backend.");
         return;
       }
 
-      const approveData = await approveRes.json().catch(() => null);
       setLocalStatus(
         ((approveData?.status ?? approveData?.new_status) as GraphNode["status"]) ??
-        (decision === "approved" ? "approved" : "failed")
+        (decision === "approved" ? "approved" : "denied")
       );
 
       if (decision === "approved") {
@@ -161,14 +162,15 @@ function PendingApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id
   );
 }
 
-const CORTEX_INSIGHTS = [
-  { text: "Found 7 modules, 12 cross-dependencies", ok: true },
-  { text: "Guardian protects 3 critical files", ok: true },
-  { text: "Potential refactor in graph.py (complexity: high)", ok: true },
-  { text: "2 files have unused imports", ok: true },
-];
-
-function CortexInsightPanel() {
+function CortexInsightPanel({ pendingOps }: { pendingOps: Operation[] }) {
+  const highRisk = pendingOps.filter((op) => op.blast_radius === "high").length;
+  const conflicts = pendingOps.filter((op) => (op.conflicts?.length ?? 0) > 0).length;
+  const insights = [
+    `${pendingOps.length} operasi menunggu approval`,
+    `${highRisk} berisiko high blast radius`,
+    `${conflicts} operasi konflik dengan operasi lain`,
+    "Guardian fail-closed: verifikasi gagal = rollback",
+  ];
   return (
     <div className="rounded-xl border border-slate-700/60 bg-slate-800/40 p-3.5 space-y-2.5">
       {/* Header */}
@@ -183,10 +185,10 @@ function CortexInsightPanel() {
       <div className="text-xs font-medium text-slate-300">Codebase Understanding</div>
 
       <div className="space-y-1.5">
-        {CORTEX_INSIGHTS.map((item, i) => (
-          <div key={i} className="flex items-start gap-2 text-xs">
+        {insights.map((text) => (
+          <div key={text} className="flex items-start gap-2 text-xs">
             <span className="text-green-400 mt-0.5 shrink-0">&#9679;</span>
-            <span className="text-slate-300">{item.text}</span>
+            <span className="text-slate-300">{text}</span>
           </div>
         ))}
       </div>
@@ -238,7 +240,7 @@ export default function GuardianPanel({ pendingOps, onOpDecided }: Props) {
         )}
 
         {/* Cortex insight */}
-        <CortexInsightPanel />
+        <CortexInsightPanel pendingOps={pendingOps} />
       </div>
     </aside>
   );

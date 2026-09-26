@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  bucketActivity, buildFileTree, conflictCandidates, isOpen,
+  bucketActivity, buildFileTree, conflictCandidates, isOpen, mapPending,
   opSummary, parseTs, pct, relativeTime, rollbackStats, securityOverview,
   type LiveOp,
 } from "./derive.ts";
@@ -143,4 +143,28 @@ test("buildFileTree memecah path Windows (backslash)", () => {
     "  dir:tests",
     "    file:conftest.py",
   ]);
+});
+
+// FE-2: pending kosong harus jadi list kosong, bukan data lama/mock yang nyangkut.
+test("mapPending mengembalikan [] saat backend tidak punya pending", () => {
+  assert.deepEqual(mapPending([]), []);
+  assert.deepEqual(mapPending(undefined), []);
+  assert.deepEqual(mapPending("bukan array"), []);
+});
+
+test("mapPending memetakan field backend dan fallback aman", () => {
+  const [first] = mapPending([{ id: "op::1", tool_name: "db.run_migration", blast_radius: "high" }]);
+  assert.equal(first.id, "op::1");
+  assert.equal(first.params_json, "{}");
+  assert.equal(first.target_node_id, null);
+  assert.equal(first.status, "pending");
+  assert.equal(first.requires_approval, 1);
+  assert.equal(first.conflicts, undefined);
+  assert.ok(first.created_at);
+});
+
+test("mapPending mempertahankan status denied (bukan jadi failed)", () => {
+  const [op] = mapPending([{ id: "op::2", tool_name: "fs.write", status: "denied", conflicts: ["op::1"] }]);
+  assert.equal(op.status, "denied");
+  assert.deepEqual(op.conflicts, ["op::1"]);
 });

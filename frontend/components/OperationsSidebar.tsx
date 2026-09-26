@@ -7,6 +7,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { GraphNode, Operation } from "@/lib/types";
+import { mapPending } from "@/lib/derive";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
@@ -57,6 +58,7 @@ function StatusBadge({ status }: { status: GraphNode["status"] }) {
     verified: "bg-green-900 text-green-300",
     failed: "bg-red-900 text-red-300",
     rolled_back: "bg-red-900 text-red-300",
+    denied: "bg-slate-700 text-slate-300",
     idle: "bg-slate-700 text-slate-400",
   };
   return <span className={`text-xs px-2 py-0.5 rounded-full font-mono ${styles[status] ?? styles.idle}`}>{status}</span>;
@@ -78,17 +80,17 @@ function OperationCard({ op }: { op: Operation }) {
         body: JSON.stringify({ operation_id: op.id, decision }),
       }).catch(() => null);
 
-      const approveData = approveRes?.ok ? await approveRes.json().catch(() => null) : null;
+      const approveData = (await approveRes?.json().catch(() => null)) as
+        { status?: string; new_status?: string; detail?: string } | null;
 
       if (!approveRes || !approveRes.ok) {
-        await new Promise((r) => setTimeout(r, 600));
-        setLocalStatus(decision === "approved" ? "approved" : "failed");
+        setErrorMsg(approveData?.detail ?? "Approve ditolak backend.");
         return;
       }
 
       setLocalStatus(
         ((approveData?.status ?? approveData?.new_status) as GraphNode["status"]) ??
-        (decision === "approved" ? "approved" : "failed")
+        (decision === "approved" ? "approved" : "denied")
       );
 
       if (decision === "approved") {
@@ -306,7 +308,7 @@ function EventLogPanel({ log }: { log: EventLogEntry[] }) {
 
 // --- Hook: fetch operasi dari backend, fallback ke mock ---
 function useOperations() {
-  const [ops, setOps] = useState<Operation[]>(MOCK_OPERATIONS);
+  const [ops, setOps] = useState<Operation[]>(process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true" ? [] : MOCK_OPERATIONS);
 
   useEffect(() => {
     const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -315,21 +317,8 @@ function useOperations() {
       try {
         const res = await fetch(`${BACKEND_URL}/list_pending_approvals`, { cache: "no-store" });
         if (res.ok) {
-          const data = await res.json();
-          const pending: Operation[] = (data.pending ?? []).map(
-            (op: Record<string, unknown>) => ({
-              id: op.id as string,
-              tool_name: op.tool_name as string,
-              params_json: (op.params_json as string) ?? "{}",
-              target_node_id: (op.target_node_id as string) ?? null,
-              blast_radius: (op.blast_radius as Operation["blast_radius"]) ?? "unknown",
-              status: (op.status as GraphNode["status"]) ?? "pending",
-              requires_approval: (op.requires_approval as number) ?? 1,
-              conflicts: op.conflicts ? (op.conflicts as string[]) : undefined,
-              created_at: (op.created_at as string) ?? new Date().toISOString(),
-            })
-          );
-          if (pending.length > 0) setOps(pending);
+          const data = (await res.json()) as { pending?: unknown };
+          setOps(mapPending(data.pending ?? []));
         }
       } catch { /* backend belum siap */ }
     }

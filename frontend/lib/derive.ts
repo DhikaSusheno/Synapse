@@ -2,7 +2,7 @@
 // Derivasi data live backend -> UI. Semua pure, tidak fetch.
 // FE-1 @nabilfauzandafa
 
-import type { NodeStatus } from "./types";
+import type { NodeStatus, Operation } from "./types";
 
 export interface LiveOp {
   id: string;
@@ -205,4 +205,23 @@ export function opSummary(op: LiveOp): string {
     if (p.sql) return p.sql;
   } catch { /* params bukan JSON */ }
   return op.target_node_id ?? op.tool_name;
+}
+
+// FE-2: payload /list_pending_approvals -> Operation[] untuk kartu approval.
+export function mapPending(raw: unknown): Operation[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item) => {
+    const o = (item ?? {}) as Record<string, unknown>;
+    return {
+      id: (o.id as string) ?? "",
+      tool_name: (o.tool_name as string) ?? "unknown",
+      params_json: (o.params_json as string) ?? "{}",
+      target_node_id: (o.target_node_id as string) ?? null,
+      blast_radius: (o.blast_radius as Operation["blast_radius"]) ?? "unknown",
+      status: (o.status as NodeStatus) ?? "pending",
+      requires_approval: (o.requires_approval as number) ?? 1,
+      conflicts: Array.isArray(o.conflicts) ? (o.conflicts as string[]) : undefined,
+      created_at: (o.created_at as string) ?? new Date().toISOString(),
+    };
+  });
 }
