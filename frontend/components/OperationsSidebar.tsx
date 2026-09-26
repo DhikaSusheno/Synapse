@@ -1,16 +1,16 @@
 "use client";
 
 // components/OperationsSidebar.tsx
-// FE-2 placeholder — approve/deny controls + penjelasan operasi
+// FE-2 placeholder - approve/deny controls + penjelasan operasi
 // Owner FE-2: @ShannWasHere (wiring ke API asli)
 // Owner FE-1: @nabilfauzandafa (state yang diterima dari graph / SSE)
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { GraphNode, Operation } from "@/lib/types";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
-// ─── Data mock operasi (ganti dengan fetch ke GET /operations saat live) ─────
+// Data mock operasi (fallback saat backend offline)
 const MOCK_OPERATIONS: Operation[] = [
   {
     id: "op::migrate-001",
@@ -22,13 +22,24 @@ const MOCK_OPERATIONS: Operation[] = [
     requires_approval: 1,
     created_at: new Date().toISOString(),
   },
+  {
+    id: "op::migrate-002",
+    tool_name: "db.run_migration (conflict)",
+    params_json: JSON.stringify({ migration: "drop_column_users_legacy" }),
+    target_node_id: "file::backend/database.py",
+    blast_radius: "high",
+    status: "pending",
+    requires_approval: 1,
+    conflicts: ["op::migrate-001"],
+    created_at: new Date().toISOString(),
+  },
 ];
 
 interface Props {
   selectedNode: GraphNode | null;
 }
 
-// ─── Badge warna blast radius ─────────────────────────────────────────────
+// ─── Badge warna blast radius ────────────────────────────────────────────────
 function BlastBadge({ level }: { level: Operation["blast_radius"] }) {
   const styles: Record<string, string> = {
     high:    "bg-red-900 text-red-300",
@@ -43,7 +54,7 @@ function BlastBadge({ level }: { level: Operation["blast_radius"] }) {
   );
 }
 
-// ─── Badge status ─────────────────────────────────────────────────────────
+// ─── Badge status ─────────────────────────────────────────────────────────────
 function StatusBadge({ status }: { status: GraphNode["status"] }) {
   const styles: Record<string, string> = {
     pending:     "bg-yellow-900 text-yellow-300",
@@ -61,7 +72,7 @@ function StatusBadge({ status }: { status: GraphNode["status"] }) {
   );
 }
 
-// ─── Kartu operasi tunggal ────────────────────────────────────────────────
+// ─── Kartu operasi tunggal ────────────────────────────────────────────────────
 function OperationCard({ op }: { op: Operation }) {
   const [loading, setLoading] = useState(false);
   const [localStatus, setLocalStatus] = useState(op.status);
@@ -69,14 +80,25 @@ function OperationCard({ op }: { op: Operation }) {
   async function decide(decision: "approved" | "denied") {
     setLoading(true);
     try {
-      // TODO FE-2: ganti dengan endpoint asli saat backend selesai
-      // await fetch(`${BACKEND_URL}/approve_operation`, {
-      //   method: "POST",
-      //   headers: { "Content-Type": "application/json" },
-      //   body: JSON.stringify({ operation_id: op.id, decision }),
-      // });
-      await new Promise((r) => setTimeout(r, 600)); // simulasi
-      setLocalStatus(decision === "approved" ? "approved" : "failed");
+      // Coba ke backend asli; fallback ke simulasi jika gagal
+      const res = await fetch(`${BACKEND_URL}/approve_operation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ operation_id: op.id, decision }),
+      }).catch(() => null);
+
+      if (res && res.ok) {
+        const data = await res.json().catch(() => null);
+        if (data?.status) {
+          setLocalStatus(data.status);
+        } else {
+          setLocalStatus(decision === "approved" ? "approved" : "failed");
+        }
+      } else {
+        // Backend offline → simulasi lokal
+        await new Promise((r) => setTimeout(r, 600));
+        setLocalStatus(decision === "approved" ? "approved" : "failed");
+      }
     } finally {
       setLoading(false);
     }
@@ -102,6 +124,13 @@ function OperationCard({ op }: { op: Operation }) {
         <BlastBadge level={op.blast_radius} />
       </div>
 
+      {op.conflicts && op.conflicts.length > 0 && (
+        <div className="text-xs text-red-400 flex items-center gap-1">
+          <span>⚡</span>
+          <span>Konflik dengan: {op.conflicts.join(", ")}</span>
+        </div>
+      )}
+
       {Object.keys(params).length > 0 && (
         <div className="text-xs text-slate-400 font-mono bg-slate-900 rounded p-1.5 break-all">
           {JSON.stringify(params, null, 2)}
@@ -121,14 +150,14 @@ function OperationCard({ op }: { op: Operation }) {
             disabled={loading}
             className="flex-1 text-xs py-1.5 rounded bg-green-700 hover:bg-green-600 text-white font-semibold disabled:opacity-50 transition-colors"
           >
-            {loading ? "…" : "✓ Approve"}
+            {loading ? "…" : "✅ Approve"}
           </button>
           <button
             onClick={() => decide("denied")}
             disabled={loading}
             className="flex-1 text-xs py-1.5 rounded bg-red-800 hover:bg-red-700 text-white font-semibold disabled:opacity-50 transition-colors"
           >
-            {loading ? "…" : "✗ Deny"}
+            {loading ? "…" : "❌ Deny"}
           </button>
         </div>
       )}
@@ -136,7 +165,7 @@ function OperationCard({ op }: { op: Operation }) {
   );
 }
 
-// ─── Panel info node yang diklik di graph ────────────────────────────────
+// ─── Panel info node yang diklik di graph ─────────────────────────────────────
 function NodeInfoPanel({ node }: { node: GraphNode }) {
   return (
     <div className="border border-slate-700 rounded-lg p-3 space-y-1 bg-slate-800/50">
@@ -159,16 +188,47 @@ function NodeInfoPanel({ node }: { node: GraphNode }) {
   );
 }
 
-// ─── Sidebar utama ────────────────────────────────────────────────────────
+// ─── Hook: fetch operasi dari backend, fallback ke mock ───────────────────────
+function useOperations() {
+  const [ops, setOps] = useState<Operation[]>(MOCK_OPERATIONS);
+
+  useEffect(() => {
+    const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
+    if (!USE_LIVE) return;
+
+    async function load() {
+      try {
+        const res = await fetch(`${BACKEND_URL}/operations?status=pending`, {
+          cache: "no-store",
+        });
+        if (res.ok) {
+          const data: Operation[] = await res.json();
+          if (data.length > 0) setOps(data);
+        }
+      } catch {
+        // backend belum siap — tetap pakai mock
+      }
+    }
+
+    load();
+    const interval = setInterval(load, 5000); // polling tiap 5 detik
+    return () => clearInterval(interval);
+  }, []);
+
+  return ops;
+}
+
+// ─── Sidebar utama ────────────────────────────────────────────────────────────
 export default function OperationsSidebar({ selectedNode }: Props) {
   const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
+  const ops = useOperations();
 
   return (
     <aside className="w-72 shrink-0 border-l border-slate-700 flex flex-col overflow-hidden bg-slate-900">
       <div className="px-4 py-3 border-b border-slate-700">
         <h2 className="text-sm font-semibold text-slate-200">Operations</h2>
         <p className="text-xs text-slate-500 mt-0.5">
-          {USE_LIVE ? "Live — dari backend" : "Mock — data simulasi"}
+          {USE_LIVE ? "🟢 Live — dari backend" : "🟡 Mock — data simulasi"}
         </p>
       </div>
 
@@ -180,9 +240,11 @@ export default function OperationsSidebar({ selectedNode }: Props) {
         <div className="text-xs text-slate-400 uppercase tracking-wide px-0.5">
           Pending approvals
         </div>
-        {MOCK_OPERATIONS.map((op) => (
-          <OperationCard key={op.id} op={op} />
-        ))}
+        {ops.length === 0 ? (
+          <p className="text-xs text-slate-500 px-0.5">Tidak ada operasi pending.</p>
+        ) : (
+          ops.map((op) => <OperationCard key={op.id} op={op} />)
+        )}
       </div>
 
       {/* Footer hint */}

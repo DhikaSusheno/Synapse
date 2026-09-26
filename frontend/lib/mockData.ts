@@ -37,6 +37,13 @@ export const MOCK_NODES: GraphNode[] = [
     status: "pending",
     meta: { blast_radius: "high", requires_approval: true },
   },
+  {
+    id: "op::migrate-002",
+    name: "db.run_migration (conflict)",
+    type: "operation",
+    status: "idle",
+    meta: { blast_radius: "high", requires_approval: true, conflicts: ["op::migrate-001"] },
+  },
 ];
 
 export const MOCK_LINKS: GraphLink[] = [
@@ -61,13 +68,26 @@ export const MOCK_LINKS: GraphLink[] = [
   { source: "file::backend/cortex.py",   target: "dep::tree-sitter", relationship: "REFERENCES" },
 
   // Operasi menarget file
-  { source: "op::migrate-001",                    target: "file::backend/database.py",   relationship: "TARGETS" },
+  { source: "op::migrate-001",                    target: "file::backend/database.py",      relationship: "TARGETS" },
+  { source: "op::migrate-002",                    target: "file::backend/database.py",      relationship: "TARGETS" },
+  { source: "op::migrate-002",                    target: "op::migrate-001",                relationship: "CONFLICTS_WITH" },
   { source: "symbol::main.py::understand_repo",   target: "symbol::cortex.py::repo_health", relationship: "REFERENCES" },
 ];
 
 // Urutan perubahan status untuk simulasi demo (dipakai oleh useMockSimulation)
+// Skenario: migrate-001 sukses, migrate-002 conflict → failed → rolled_back → pulih
 export const MOCK_TIMELINE: Array<{ delayMs: number; nodeId: string; status: GraphNode["status"] }> = [
+  // Skenario 1: operasi normal
   { delayMs: 2000,  nodeId: "op::migrate-001", status: "approved"  },
   { delayMs: 4000,  nodeId: "op::migrate-001", status: "executing" },
   { delayMs: 7000,  nodeId: "op::migrate-001", status: "verified"  },
+
+  // Skenario 2: operasi dengan konflik → failed → rolled_back
+  { delayMs: 9000,  nodeId: "op::migrate-002", status: "pending"   },
+  { delayMs: 11000, nodeId: "op::migrate-002", status: "approved"  },
+  { delayMs: 13000, nodeId: "op::migrate-002", status: "executing" },
+  { delayMs: 15000, nodeId: "op::migrate-002", status: "failed"    },
+  { delayMs: 16500, nodeId: "op::migrate-002", status: "rolled_back" },
+  // Auto-pulih ke verified setelah rollback selesai (merah berkedip → hijau)
+  { delayMs: 20000, nodeId: "op::migrate-002", status: "verified"  },
 ];

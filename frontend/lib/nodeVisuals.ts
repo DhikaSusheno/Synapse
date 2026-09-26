@@ -16,11 +16,11 @@ const TYPE_COLOR: Record<NodeType, string> = {
 // Warna per STATUS (khusus operation node)
 const STATUS_COLOR: Record<NodeStatus, string> = {
   idle:        "#f8fafc",
-  pending:     "#fbbf24", // kuning — pulse
-  approved:    "#38bdf8", // biru muda — menunggu eksekusi
-  executing:   "#fb923c", // oranye — sedang jalan
-  verified:    "#22c55e", // hijau — sukses
-  failed:      "#ef4444", // merah — gagal
+  pending:     "#fbbf24", // kuning - pulse
+  approved:    "#38bdf8", // biru muda - menunggu eksekusi
+  executing:   "#fb923c", // oranye - sedang jalan
+  verified:    "#22c55e", // hijau - sukses
+  failed:      "#ef4444", // merah - gagal
   rolled_back: "#ef4444", // merah (akan pulse lalu hijau di animasi)
 };
 
@@ -51,7 +51,7 @@ export function getNodeLabel(node: GraphNode): string {
     executing:   " ⚡",
     verified:    " ✅",
     failed:      " ❌",
-    rolled_back: " 🔄",
+    rolled_back: " 🔁",
   };
   return `${node.name}${statusBadge[node.status] ?? ""}`;
 }
@@ -68,4 +68,12 @@ export function getLinkColor(relationship: string): string {
     ROLLED_BACK_BY:  "#f97316",
   };
   return map[relationship] ?? "#334155";
+}
+
+// Hex color → rgba helper untuk glow effect di canvas
+export function hexToRgba(hex: string, alpha: number): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
 }

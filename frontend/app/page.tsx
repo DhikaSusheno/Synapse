@@ -1,7 +1,7 @@
 "use client";
 
 // app/page.tsx
-// Halaman utama Synapse — graph + sidebar
+// Halaman utama Synapse - graph + sidebar
 // FE-1 @nabilfauzandafa
 
 import { useState } from "react";
@@ -31,7 +31,7 @@ export default function HomePage() {
       {/* Header */}
       <header className="flex items-center gap-3 px-5 py-3 border-b border-slate-800 bg-slate-900 shrink-0">
         <span className="text-lg font-bold tracking-tight">
-          ⚡ Synapse
+          🧠 Synapse
         </span>
         <span className="text-xs text-slate-400 hidden sm:block">
           Reversible · Conflict-aware · AI agent guardrail
@@ -43,7 +43,7 @@ export default function HomePage() {
 
       {/* Body: graph + sidebar */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Graph area — mengisi sisa ruang */}
+        {/* Graph area - mengisi sisa ruang */}
         <main className="flex-1 overflow-hidden relative">
           <SynapseGraph onNodeClick={setSelectedNode} />
         </main>
