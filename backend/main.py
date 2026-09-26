@@ -107,6 +107,22 @@ class ApproveOperationRequest(BaseModel):
     note: str = ""
 
 
+class ProposeOperationRequest(BaseModel):
+    tool_name: str
+    params: dict = {}
+    target: str
+
+
+class ExecuteOperationRequest(BaseModel):
+    operation_id: str
+
+
+class ApproveOperationRequest(BaseModel):
+    operation_id: str
+    decision: str  # 'approved' | 'denied'
+    note: str = ""
+
+
 # ---------------------------------------------------------------------------
 # CORTEX endpoints — BE-2 Masrendra
 # ---------------------------------------------------------------------------
