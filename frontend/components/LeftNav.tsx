@@ -6,7 +6,7 @@
 
 import { useState } from "react";
 
-export type NavPage = "overview" | "code-graph" | "guardian" | "cortex" | "approvals" | "operations" | "security" | "settings";
+export type NavPage = "overview" | "code-graph" | "guardian" | "cortex" | "approvals" | "operations" | "security" | "settings" | "agents";
 
 interface Props {
   activePage: NavPage;
@@ -23,6 +23,7 @@ const NAV_ITEMS: { id: NavPage; icon: string; label: string }[] = [
   { id: "operations",  icon: "&#9881;",  label: "Operations" },
   { id: "security",    icon: "&#128737;", label: "Security" },
   { id: "settings",    icon: "&#9881;",  label: "Settings" },
+  { id: "agents",      icon: "&#9827;",  label: "Agents" },
 ];
 
 // Icon per nav item
@@ -36,6 +37,7 @@ function NavIcon({ id }: { id: NavPage }) {
     case "operations": return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9881;</span>;
     case "security":   return <span className="w-4 h-4 flex items-center justify-center text-xs">&#128737;</span>;
     case "settings":   return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9881;</span>;
+    case "agents":     return <span className="w-4 h-4 flex items-center justify-center text-xs">&#9827;</span>;
     default:           return null;
   }
 }
