@@ -1,6 +1,10 @@
 // hooks/useSSE.ts
 // Konsumsi SSE stream dari backend /stream.
 // Diaktifkan saat backend sudah live - gantikan useMockSimulation.
+//
+// Mitigation BUG-08: cortex._emit() not thread-safe (issue #11)
+// Frontend reconnect dengan exponential backoff agar SSE bisa recover
+// otomatis jika stream mati saat approve/execute diklik di demo.
 
 import { useEffect, useRef, useCallback } from "react";
 import type { SSEEvent, GraphNode } from "@/lib/types";
@@ -16,7 +20,6 @@ interface BackendNode {
   complexity?: number;
 }
 
-// Konversi node format backend → format GraphNode frontend
 function mapBackendNode(n: BackendNode): GraphNode {
   return {
     id: n.id,
@@ -39,6 +42,11 @@ interface UseSSEOptions {
   enabled: boolean;
 }
 
+// Exponential backoff: 1s, 2s, 4s, 8s, capped at 10s
+function nextDelay(attempt: number): number {
+  return Math.min(1000 * Math.pow(2, attempt), 10_000);
+}
+
 export function useSSE({
   onNodeUpdate,
   onGraphUpdate,
@@ -46,30 +54,35 @@ export function useSSE({
   enabled,
 }: UseSSEOptions) {
   const esRef = useRef<EventSource | null>(null);
+  const attemptRef = useRef(0);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mountedRef = useRef(true);
 
   const connect = useCallback(() => {
+    if (!mountedRef.current) return;
     if (esRef.current) {
       esRef.current.close();
+      esRef.current = null;
     }
 
     const es = new EventSource(`${BACKEND_URL}/stream`);
     esRef.current = es;
+
+    es.onopen = () => {
+      // Reset backoff counter on successful connection
+      attemptRef.current = 0;
+    };
 
     es.onmessage = (event) => {
       try {
         const parsed: SSEEvent = JSON.parse(event.data);
 
         switch (parsed.event) {
-          // Backend emit graph_update saat understand_repo selesai
           case "graph_update": {
             const rawNodes = (parsed.data.nodes as BackendNode[] | undefined) ?? [];
-            if (rawNodes.length > 0) {
-              onGraphUpdate(rawNodes.map(mapBackendNode));
-            }
+            if (rawNodes.length > 0) onGraphUpdate(rawNodes.map(mapBackendNode));
             break;
           }
-
-          // Progress ingest per-doc
           case "ingest_progress": {
             onIngestProgress?.({
               current_doc: (parsed.data.current_doc as string) ?? "",
@@ -77,8 +90,6 @@ export function useSSE({
             });
             break;
           }
-
-          // Status transition operasi — backend pakai operation_id UUID
           case "operation_proposed":
             onNodeUpdate(parsed.data.operation_id as string, "pending");
             break;
@@ -97,7 +108,6 @@ export function useSSE({
           case "operation_rolled_back":
             onNodeUpdate(parsed.data.operation_id as string, "rolled_back");
             break;
-
           case "heartbeat":
           case "connected":
           default:
@@ -109,15 +119,25 @@ export function useSSE({
     };
 
     es.onerror = () => {
-      // Auto-reconnect setelah 3 detik jika koneksi putus
       es.close();
-      setTimeout(connect, 3000);
+      esRef.current = null;
+      if (!mountedRef.current) return;
+      // Exponential backoff reconnect (mitigasi BUG-08)
+      const delay = nextDelay(attemptRef.current);
+      attemptRef.current += 1;
+      timerRef.current = setTimeout(connect, delay);
     };
   }, [onNodeUpdate, onGraphUpdate, onIngestProgress]);
 
   useEffect(() => {
+    mountedRef.current = true;
     if (!enabled) return;
     connect();
-    return () => esRef.current?.close();
+    return () => {
+      mountedRef.current = false;
+      esRef.current?.close();
+      esRef.current = null;
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
   }, [enabled, connect]);
 }
