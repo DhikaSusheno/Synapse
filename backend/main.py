@@ -69,6 +69,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     init_db()
+    # guardian.py langsung import _emit dari cortex — tidak perlu set_emit()
     print("[Synapse] Server ready. Visit http://localhost:8000/docs")
 
 
