@@ -2,6 +2,7 @@
 
 // components/SynapseGraph.tsx
 // FE-1 @nabilfauzandafa - Force-directed live graph
+// FE-2 @ShannWasHere - encoding fix (garbled emoji -> text labels)
 //
 // Mode mock : useMockSimulation aktif, useSSE nonaktif
 // Mode live : set env NEXT_PUBLIC_USE_LIVE_SSE=true
@@ -19,7 +20,7 @@ const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), {
   ssr: false,
   loading: () => (
     <div className="flex items-center justify-center h-full text-slate-400">
-      Loading graph engine…
+      Loading graph engine...
     </div>
   ),
 });
@@ -42,7 +43,7 @@ interface Props {
   onNodeCount?: (nodes: number, links: number) => void;
 }
 
-// ─── Canvas pulse/blink renderer ────────────────────────────────────────────
+// --- Canvas pulse/blink renderer ---
 function drawNode(
   node: RawNode,
   ctx: CanvasRenderingContext2D,
@@ -117,7 +118,7 @@ function drawNode(
   ctx.fillText(node.name, x, y + r + 2 / globalScale);
 }
 
-// ─── Hook animasi waktu ─────────────────────────────────────────────────
+// --- Hook animasi waktu ---
 function useAnimationTime(): number {
   const [t, setT] = useState(0);
   const rafRef = useRef<number>(0);
@@ -137,7 +138,7 @@ function useAnimationTime(): number {
   return t;
 }
 
-// ─── Hook: load initial graph dari backend ───────────────────────────────────
+// --- Hook: load initial graph dari backend ---
 function useInitialGraph(
   setNodes: React.Dispatch<React.SetStateAction<GraphNode[]>>,
   setLinks: React.Dispatch<React.SetStateAction<GraphLink[]>>,
@@ -170,14 +171,30 @@ function useInitialGraph(
           );
         }
       } catch {
-        // backend offline — tetap pakai mock
+        // backend offline - tetap pakai mock
       }
     }
     load();
   }, [enabled, setNodes, setLinks]);
 }
 
-// ─── Komponen utama ──────────────────────────────────────────────────────────
+// Legend entries: [color, label]
+const NODE_LEGEND: [string, string][] = [
+  ["#60a5fa", "File"],
+  ["#a78bfa", "Symbol"],
+  ["#64748b", "Dependency"],
+  ["#34d399", "Doc"],
+];
+
+const OP_LEGEND: [string, string][] = [
+  ["#fbbf24", "Pending (pulse)"],
+  ["#38bdf8", "Approved"],
+  ["#fb923c", "Executing..."],
+  ["#22c55e", "Verified"],
+  ["#ef4444", "Failed / Rolled back"],
+];
+
+// --- Komponen utama ---
 export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
   const [nodes, setNodes] = useState<GraphNode[]>(USE_LIVE ? [] : MOCK_NODES);
   const [links, setLinks] = useState<GraphLink[]>(USE_LIVE ? [] : MOCK_LINKS);
@@ -257,29 +274,14 @@ export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
       {/* Legend */}
       <div className="absolute top-3 left-3 z-10 flex flex-col gap-1 bg-slate-900/80 backdrop-blur rounded-lg px-3 py-2 text-xs">
         <span className="text-slate-400 font-semibold mb-1">Node</span>
-        {(
-          [
-            ["#60a5fa", "File"],
-            ["#a78bfa", "Symbol"],
-            ["#64748b", "Dependency"],
-            ["#34d399", "Doc"],
-          ] as [string, string][]
-        ).map(([color, label]) => (
+        {NODE_LEGEND.map(([color, label]) => (
           <span key={label} className="flex items-center gap-1.5">
             <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: color }} />
             {label}
           </span>
         ))}
         <span className="text-slate-400 font-semibold mt-2 mb-1">Operation</span>
-        {(
-          [
-            ["#fbbf24", "Pending ⏳ (pulse)"],
-            ["#38bdf8", "Approved"],
-            ["#fb923c", "Executing ⚡"],
-            ["#22c55e", "Verified ✅"],
-            ["#ef4444", "Failed / Rolled back 🔁"],
-          ] as [string, string][]
-        ).map(([color, label]) => (
+        {OP_LEGEND.map(([color, label]) => (
           <span key={label} className="flex items-center gap-1.5">
             <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: color }} />
             {label}
@@ -299,14 +301,14 @@ export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
             USE_LIVE ? "bg-green-900 text-green-300" : "bg-yellow-900 text-yellow-300"
           }`}
         >
-          {USE_LIVE ? "🟢 LIVE" : "🟡 MOCK"}
+          {USE_LIVE ? "LIVE" : "MOCK"}
         </span>
       </div>
 
       {/* Ingest progress overlay */}
       {ingestProgress && (
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 bg-slate-800/90 backdrop-blur rounded-lg px-4 py-2 text-xs text-slate-300 flex items-center gap-2 shadow-lg">
-          <span className="inline-block animate-spin">⧗</span>
+          <span className="inline-block animate-spin">&#9696;</span>
           <span>
             Ingesting{" "}
             <span className="text-slate-100 font-mono">{ingestProgress.current_doc}</span>
@@ -323,7 +325,7 @@ export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
       {/* Empty state saat live mode dan graph kosong */}
       {USE_LIVE && nodes.length === 0 && !ingestProgress && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-slate-500 pointer-events-none">
-          <span className="text-3xl">🧠</span>
+          <span className="text-3xl">&#x1F4CA;</span>
           <span className="text-sm">
             Graph kosong.{" "}
             <code className="bg-slate-800 px-1 rounded text-slate-400">
