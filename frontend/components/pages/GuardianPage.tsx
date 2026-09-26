@@ -5,6 +5,7 @@
 
 import { useEffect, useState } from "react";
 import type { Operation } from "@/lib/types";
+import { stamp } from "@/lib/derive";
 import RiskBadge from "@/components/shared/RiskBadge";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
@@ -106,7 +107,7 @@ function PendingOpDetail({ op, onDecided }: PendingOpDetailProps) {
         </div>
 
         <div className="grid grid-cols-4 gap-2 text-xs">
-          {[ ["Agent", "Cortex Agent"], ["Target", op.target_node_id ?? "db"], ["Blast Radius", op.blast_radius], ["Time", new Date(op.created_at).toLocaleString()] ]
+          {[ ["Agent", "Cortex Agent"], ["Target", op.target_node_id ?? "db"], ["Blast Radius", op.blast_radius], ["Time", stamp(op.created_at)] ]
             .map(([k, v]) => (
               <div key={k}>
                 <div className="text-slate-500">{k}</div>

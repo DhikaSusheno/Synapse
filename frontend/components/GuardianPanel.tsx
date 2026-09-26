@@ -6,6 +6,7 @@
 
 import { useState } from "react";
 import type { Operation, GraphNode } from "@/lib/types";
+import { stamp } from "@/lib/derive";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
@@ -117,7 +118,7 @@ function PendingApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id
           {op.blast_radius === "high" ? "8.7 / 10" : op.blast_radius === "medium" ? "5.0 / 10" : "2.1 / 10"}
         </span>
         <span className="text-slate-500">Time</span>
-        <span className="text-slate-300">{new Date(op.created_at).toLocaleString()}</span>
+        <span className="text-slate-300">{stamp(op.created_at)}</span>
       </div>
 
       {op.conflicts && op.conflicts.length > 0 && (

@@ -9,7 +9,7 @@
 import { useEffect, useState } from "react";
 import { useLiveOps } from "@/hooks/useLiveOps";
 import {
-  bucketActivity, conflictCandidates, isOpen, opSummary, pct, relativeTime,
+  bucketActivity, clock, conflictCandidates, isOpen, opSummary, pct, relativeTime,
   type ConflictCandidate, type LiveOp,
 } from "@/lib/derive";
 import type { SSELogEntry } from "@/lib/types";
@@ -197,7 +197,7 @@ export default function AgentsPage() {
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-medium text-blue-400">Guardian</span>
                       <span className="text-[10px] text-slate-500 font-mono">
-                        {new Date(op.created_at).toLocaleTimeString("id", { hour: "2-digit", minute: "2-digit" })}
+                        {clock(op.created_at)}
                       </span>
                     </div>
                     <div className="text-xs text-slate-300 truncate">{opSummary(op)}</div>

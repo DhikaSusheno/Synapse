@@ -23,6 +23,30 @@ export function isOpen(status: string): boolean {
   return OPEN.includes(status);
 }
 
+// Backend tulis timestamp sebagai UTC naive (datetime.utcnow().isoformat(), tanpa "Z"),
+// jadi new Date() akan baca itu sebagai waktu lokal dan geser selisih zona waktu.
+// ponytail: append "Z" kalau string tidak punya offset. Kalau backend nanti pindah ke
+// datetime.now(datetime.UTC), helper ini jadi no-op.
+export function parseTs(iso: string | null | undefined): number {
+  if (!iso) return NaN;
+  const hasOffset = /(?:Z|[+-]\d{2}:?\d{2})$/.test(iso);
+  return new Date(hasOffset ? iso : `${iso}Z`).getTime();
+}
+
+// Jam HH:MM lokal dari timestamp backend.
+export function clock(iso: string | null | undefined): string {
+  const t = parseTs(iso);
+  if (Number.isNaN(t)) return "-";
+  return new Date(t).toLocaleTimeString("id", { hour: "2-digit", minute: "2-digit" });
+}
+
+// Tanggal + jam lengkap, untuk detail view.
+export function stamp(iso: string | null | undefined): string {
+  const t = parseTs(iso);
+  if (Number.isNaN(t)) return "-";
+  return new Date(t).toLocaleString();
+}
+
 export function pct(part: number, total: number): number {
   return total === 0 ? 0 : Math.round((part / total) * 100);
 }
@@ -55,7 +79,7 @@ export function bucketActivity(
     count: 0,
   }));
   for (const op of ops) {
-    const t = new Date(op.created_at).getTime();
+    const t = parseTs(op.created_at);
     if (Number.isNaN(t)) continue;
     const idx = Math.floor((t - (now - spanMs)) / size);
     if (idx >= buckets) out[buckets - 1].count += 1;   // event tepat "sekarang" → bucket terakhir
@@ -97,7 +121,7 @@ export function rollbackStats(ops: readonly LiveOp[]): RollbackStats {
     .slice(0, 5)
     .map((op) => ({
       opId: op.id,
-      timestamp: new Date(op.executed_at ?? op.created_at).toLocaleTimeString("id", { hour: "2-digit", minute: "2-digit" }),
+      timestamp: clock(op.executed_at ?? op.created_at),
       success: op.status === "verified",
     }));
   return {
@@ -146,7 +170,8 @@ export function buildFileTree(nodes: readonly { id: string; name: string; type: 
   const sorted = [...nodes].sort((a, b) => a.name.localeCompare(b.name));
   for (const node of sorted) {
     const raw = node.name.includes("::") ? node.name.split("::").pop()! : node.name;
-    const parts = raw.split("/").filter(Boolean);
+    // Backend di Windows menyimpan path dengan backslash, di Linux dengan forward slash.
+    const parts = raw.split(/[\\/]/).filter(Boolean);
     let prefix = "";
     parts.forEach((part, i) => {
       prefix = prefix ? `${prefix}/${part}` : part;
@@ -163,7 +188,7 @@ export function buildFileTree(nodes: readonly { id: string; name: string; type: 
 }
 
 export function relativeTime(iso: string): string {
-  const t = new Date(iso).getTime();
+  const t = parseTs(iso);
   if (Number.isNaN(t)) return "-";
   const diff = Math.max(0, Date.now() - t);
   const min = Math.floor(diff / 60000);

@@ -11,7 +11,7 @@
 import { useEffect, useState } from "react";
 import { useLiveOps } from "@/hooks/useLiveOps";
 import {
-  conflictCandidates, pct, rollbackStats, securityOverview,
+  clock, conflictCandidates, pct, rollbackStats, securityOverview,
   type ConflictCandidate, type LiveOp, type RollbackStats, type SecurityOverview,
 } from "@/lib/derive";
 
@@ -82,7 +82,7 @@ function opEvents(ops: readonly LiveOp[]): SecurityEvent[] {
     .filter((op) => op.status === "rolled_back" || op.status === "failed" || op.status === "verified" || op.status === "denied")
     .slice(0, 20)
     .map((op) => ({
-      timestamp: new Date(op.created_at).toLocaleTimeString("id", { hour: "2-digit", minute: "2-digit" }),
+      timestamp: clock(op.created_at),
       event: `operation_${op.status}`,
       detail: `${op.id.slice(0, 12)} ${op.tool_name}`.trim(),
       severity: SEVERITY_BY_EVENT[`operation_${op.status}`] ?? "info",

@@ -1,12 +1,13 @@
 "use client";
 // app/page.tsx
 // Shell layout 3-kolom + routing 8 halaman sesuai DESIGN_SYSTEM.md
-// FE-1 @nabilfauzandafa · FE-2 @ShannWasHere
+// FE-1 @nabilfauzandafa Â· FE-2 @ShannWasHere
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import type { GraphNode, Operation } from "@/lib/types";
 import type { NavPage } from "@/components/LeftNav";
+import { stamp } from "@/lib/derive";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -160,8 +161,8 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
         </div>
       </div>
       <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-        <span className="text-slate-500">ID</span><span className="text-slate-400 font-mono truncate">{op.id.slice(0, 16)}…</span>
-        <span className="text-slate-500">Time</span><span className="text-slate-400">{new Date(op.created_at).toLocaleString()}</span>
+        <span className="text-slate-500">ID</span><span className="text-slate-400 font-mono truncate">{op.id.slice(0, 16)}â€¦</span>
+        <span className="text-slate-500">Time</span><span className="text-slate-400">{stamp(op.created_at)}</span>
       </div>
       {op.conflicts && op.conflicts.length > 0 && (
         <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-3 py-2 flex items-center gap-1.5">
@@ -171,8 +172,8 @@ function ApprovalCard({ op, onDecided }: { op: Operation; onDecided?: (id: strin
       {errorMsg && <div className="text-xs text-red-400 bg-red-900/20 rounded-lg px-3 py-2">{errorMsg}</div>}
       {!isDone ? (
         <div className="flex gap-2">
-          <button onClick={() => decide("approved")} disabled={loading} className="flex-1 py-2 rounded-lg bg-green-600 hover:bg-green-500 text-white text-xs font-bold disabled:opacity-50 transition-colors">{loading ? "…" : "Approve"}</button>
-          <button onClick={() => decide("denied")}   disabled={loading} className="flex-1 py-2 rounded-lg bg-red-700/80 hover:bg-red-600 text-white text-xs font-bold disabled:opacity-50 transition-colors">{loading ? "…" : "Deny"}</button>
+          <button onClick={() => decide("approved")} disabled={loading} className="flex-1 py-2 rounded-lg bg-green-600 hover:bg-green-500 text-white text-xs font-bold disabled:opacity-50 transition-colors">{loading ? "â€¦" : "Approve"}</button>
+          <button onClick={() => decide("denied")}   disabled={loading} className="flex-1 py-2 rounded-lg bg-red-700/80 hover:bg-red-600 text-white text-xs font-bold disabled:opacity-50 transition-colors">{loading ? "â€¦" : "Deny"}</button>
         </div>
       ) : (
         <div className={`text-xs text-center py-2 rounded-lg font-semibold ${
@@ -269,7 +270,7 @@ function OperationsPage() {
                   <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border w-fit ${BLAST_BADGE[op.blast_radius] ?? BLAST_BADGE.unknown}`}>{op.blast_radius.toUpperCase()}</span>
                   <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border w-fit ${STATUS_BADGE[op.status] ?? STATUS_BADGE.idle}`}>{op.status}</span>
                   <span className="text-[10px] text-slate-400">{op.requires_approval ? "Required" : "Auto"}</span>
-                  <span className="text-[10px] text-slate-500 font-mono">{new Date(op.created_at).toLocaleString()}</span>
+                  <span className="text-[10px] text-slate-500 font-mono">{stamp(op.created_at)}</span>
                 </div>
               );
             })}
@@ -325,7 +326,7 @@ export default function HomePage() {
         {activePage === "security"   && <SecurityPage />}
         {activePage === "settings"   && <SettingsPage />}
 
-        {/* GuardianPanel kanan — hanya overview + guardian */}
+        {/* GuardianPanel kanan â€” hanya overview + guardian */}
         {!hideRightPanel && (
           <GuardianPanel pendingOps={ops} onOpDecided={handleOpDecided} />
         )}

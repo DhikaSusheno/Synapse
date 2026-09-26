@@ -195,7 +195,7 @@ function NodeInfoPanel({ node }: { node: GraphNode }) {
       .catch(() => null)
       .finally(() => { if (!cancelled) setExplainLoading(false); });
     return () => { cancelled = true; };
-  }, [node.id, USE_LIVE]);
+  }, [node.id, node.name, USE_LIVE]);
 
   return (
     <div className="border border-slate-700 rounded-lg p-3 space-y-2 bg-slate-800/50">

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   bucketActivity, buildFileTree, conflictCandidates, isOpen,
-  opSummary, pct, relativeTime, rollbackStats, securityOverview,
+  opSummary, parseTs, pct, relativeTime, rollbackStats, securityOverview,
   type LiveOp,
 } from "./derive.ts";
 
@@ -106,4 +106,41 @@ test("opSummary ambil sql, fallback target", () => {
 test("relativeTime menangani input rusak", () => {
   assert.equal(relativeTime("bukan-tanggal"), "-");
   assert.match(relativeTime(new Date().toISOString()), /just now/);
+});
+
+// BUG-2: backend tulis UTC naive (tanpa "Z"), new Date() baca sebagai waktu lokal.
+test("parseTs baca timestamp UTC naive sebagai UTC", () => {
+  const naive = new Date().toISOString().slice(0, 19);           // "2026-09-26T15:50:00"
+  assert.equal(parseTs(naive), parseTs(`${naive}Z`));
+  assert.equal(parseTs("2026-09-26T15:50:00Z"), Date.parse("2026-09-26T15:50:00Z"));
+  assert.equal(parseTs("2026-09-26T15:50:00+07:00"), Date.parse("2026-09-26T15:50:00+07:00"));
+  assert.ok(Number.isNaN(parseTs("bukan-tanggal")));
+  assert.ok(Number.isNaN(parseTs(null)));
+});
+
+test("bucketActivity menghitung op dengan timestamp UTC naive", () => {
+  // Sebelum fix: op ini jatuh 7 jam di luar window 5 jam -> semua bucket 0.
+  const naive = new Date(Date.now() - 60_000).toISOString().slice(0, 19);
+  const b = bucketActivity([op({ created_at: naive })], 10, 5 * 60 * 60 * 1000);
+  assert.equal(b[b.length - 1].count, 1);
+});
+
+test("relativeTime tidak geser untuk timestamp UTC naive", () => {
+  const naive = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString().slice(0, 19);
+  assert.equal(relativeTime(naive), "3 h ago");
+});
+
+// BUG-1: backend di Windows menyimpan path dengan backslash.
+test("buildFileTree memecah path Windows (backslash)", () => {
+  const t = buildFileTree([
+    { id: "1", name: "backend\\main.py", type: "file" },
+    { id: "2", name: "security\\tests\\conftest.py", type: "file" },
+  ]);
+  assert.deepEqual(t.map((n) => `${"  ".repeat(n.depth)}${n.type}:${n.name}`), [
+    "dir:backend",
+    "  file:main.py",
+    "dir:security",
+    "  dir:tests",
+    "    file:conftest.py",
+  ]);
 });
