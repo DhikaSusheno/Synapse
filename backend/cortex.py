@@ -722,9 +722,15 @@ def repo_health() -> dict:
         1
     )
 
+    # Python 3.11 compat: tidak boleh backslash di dalam f-string expression
+    if health_score >= 80:
+        health_label = "\U0001f7e2 Sehat"
+    elif health_score >= 60:
+        health_label = "\U0001f7e1 Perlu perhatian"
+    else:
+        health_label = "\U0001f534 Butuh perbaikan"
     summary = (
-        f"{'\U0001f7e2 Sehat' if health_score >= 80 else '\U0001f7e1 Perlu perhatian' if health_score >= 60 else '\U0001f534 Butuh perbaikan'}"
-        f" \u2014 Skor {health_score}/100. Dokumentasi {doc_coverage}%, "
+        f"{health_label} \u2014 Skor {health_score}/100. Dokumentasi {doc_coverage}%, "
         f"{len(dead_candidates)} kandidat dead code, {len(high_cx)} fungsi kompleks."
     )
 
