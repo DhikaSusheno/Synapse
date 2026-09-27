@@ -71,10 +71,10 @@ curl -X POST http://localhost:8000/understand_repo \
 | POST | `/understand_repo` | Code Graph (trigger ingest) |
 | POST | `/explain_topic` | Code Graph (klik node), Cortex |
 | POST | `/review_artifact` | Cortex |
-| GET | `/repo_health` | Overview, Agents, Security |
-| GET | `/complexity_report` | Cortex |
-| POST | `/find_path` | Cortex |
-| POST | `/suggest_refactor` | Cortex |
+| GET | `/repo_health` | Cortex (Repo Health card) |
+| GET | `/complexity_report` | Cortex (Complexity Ranking card) |
+| POST | `/find_path` | Cortex (Find Path card) |
+| POST | `/suggest_refactor` | Cortex (Refactor Suggestions card) |
 | GET | `/operations` | Operations, Approvals, Agents, Guardian, GuardianPanel, Security |
 | POST | `/approve_operation` | Guardian, Approvals, GuardianPanel (via `decideOperation`) |
 | POST | `/execute_operation` | Guardian, Approvals, GuardianPanel (via `decideOperation`) |
