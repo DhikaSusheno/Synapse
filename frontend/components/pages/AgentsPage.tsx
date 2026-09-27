@@ -105,8 +105,8 @@ export default function AgentsPage() {
 
   const agentTasks: Record<string, number> = {
     guardian: openOps.length,
-    cortex:   summary?.nodes_by_type.symbol ?? 0,
-    review:   summary?.nodes_by_type.file ?? 0,
+    cortex:   summary?.nodes_by_type?.symbol ?? 0,
+    review:   summary?.nodes_by_type?.file ?? 0,
   };
 
   return (
