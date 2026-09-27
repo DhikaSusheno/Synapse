@@ -2,8 +2,12 @@
 // hooks/useBackendStatus.ts
 // Deteksi ketersediaan backend di runtime dan sediakan status live/mock
 // untuk menghindari kebingungan "kenapa fitur ga jalan?" saat pertama kali jalan.
+//
+// SATU poller, BANYAK subscriber. Dulu banner dan TopNavbar masing-masing poll
+// /health sehingga bisa tampil bersamaan "Live Connection" (hijau) dan
+// "OFFLINE" (merah). Sekarang keduanya baca state yang sama dari modul ini.
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState } from "react";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -16,48 +20,69 @@ export interface BackendStatus {
   error?: string;
 }
 
-export function useBackendStatus(): BackendStatus {
-  const [status, setStatus] = useState<BackendStatus>({
-    mode: USE_LIVE ? "checking" : "mock",
-    isLive: false,
-  });
+const listeners = new Set<(s: BackendStatus) => void>();
+let current: BackendStatus = { mode: USE_LIVE ? "checking" : "mock", isLive: false };
+let poller: ReturnType<typeof setInterval> | null = null;
 
-  const checkBackend = useCallback(async () => {
-    if (!USE_LIVE) {
-      setStatus({ mode: "mock", isLive: false });
-      return;
-    }
-    setStatus((prev) => ({ ...prev, mode: "checking" }));
-    try {
-      const res = await fetch(`${BACKEND_URL}/health`, {
-        method: "GET",
-        cache: "no-store",
-        signal: AbortSignal.timeout(3000),
-      });
-      if (res.ok) {
-        setStatus({ mode: "live", isLive: true });
-      } else {
-        setStatus({
-          mode: "offline",
-          isLive: false,
-          error: `Backend responded ${res.status}`,
-        });
-      }
-    } catch (e) {
-      setStatus({
+function emit() {
+  // ponytail: forEach, bukan for..of — tsconfig target-nya di bawah ES2015 dan
+  // iterasi Set butuh downlevelIteration.
+  listeners.forEach((l) => l(current));
+}
+
+async function checkBackend() {
+  if (!USE_LIVE) {
+    current = { mode: "mock", isLive: false };
+    emit();
+    return;
+  }
+  current = { ...current, mode: "checking" };
+  emit();
+  try {
+    const res = await fetch(`${BACKEND_URL}/health`, {
+      method: "GET",
+      cache: "no-store",
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      current = { mode: "live", isLive: true };
+    } else {
+      current = {
         mode: "offline",
         isLive: false,
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
+        error: `Backend responded ${res.status}`,
+      };
     }
-  }, []);
+  } catch (e) {
+    current = {
+      mode: "offline",
+      isLive: false,
+      error: e instanceof Error ? e.message : "Unknown error",
+    };
+  }
+  emit();
+}
+
+export function useBackendStatus(): BackendStatus {
+  const [status, setStatus] = useState<BackendStatus>(current);
 
   useEffect(() => {
-    checkBackend();
-    // Re-check every 30s to catch backend coming online
-    const interval = setInterval(checkBackend, 30_000);
-    return () => clearInterval(interval);
-  }, [checkBackend]);
+    listeners.add(setStatus);
+    setStatus(current);
+    if (poller === null) {
+      checkBackend();
+      poller = setInterval(checkBackend, 30_000);
+    }
+    return () => {
+      listeners.delete(setStatus);
+      // ponytail: satu timer modul untuk semua consumer. Kalau consumer terakhir
+      // hilang, timer ikut mati; poll berikutnya terjadi saat mount lagi.
+      if (listeners.size === 0 && poller !== null) {
+        clearInterval(poller);
+        poller = null;
+      }
+    };
+  }, []);
 
   return status;
 }

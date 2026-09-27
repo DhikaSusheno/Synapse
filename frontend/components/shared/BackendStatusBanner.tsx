@@ -6,10 +6,10 @@
 import { useBackendStatus, BackendStatus } from "@/hooks/useBackendStatus";
 
 const ICONS = {
-  live: "&#9679;",
-  mock: "&#9888;",
-  checking: "&#8987;",
-  offline: "&#10060;",
+  live: "●",
+  mock: "▲",
+  checking: "◌",
+  offline: "✕",
 };
 
 const COLORS = {
@@ -20,17 +20,17 @@ const COLORS = {
 };
 
 const LABELS = {
-  live: "LIVE",
-  mock: "MOCK MODE",
-  checking: "CHECKING...",
+  live: "LIVE DATA",
+  mock: "DEMO DATA",
+  checking: "CHECKING",
   offline: "OFFLINE",
 };
 
 const MESSAGES = {
   live: "Connected to backend — real data active",
-  mock: "Running in MOCK mode — set NEXT_PUBLIC_USE_LIVE_SSE=true to enable live backend",
-  checking: "Checking backend availability...",
-  offline: "Backend unreachable — check if backend is running on NEXT_PUBLIC_BACKEND_URL",
+  mock: "Sample operations, not real runs — start the backend and set NEXT_PUBLIC_USE_LIVE_SSE=true for live data",
+  checking: "Checking backend availability…",
+  offline: "Backend unreachable — check NEXT_PUBLIC_BACKEND_URL",
 };
 
 export default function BackendStatusBanner() {
@@ -41,37 +41,31 @@ export default function BackendStatusBanner() {
 
   return (
     <div
-      className={`fixed top-0 left-0 right-0 z-50 px-4 py-2.5 ${COLORS[status.mode]} border-b border-solid`}
+      className={`shrink-0 px-4 py-2.5 ${COLORS[status.mode]} border-b border-solid`}
       role="status"
       aria-live="polite"
     >
       <div className="max-w-7xl mx-auto flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2.5 min-w-0">
           <span
-            className={`w-5 h-5 rounded-full flex items-center justify-center text-xs ${
+            aria-hidden="true"
+            className={`text-sm leading-none shrink-0 ${
               status.mode === "checking" ? "animate-pulse" : ""
             }`}
-            dangerouslySetInnerHTML={{ __html: ICONS[status.mode] }}
-          />
-          <span className="text-xs font-semibold uppercase tracking-wide">
+          >
+            {ICONS[status.mode]}
+          </span>
+          <span className="text-xs font-semibold uppercase tracking-wide shrink-0">
             {LABELS[status.mode]}
           </span>
-          <span className="text-xs text-slate-300/80">{MESSAGES[status.mode]}</span>
+          <span className="text-xs text-slate-300/80 truncate">{MESSAGES[status.mode]}</span>
         </div>
-        {status.mode === "mock" && (
+        {(status.mode === "mock" || status.mode === "offline") && (
           <button
             onClick={() => window.location.reload()}
-            className="text-xs px-3 py-1.5 bg-slate-900/50 border border-slate-700/50 rounded-lg hover:bg-slate-800/50 transition-colors whitespace-nowrap"
+            className="text-xs px-3 py-1.5 bg-slate-900/50 border border-slate-700/50 rounded-lg hover:bg-slate-800/50 transition-colors whitespace-nowrap shrink-0"
           >
-            Reload after fixing .env.local
-          </button>
-        )}
-        {status.mode === "offline" && (
-          <button
-            onClick={() => window.location.reload()}
-            className="text-xs px-3 py-1.5 bg-slate-900/50 border border-slate-700/50 rounded-lg hover:bg-slate-800/50 transition-colors whitespace-nowrap"
-          >
-            Retry
+            {status.mode === "mock" ? "Reload after fixing .env.local" : "Retry"}
           </button>
         )}
       </div>

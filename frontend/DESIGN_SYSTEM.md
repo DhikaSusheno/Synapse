@@ -3,6 +3,7 @@
 > Dokumen ini adalah **source of truth** untuk semua tim frontend (FE-1, FE-2) dan backend.
 > Berdasarkan `Dashboard Synapsenya.png` yang ditetapkan sebagai desain final.
 > Diupdate oleh: @nabilfauzandafa (FE-1)
+> Scope & bug ledger: [`PRD.md`](./PRD.md)
 
 ---
 
@@ -17,12 +18,15 @@
 | `text-primary` | `white` | Heading |
 | `text-secondary` | `slate-400` | Subtitle / label |
 | `text-muted` | `slate-500/600` | Placeholder, meta |
-| `accent-blue` | `#3b82f6` | Guardian agent, active nav |
+| `accent-blue` | `#3b82f6` | Guardian agent, active nav, CTA |
 | `accent-purple` | `#a855f7` | Cortex agent |
 | `accent-green` | `#22c55e` | Success, verified, healthy |
-| `accent-yellow` | `#fbbf24` | Pending, warning |
+| `accent-yellow` | `#fbbf24` | Pending, warning, demo data |
 | `accent-red` | `#ef4444` | High risk, failed, conflict |
 | `accent-orange` | `#fb923c` | Executing |
+
+> **Canvas graph wajib `#080d14`.** Dulu `#0f172a` (slate-900) —creates a seam
+> karena `#0d1117` panel di atasnya. Sama dengan `bg-app`.
 
 ---
 
@@ -30,6 +34,8 @@
 
 ```
 ┌─────────────────────────────────────────────────────┐
+│  BackendStatusBanner (dalam flow, bukan fixed)      │
+├─────────────────────────────────────────────────────┤
 │  TopNavbar (h-12, bg-panel, border-b)               │
 ├──────────┬──────────────────────────┬───────────────┤
 │ LeftNav  │  <Page Content>          │ GuardianPanel │
@@ -40,9 +46,62 @@
 └──────────┴──────────────────────────┴───────────────┘
 ```
 
-**TopNavbar props:** `isLive`, `nodeCount`, `edgeCount`  
-**LeftNav props:** `activePage`, `onNavigate`, `pendingApprovals`  
+`<body>` punya `h-screen overflow-hidden`, `layout.tsx` membungkus children dalam
+flex column `min-h-0 flex-1`, dan root setiap halaman memakai **`h-full`** —
+bukan `h-screen`. Kalau halaman memakai `h-screen`, total tinggi melebihi viewport
+setelah banner ditambahkan.
+
+> **Jangan pakai `position: fixed` untuk bar di `top-0`.** Itu menutupi
+> `TopNavbar` dan logo `LeftNav` (bug B-01). Banner harus anak flex column.
+
+**TopNavbar props:** `nodeCount`, `edgeCount`, `onOpenSettings`
+**LeftNav props:** `activePage`, `onNavigate`, `pendingApprovals`
 **GuardianPanel props:** `pendingOps`, `onOpDecided`
+
+### Aturan global
+
+- `color-scheme: dark` wajib ada di `globals.css`. Tanpa itu `<select>`,
+  scrollbar, dan input popup browser membuka dengan latar terang.
+- `:focus-visible` sudah didefinisikan global (ring biru 2px). Jangan dihapus.
+- `--font-inter` berasal dari `next/font/local` lewat `inter.variable` pada
+  `<html>`. **Jangan** deklarasikan ulang di `:root` — itu menimpa nama family
+  hasil hash dan diam-diam jatuh ke system-ui (bug B-04).
+- Ikon navigasi: SVG garis 24×24, `stroke="currentColor"`, `strokeWidth={1.7}`.
+  Tidak ada emoji sebagai ikon — warna emoji ikut sistem operasi sehingga tidak
+  konsisten dengan UI yang monochrome.
+- Entitas HTML (`&#183;`) hanya bisa dipakai di **teks JSX**. Di dalam string
+  literal JS akan tampil apa adanya (bug B-16). Gunakan karakter aslinya.
+
+---
+
+## Route 0 — Landing / Explainer (`/landing`)
+
+Server component. Tanpa state, tanpa fetch, tanpa `"use client"`.
+Tujuan: juri memahami masalah dan solusi tanpa perlu penjelasan pemateri.
+
+| Section | Isi | Syarat |
+|---|---|---|
+| Nav | Logo, anchor `#problem` `#how` `#agents` `#demo`, CTA `Open Live Demo` | Sticky, CTA ke `/` |
+| Hero | Nama hackathon, 1 headline, 1 paragraf value, 2 CTA, 4 stat faktual | Headline menyebut masalah, bukan fitur |
+| Problem | 3 kartu (review kalah cepat, tidak ada pemahaman bersama, sulit rollback) | Framing masalah |
+| How it works | 4 langkah `01–04`: Understand → Propose → Guard → Verify | Sebut blast radius, conflict, rollback |
+| Properties | 4 kartu: Reversible, Conflict-aware, Fail-closed, Human in the loop | Semua harus benar-benar ada di backend |
+| Agents | 3 kartu: Guardian, Cortex, Review | Tidak tumpang tindih |
+| Demo path | 3 langkah bernomor, tiap langkah menyebut halaman tujuan | Jalur yang bisa didemokan manual |
+| Stack | 8 chip teknologi | Hanya yang ada di `package.json` |
+| Footer | Satu kalimat produk + link ke demo | — |
+
+**Token visual:** `bg-app #080d14`, `bg-panel #0d1117`, `border slate-800/60`,
+aksen tunggal `#3b82f6`, `rounded-xl` untuk kartu, `rounded-lg` untuk kontrol,
+`max-w-6xl` + `px-6`.
+
+**Aturan konten:** faktual saja, tidak boleh ada angka traction/performa yang
+dikarang, tidak boleh ada slug generik, dan setiap langkah demo harus menyebut
+halaman tujuan.
+
+**Landing page memakai shell sendiri** — tanpa `TopNavbar`/`LeftNav`, tanpa
+graph. Itu disengaja: halaman ini harus bisa dibaca tanpa login dan tanpa
+backend hidup.
 
 ---
 
@@ -69,11 +128,17 @@
 ### Left Area — Code Graph Canvas
 - `SynapseGraph` fullscreen dengan header panel:
   - Title: "Code Graph" + subtitle "Hybrid AST + semantic understanding"
-  - Search bar: `Search files, symbols, docs...`
-  - Filter pills: `All | File | Symbol | Dependency | Doc`
+  - Search bar: `Search files, symbols, docs...` — **benar-benar menyaring**
+    (`lib/graphFilter.ts`), cocok ke `name` dan `id`, case-insensitive
+  - Filter pills: `All | File | Symbol | Dependency | Doc` — menyaring node
+    berdasarkan tipe. Node bertipe `operation` **selalu ikut**, apa pun filter,
+    supaya status Approved/executing tidak hilang saat user mengetik
   - Zoom controls (+/−/reset)
   - Edge Relationships legend (calls, uses, defines, documents, depends on)
 - Graph canvas mengisi sisa ruang
+- Saat filter aktif, canvas kanan atas menampilkan `n/total nodes`
+- Edge yang salah satu ujungnya tersaring ikut hilang — tidak ada edge menuju
+  node yang tidak ada
 
 ### Right Area — Selected Node Panel (`w-64`)
 - **Selected Node card:**
@@ -289,18 +354,32 @@ Spec: Live Execution step tracker + Operation History table dengan filter.
 ### Tab: Storage
 - Database File path
 - Tables: nodes, edges, operations
-- Button: "View Schema →"
 
 ### Tab: Repository
 - Default Branch (input)
-- Workspace Path (input + Browse)
+- Workspace Path (input)
 - Auto DB Migration toggle
 - Enable Conflict Detection toggle
 - Enable SSM Events toggle
 
+> Tidak ada tombol **Browse** dan tidak ada tombol **View Schema** di tab
+> Storage. Keduanya tidak bisa dikerjakan: browser tidak bisa memilih folder di
+> server, dan tidak ada endpoint schema. Kontrol yang tidak bisa dikerjakan
+> dihapus, bukan dipalsukan.
+
 ### Tab: Approval
 - Default approval mode
 - Conflict auto-deny toggle
+
+### Persistence
+Semua preferensi di atas disimpan di `localStorage` (`synapse.settings`).
+Backend tidak punya endpoint `/settings`. `Save Changes` menulis, `Reset to
+Default` menghapus key dan mengembalikan form ke default, keduanya menampilkan
+umpan balik "Saved to this browser".
+
+Nilai yang **tidak** bisa diubah dari UI (status server, SSE, storage) selalu
+berasal dari backend nyata. `MCP / Server` menampilkan kondisi sebenarnya dari
+`useBackendStatus()`, bukan teks hardcoded.
 
 ### Buttons: Reset to Default | Save Changes
 
@@ -390,12 +469,15 @@ Tidak ada endpoint baru yang dibutuhkan. Kalau nanti backend menambah
 ```
 frontend/
 ├── DESIGN_SYSTEM.md         ← dokumen ini
-├── PRD.md                   ← deliverable spec (diupdate)
-├── README.md                ← cara run + endpoint map (diupdate)
+├── PRD.md                   ← scope + bug ledger + checklist demo
+├── MASTER_PROMPT.md         ← prompt lanjutan ke AI agent
+├── README.md                ← cara run + endpoint map
 ├── app/
-│   ├── page.tsx             ← shell layout 3-kolom
+│   ├── page.tsx             ← shell 3 kolom + routing 9 halaman
+│                              + ApprovalsPage & OperationsPage (fungsi lokal)
+│   ├── landing/page.tsx     ← explainer hackathon (server component)
 │   ├── globals.css
-│   ├── layout.tsx
+│   ├── layout.tsx           ← flex column: banner di flow, children h-full
 │   └── api/graph/route.ts
 ├── components/
 │   ├── LeftNav.tsx          ← FE-1: navigasi kiri
@@ -403,7 +485,6 @@ frontend/
 │   ├── GuardianPanel.tsx    ← FE-1: right panel
 │   ├── OverviewMain.tsx     ← FE-1: halaman overview
 │   ├── SynapseGraph.tsx     ← FE-1+2: force graph canvas
-│   ├── OperationsSidebar.tsx← FE-2: sidebar ops+log
 │   ├── pages/
 │   │   ├── CodeGraphPage.tsx  ← FE-1 ✅
 │   │   ├── GuardianPage.tsx   ← FE-1 ✅
@@ -412,18 +493,22 @@ frontend/
 │   │   ├── SecurityPage.tsx   ← FE-1 ✅
 │   │   └── SettingsPage.tsx   ← FE-1 ✅
 │   └── shared/
-│       ├── RiskBadge.tsx      ← FE-1 ✅
-│       ├── StatusBadge.tsx    ← FE-1 ✅
-│       └── AgentBadge.tsx     ← FE-1 ✅
+│       ├── RiskBadge.tsx            ← FE-1 ✅
+│       ├── StatusBadge.tsx          ← FE-1 ✅
+│       ├── AgentBadge.tsx           ← FE-1 ✅
+│       └── BackendStatusBanner.tsx  ← DEMO DATA / LIVE / OFFLINE
 ├── hooks/
 │   ├── useSSE.ts
-│   ├── useLiveOps.ts          ← FE-1 ✅ poll /operations
+│   ├── useSSEStream.ts
+│   ├── useBackendStatus.ts  ← SATU poller /health, banyak subscriber
+│   ├── useLiveOps.ts        ← FE-1 ✅ poll /operations
 │   └── useMockSimulation.ts
 └── lib/
     ├── types.ts
     ├── mockData.ts
-    ├── derive.ts              ← FE-1 ✅ derivasi data live -> UI
-    ├── derive.test.ts         ← FE-1 ✅
+    ├── graphFilter.ts       ← filter + search graph (pure, ada test)
+    ├── derive.ts            ← FE-1 ✅ derivasi data live -> UI
+    ├── derive.test.ts       ← FE-1 ✅
     └── nodeVisuals.ts
 ```
 
@@ -442,19 +527,31 @@ frontend/
 - [x] CortexPage — 4 endpoint BE yang sebelumnya tidak pernah dipanggil: `/repo_health`, `/complexity_report`, `/find_path`, `/suggest_refactor`
 - [x] AgentsPage — 3 agent cards + tasks + SSE stream + activity chart (data live)
 - [x] SecurityPage — stats + rule engine + conflict candidates + event feed (data live)
-- [x] SettingsPage — tabs: General + MCP + Storage + Repository
-- [x] Shared badges (RiskBadge, StatusBadge, AgentBadge)
+- [x] SettingsPage — tabs: General + MCP / Server + Storage + Repository + Approval
+- [x] SettingsPage — persistensi `localStorage` + Save/Reset + error handling
+- [x] Shared badges (RiskBadge, StatusBadge, AgentBadge) + BackendStatusBanner
 - [x] hooks/useLiveOps.ts — poll `/operations`
-- [x] lib/derive.ts + lib/derive.test.ts — derivasi murni + 12 test
+- [x] hooks/useBackendStatus.ts — satu poller `/health`, banyak subscriber
+- [x] lib/derive.ts + lib/derive.test.ts — derivasi murni + 20 test
+- [x] lib/graphFilter.ts + lib/graphFilter.test.ts — filter/search graph + 9 test
 - [x] Nav "Agents" masuk LeftNav (sebelumnya halaman tidak terjangkau)
+- [x] Landing `/landing` — explainer hackathon, server component, statis
+- [x] Shell: banner masuk flow, `h-screen` pindah ke `<body>`, halaman `h-full`
+- [x] `color-scheme: dark` + `:focus-visible` global
 
 ### FE-2 @ShannWasHere
-- [x] OperationsSidebar (ops tab + log tab)
-- [x] ApprovalsPage (table + approve/deny + detail)
-- [x] OperationsPage (live execution + history table)
 - [x] GuardianPanel — semua pending ops (commit 8c085c3)
+- [x] ApprovalsPage — table + approve/deny + detail
+- [x] OperationsPage — live execution + filter status + history table
+
+> `ApprovalsPage` dan `OperationsPage` **bukan file terpisah**. Keduanya fungsi
+> lokal di `app/page.tsx` (baris 165 dan 195), bukan di `components/pages/`.
+> Itu sebabnya `components/pages/` hanya berisi 6 file. `OperationsSidebar`
+> tidak pernah ada sebagai komponen — log ikut di `OperationsPage`.
 
 ### Backend @DhikaSusheno / @Masrendra
 - [x] Semua endpoint yang dipakai FE-1 sudah ada (`/operations`, `/graph/summary`, `/graph/nodes`, `/health`)
 - [ ] (opsional) `GET /security/rules` — kalau ditambah, `RULES` di SecurityPage diisi dari backend
-- [ ] (opsional) `GET /settings` + `POST /settings` — untuk tab General di SettingsPage
+- [ ] (opsional) `GET /settings` + `POST /settings` — **tidak dipakai**. Tab Settings
+      pakai `localStorage` supaya berfungsi tanpa endpoint baru. Kalau endpoint
+      ini suatu hari ada, `lib/settings.ts` bisa jadi satu tempat untuk pindah.

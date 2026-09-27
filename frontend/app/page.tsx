@@ -5,7 +5,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import type { GraphNode, Operation } from "@/lib/types";
+import type { Operation } from "@/lib/types";
 import type { NavPage } from "@/components/LeftNav";
 import { mapPending, stamp } from "@/lib/derive";
 import { decideOperation } from "@/lib/operations";
@@ -263,7 +263,6 @@ function OperationsPage() {
 // --- HomePage ---
 export default function HomePage() {
   const [activePage, setActivePage]     = useState<NavPage>("overview");
-  const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [graphCount, setGraphCount]     = useState({ nodes: 0, links: 0 });
   const [ops, handleOpDecided]          = useOperations();
 
@@ -277,8 +276,12 @@ export default function HomePage() {
   const hideRightPanel = !(["overview", "guardian"] as NavPage[]).includes(activePage);
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-[#080d14]">
-      <TopNavbar isLive={USE_LIVE} nodeCount={graphCount.nodes} edgeCount={graphCount.links} />
+    <div className="flex flex-col h-full overflow-hidden bg-[#080d14]">
+      <TopNavbar
+        nodeCount={graphCount.nodes}
+        edgeCount={graphCount.links}
+        onOpenSettings={() => setActivePage("settings")}
+      />
 
       <div className="flex flex-1 overflow-hidden">
         <LeftNav activePage={activePage} onNavigate={setActivePage} pendingApprovals={pendingCount} />
@@ -286,14 +289,14 @@ export default function HomePage() {
         {/* ===== Page Content ===== */}
         {activePage === "overview" && (
           <OverviewMain
-            onNodeClick={setSelectedNode} onNodeCount={handleNodeCount}
+            onNodeCount={handleNodeCount}
             nodeCount={graphCount.nodes}  edgeCount={graphCount.links}
             operations={ops}
           />
         )}
         {activePage === "code-graph" && (
           <CodeGraphPage
-            onNodeClick={setSelectedNode} onNodeCount={handleNodeCount}
+            onNodeCount={handleNodeCount}
             nodeCount={graphCount.nodes}  edgeCount={graphCount.links}
           />
         )}

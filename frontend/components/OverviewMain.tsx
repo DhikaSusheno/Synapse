@@ -19,7 +19,7 @@ const SynapseGraph = dynamic(() => import("@/components/SynapseGraph"), {
 });
 
 interface Props {
-  onNodeClick: (node: GraphNode) => void;
+  onNodeClick?: (node: GraphNode) => void;
   onNodeCount: (nodes: number, links: number) => void;
   nodeCount: number;
   edgeCount: number;

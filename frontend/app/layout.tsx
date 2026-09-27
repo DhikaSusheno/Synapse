@@ -17,9 +17,13 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className="dark">
-      <body className={`${inter.variable} bg-slate-950 text-slate-100 antialiased`}>
-        <BackendStatusBanner />
-        {children}
+      <body className={`${inter.variable} h-screen overflow-hidden bg-[#080d14] text-slate-100 antialiased`}>
+        {/* Banner sits in flow (not fixed) so it can never cover the TopNavbar or
+            the LeftNav logo. Children get the remaining height. */}
+        <div className="flex h-full flex-col">
+          <BackendStatusBanner />
+          <div className="min-h-0 flex-1">{children}</div>
+        </div>
       </body>
     </html>
   );

@@ -7,6 +7,7 @@ import dynamic from "next/dynamic";
 import { useRef, useState } from "react";
 import type { GraphNode } from "@/lib/types";
 import { useSSEStream } from "@/hooks/useSSEStream";
+import { NODE_TYPE_FILTERS, type NodeTypeFilter } from "@/lib/graphFilter";
 
 const SynapseGraph = dynamic(() => import("@/components/SynapseGraph"), {
   ssr: false,
@@ -14,8 +15,6 @@ const SynapseGraph = dynamic(() => import("@/components/SynapseGraph"), {
 });
 
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
-
-const FILTER_TYPES = ["All", "File", "Symbol", "Dependency", "Doc"] as const;
 
 interface SSELine { ts: string; message: string; }
 
@@ -32,21 +31,21 @@ function useLiveFeed(): SSELine[] {
 }
 
 interface Props {
-  onNodeClick: (node: GraphNode) => void;
+  onNodeClick?: (node: GraphNode) => void;
   onNodeCount: (n: number, l: number) => void;
   nodeCount: number;
   edgeCount: number;
 }
 
 export default function CodeGraphPage({ onNodeClick, onNodeCount, nodeCount, edgeCount }: Props) {
-  const [filterType, setFilterType] = useState<typeof FILTER_TYPES[number]>("All");
+  const [filterType, setFilterType] = useState<NodeTypeFilter>("All");
   const [search, setSearch]         = useState("");
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const liveFeed = useLiveFeed();
 
   function handleNodeClick(node: GraphNode) {
     setSelectedNode(node);
-    onNodeClick(node);
+    onNodeClick?.(node);
   }
 
   return (
@@ -70,21 +69,24 @@ export default function CodeGraphPage({ onNodeClick, onNodeCount, nodeCount, edg
         {/* Search + filter */}
         <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-800/40 bg-[#0d1117] shrink-0">
           <div className="flex items-center gap-2 flex-1 bg-slate-800/60 border border-slate-700/60 rounded-lg px-2.5 py-1.5">
-            <svg className="w-3 h-3 text-slate-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            <svg aria-hidden="true" className="w-3 h-3 text-slate-500 shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
             <input
+              type="search"
+              aria-label="Search files, symbols, docs"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search files, symbols, docs..."
               className="bg-transparent text-xs text-slate-300 placeholder-slate-600 outline-none flex-1"
             />
           </div>
-          <div className="flex gap-1">
-            {FILTER_TYPES.map((t) => (
+          <div className="flex gap-1" role="group" aria-label="Filter nodes by type">
+            {NODE_TYPE_FILTERS.map((t) => (
               <button
                 key={t}
                 onClick={() => setFilterType(t)}
+                aria-pressed={filterType === t}
                 className={`text-[10px] px-2.5 py-1 rounded-lg transition-colors ${
                   filterType === t ? "bg-blue-600/30 text-blue-400 border border-blue-500/40" : "text-slate-500 hover:text-slate-300 border border-transparent"
                 }`}
@@ -97,7 +99,12 @@ export default function CodeGraphPage({ onNodeClick, onNodeCount, nodeCount, edg
 
         {/* Graph canvas */}
         <div className="flex-1 overflow-hidden">
-          <SynapseGraph onNodeClick={handleNodeClick} onNodeCount={onNodeCount} />
+          <SynapseGraph
+            onNodeClick={handleNodeClick}
+            onNodeCount={onNodeCount}
+            filterType={filterType}
+            search={search}
+          />
         </div>
       </div>
 

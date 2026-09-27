@@ -8,11 +8,12 @@
 // Mode live : set env NEXT_PUBLIC_USE_LIVE_SSE=true
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MOCK_NODES, MOCK_LINKS } from "@/lib/mockData";
 import { getNodeColor, getNodeSize, getNodeLabel, getLinkColor, hexToRgba } from "@/lib/nodeVisuals";
 import { useMockSimulation } from "@/hooks/useMockSimulation";
 import { useSSE, type IngestProgress } from "@/hooks/useSSE";
+import { filterGraph, type NodeTypeFilter } from "@/lib/graphFilter";
 import type { GraphNode, GraphLink } from "@/lib/types";
 
 // react-force-graph-2d tidak support SSR
@@ -41,6 +42,10 @@ interface BackendEdge {
 interface Props {
   onNodeClick?: (node: GraphNode) => void;
   onNodeCount?: (nodes: number, links: number) => void;
+  // Filter + pencarian. Default-nya " Semua" supaya OverviewMain yang tidak
+  // mengirim apa-apa tetap melihat graph utuh.
+  filterType?: NodeTypeFilter;
+  search?: string;
 }
 
 // --- Canvas pulse/blink renderer ---
@@ -198,7 +203,7 @@ const OP_LEGEND: [string, string][] = [
 ];
 
 // --- Komponen utama ---
-export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
+export default function SynapseGraph({ onNodeClick, onNodeCount, filterType = "All", search = "" }: Props) {
   const [nodes, setNodes] = useState<GraphNode[]>(USE_LIVE ? [] : MOCK_NODES);
   const [links, setLinks] = useState<GraphLink[]>(USE_LIVE ? [] : MOCK_LINKS);
   const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(null);
@@ -261,7 +266,12 @@ export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
     return () => clearTimeout(t);
   }, [ingestProgress]);
 
-  const graphData = { nodes, links };
+  // Count di navbar tetap Report jumlah graph SEBENARNYA, bukan hasil filter.
+  const graphData = useMemo(
+    () => filterGraph(nodes, links, filterType, search),
+    [nodes, links, filterType, search]
+  );
+  const isFiltering = filterType !== "All" || search.trim() !== "";
 
   const nodeCanvasObject = useCallback(
     (node: object, ctx: CanvasRenderingContext2D, globalScale: number) => {
@@ -304,6 +314,11 @@ export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
         >
           {USE_LIVE ? "LIVE" : "MOCK"}
         </span>
+        {isFiltering && (
+          <span className="block mt-1 text-[10px] px-2 py-0.5 rounded-full font-mono bg-slate-800 text-slate-300 border border-slate-600">
+            {graphData.nodes.length}/{nodes.length} nodes
+          </span>
+        )}
       </div>
 
       {/* Ingest progress overlay */}
@@ -323,10 +338,17 @@ export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
         </div>
       )}
 
-      {/* Empty state saat live mode dan graph kosong */}
+      {/* Empty state: graph kosong dari backend, ATAU filter tidak cocok */}
+      {nodes.length > 0 && graphData.nodes.length === 0 && isFiltering && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-slate-500 pointer-events-none">
+          <span className="text-sm">No nodes match this filter.</span>
+          <span className="text-xs text-slate-600">Clear the search box or pick “All”.</span>
+        </div>
+      )}
+
       {USE_LIVE && nodes.length === 0 && !ingestProgress && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-slate-500 pointer-events-none">
-          <span className="text-3xl">&#x1F4CA;</span>
+          <span aria-hidden="true" className="text-2xl">▤</span>
           <span className="text-sm">
             Graph kosong.{" "}
             <code className="bg-slate-800 px-1 rounded text-slate-400">
@@ -341,7 +363,7 @@ export default function SynapseGraph({ onNodeClick, onNodeCount }: Props) {
         graphData={graphData}
         width={dimensions.width}
         height={dimensions.height}
-        backgroundColor="#0f172a"
+        backgroundColor="#080d14"
         nodeCanvasObject={nodeCanvasObject}
         nodeCanvasObjectMode={() => "replace"}
         nodeLabel={(node) => getNodeLabel(node as RawNode)}

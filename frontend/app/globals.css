@@ -2,15 +2,21 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --bg: #080d14;
-  --font-inter: "Inter Variable", "Inter", ui-sans-serif, system-ui, sans-serif;
-}
-
-html, body, #__next {
+/* ponytail: --font-inter comes from next/font/local via `inter.variable` on <html>.
+   Do NOT redeclare it here — a `:root` copy shadows the hashed family name and
+   silently falls back to system-ui. */
+html, body {
   height: 100%;
   background-color: #080d14;
-  font-family: var(--font-inter);
+  font-family: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  /* Native <select>, scrollbar, and input popups render dark instead of flashing white. */
+  color-scheme: dark;
+}
+
+:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
 /* Scrollbar halus */
