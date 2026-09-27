@@ -5,7 +5,7 @@ Memverifikasi rule table Guardian sesuai SYNAPSE.md section 4.4.
 Skenario yang dicakup:
   R1  db.run_migration   → blast_radius=high, require_approval=True
   R2  service.restart    → blast_radius=medium, require_approval=False
-  R3  config.write       → blast_radius=medium, require_approval=False
+  R3  config.write       → blast_radius=medium, require_approval=True (H2)
   R4  file.delete        → blast_radius=high, require_approval=True
   R5  UNKNOWN tool       → blast_radius=unknown, require_approval=True  (fail-closed)
   R6  Partial match prefix (db.run_migration.v2) → tetap match rule db.run_migration
@@ -95,9 +95,28 @@ class TestConfigWrite:
         rule = _rule_for(guardian_module, "config.write")
         assert rule["blast_radius"] == "medium"
 
-    def test_require_approval_false(self, guardian_module):
+    def test_require_approval_true(self, guardian_module):
+        """
+        H2 FIX: dulu diuji `require_approval is False` — test itu menetapkan
+        kerentanan sebagai perilaku yang diharapkan.
+
+        config.write menulis file di path bebas dari params. Tanpa approval,
+        siapa pun yang bisa propose operasi menulis file di mana pun yang bisa
+        ditulis proses (.ssh/authorized_keys, .env, hook git, source) dan
+        mendapatkan code execution tanpa persetujuan manusia sama sekali.
+        Pola ini identik dengan file.delete, yang sejak awal
+        require_approval=True.
+        """
         rule = _rule_for(guardian_module, "config.write")
-        assert rule["require_approval"] is False
+        assert rule["require_approval"] is True, (
+            "config.write menulis file bebas — wajib lewat approval manusia"
+        )
+
+    def test_propose_config_write_butuh_approval(self, guardian_module):
+        result = guardian_module.propose_operation(
+            "config.write", {"file_path": "/etc/app.conf"}, "app-config"
+        )
+        assert result["requires_approval"] is True
 
 
 # ---------------------------------------------------------------------------

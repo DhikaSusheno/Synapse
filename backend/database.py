@@ -24,7 +24,16 @@ Override path v2 lewat env var SYNAPSE_DB_PATH (lihat storage.py).
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path("synapse.db")
+# Path DIKECAK KE MODUL INI, bukan ke direktori kerja proses.
+#
+# `Path("synapse.db")` relatif terhadap CWD, jadi server yang dijalankan dari
+# lokasi berbeda membuat file DB KOSONG yang berbeda pula dan operasinya
+# berpindah tanpa error — kasus nyata: repo ini punya synapse_v2.db kosong di
+# root (98 KB, 0 row, dibuat saat demo_reset.py jalan dari root) berdampingan
+# dengan backend/synapse_v2.db yang berisi 848 entities + 1010 relations.
+# Kedua file itu adalah dua "otak" Synapse yang saling tidak tahu-menahu.
+# Modul settings.py dan storage.py sudah memakai pola anchored ini lebih dulu.
+DB_PATH = Path(__file__).resolve().parent / "synapse.db"
 
 # GLITCH-4: get_conn() (thread-local connection) DIHAPUS. Fungsi itu dead code
 # — tidak pernah dipanggil dari guardian.py maupun cortex.py, keduanya membuka

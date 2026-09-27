@@ -218,26 +218,77 @@ def is_readable_path(target: str) -> bool:
     return True
 
 
+def is_writable_path(target: str) -> bool:
+    """
+    True kalau `target` boleh DITULIS oleh guardian (config.write).
+
+    Dua aturannya sama persis dengan is_readable_path(), dan sengaja memakai
+    fungsi yang sama supaya kebijakan "mana yang boleh disentuh" tidak pernah
+    terpecah jadi dua versi yang bisa berbeda:
+      1. path harus di dalam allowed_roots() — repo + workspace
+      2. path tidak boleh menunjuk file kredensial/database
+
+    Pembedanya hanya di pemakaian dan di dokumentasi. Tanpa pemeriksaan ini
+    _exec_config_write() menulis ke path apa pun yang bisa ditulis proses
+    (.ssh/authorized_keys, .env yang memuat SYNAPSE_API_TOKEN + FERNET_KEY,
+    file sistem lain di luar repo) — padahal config.write adalah primitive
+    tulis paling umum di guardian.
+
+    Caveat yang disadari: aturan ini tidak memblokir file source (.py/.sh)
+    yang berada di dalam repo. Menulis source di dalam workspace memang
+    lingkup kerja guardian; karena config.write kini butuh approval manusia,
+    tulis semacam itu tidak bisa terjadi tanpa keputusan eksplisit.
+    """
+    return is_readable_path(target)
+
+
 def browse(path: str = "") -> Dict[str, Any]:
     raw = (path or "").strip()
     target = os.path.join(REPO_ROOT, raw) if raw else REPO_ROOT
-    if not os.path.exists(target):
-        raise FileNotFoundError(f"Path tidak ditemukan: {raw}")
-    if not os.path.isdir(target):
-        raise NotADirectoryError(f"Bukan folder: {raw}")
-    if not _is_allowed(target):
+    real_target = os.path.realpath(target)
+
+    # M11 FIX 1 — urutan pemeriksaan dibalik.
+    #
+    # Dulu `os.path.exists()` dicek SEBELUM `_is_allowed()`. Karena itu
+    # endpoint ini berubah jadi oracle keberadaan path di luar workspace:
+    #   `FileNotFoundError`  -> path itu tidak ada
+    #   `PermissionError`    -> path itu ADA, hanya di luar root
+    # Dua respon berbeda itu sudah cukup untuk memetakan filesystem milik
+    # server tanpa punya izin apa pun. Validasi izin harus selalu didahulukan
+    # supaya jawabannya sama saja untuk path yang ada maupun yang tidak ada.
+    if not _is_allowed(real_target):
         raise PermissionError("Path di luar workspace yang diizinkan")
+
+    # M11 FIX 2 — lapis kedua yang selama ini dilewat browse().
+    #
+    # `_is_allowed()` hanya memastikan path di DALAM workspace. Tapi `.env`
+    # (berisi SYNAPSE_API_TOKEN + FERNET_KEY) dan `id_rsa` juga ada DI DALAM
+    # workspace. Endpoint read-file lain sudah memakai `_is_sensitive()`
+    # lewat is_readable_path(); browse() harus tunduk pada aturan yang sama,
+    # kalau tidak penapisnya hanya setengah jalan.
+    if _is_sensitive(real_target):
+        raise PermissionError("File kredensial tidak bisa dibuka")
+
+    if not os.path.exists(real_target):
+        raise FileNotFoundError(f"Path tidak ditemukan: {raw}")
+    if not os.path.isdir(real_target):
+        raise NotADirectoryError(f"Bukan folder: {raw}")
 
     entries: List[Dict[str, Any]] = []
     try:
-        names = sorted(os.listdir(target), key=str.lower)
+        names = sorted(os.listdir(real_target), key=str.lower)
     except OSError as exc:
         raise PermissionError(f"Gagal membaca folder: {exc}")
 
     for name in names:
         if name in IGNORED_DIRS:
             continue
-        full = os.path.join(target, name)
+        full = os.path.join(real_target, name)
+        # M11: nama dan ukuran kredensial tidak ikut ditampilkan. Daftar itu
+        # sendiri sudah membocorkan keberadaan `.env` / `id_rsa` beserta
+        # ukurannya, dan penapisnya hanya satu baris.
+        if _is_sensitive(full):
+            continue
         is_dir = os.path.isdir(full)
         size = None
         if not is_dir:
@@ -247,21 +298,34 @@ def browse(path: str = "") -> Dict[str, Any]:
                 size = None
         entries.append({"name": name, "type": "dir" if is_dir else "file", "size": size})
 
-    parent_real = os.path.realpath(os.path.dirname(target))
-    parent = None
-    if any(
-        parent_real == os.path.realpath(r) or parent_real.startswith(os.path.realpath(r) + os.sep)
-        for r in allowed_roots()
-    ):
-        parent = os.path.relpath(target, parent_real).replace("\\", "/") or "."
+    # M11 FIX 3 — `parent` salah hitung.
+    #
+    # Dulu: `relpath(target, dirname(target))` — yaitu jarak target ke
+    # induknya sendiri, yang SELALU menghasilkan basename target. Tombol "↑"
+    # di SettingsPage mengirim nilai itu kembali sebagai path, jadi ia
+    # memuat ulang folder yang sama dan tidak pernah bisa naik satu level.
+    # Yang dibutuhkan adalah path RELATIF milik induknya, dan induk itu juga
+    # harus lolos allowed_roots() — dirname(REPO_ROOT) berada di luar root,
+    # sehingga di root paling atas `parent` memang harus None.
+    parent: str | None = None
+    parent_real = os.path.realpath(os.path.dirname(real_target))
+    if os.path.isdir(parent_real) and _is_allowed(parent_real):
+        try:
+            rel_parent = os.path.relpath(parent_real, REPO_ROOT).replace("\\", "/")
+        except ValueError:
+            rel_parent = ".."
+        if rel_parent == ".":
+            parent = "."
+        elif not rel_parent.startswith(".."):
+            parent = rel_parent
 
     try:
-        rel = os.path.relpath(target, REPO_ROOT).replace("\\", "/")
+        rel = os.path.relpath(real_target, REPO_ROOT).replace("\\", "/")
     except ValueError:
         rel = "."
     return {
         "path": "." if rel == "." else rel,
-        "absolute_path": os.path.realpath(target),
+        "absolute_path": os.path.realpath(real_target),
         "parent": parent,
         "entries": entries,
     }

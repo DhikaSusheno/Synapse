@@ -100,8 +100,23 @@ else:
         try:
             _fernet = Fernet(_FERNET_KEY.encode())
         except Exception:
-            _LOG.error("Invalid FERNET_KEY, generating random key")
-            _fernet = Fernet(Fernet.generate_key())
+            # FAIL CLOSED, bukan senyap.
+            #
+            # Versi lama meng-log error lalu mengganti key dengan Fernet acak.
+            # Itu membunuh semua credential yang sudah tersimpan di database
+            # (github_connections.access_token, llm_providers.api_key) secara
+            # PERMANEN, tapi aplikasi tetap jalan dan terlihat sehat —
+            # kegagalan baru terlihat nanti sebagai 500 saat decrypt.
+            # FERNET_KEY yang terisi tapi tidak valid selalu berarti salah
+            # konfigurasi (typo/corrupt), jadi lebih baik gagal keras di awal
+            # dengan pesan yang bisa ditindaklanjuti daripada kehilangan data
+            # kredensial diam-diam.
+            raise RuntimeError(
+                "FERNET_KEY terisi tapi bukan key Fernet yang valid (harus 32 byte "
+                "url-safe base64, 44 karakter). Key yang salah akan membuat SEMUA "
+                "credential tersimpan tidak bisa dibuka. Perbaiki FERNET_KEY atau "
+                "hapus variabelnya untuk mode development."
+            ) from None
 
 
 def encrypt_token(token: str) -> str:
@@ -109,9 +124,93 @@ def encrypt_token(token: str) -> str:
     return _fernet.encrypt(token.encode()).decode()
 
 
+class TokenDecryptError(ValueError):
+    """Credential tersimpan tidak bisa didekripsi.
+
+    Dilempar kalau nilai di DB bukan token Fernet yang valid, atau key
+    yang dipakai menyimpannya berbeda dengan key sekarang. Terpisah dari
+    InvalidToken kriptografi supaya pemanggil bisa membedakan "data rusak"
+    dari "config salah" tanpa harus mem-parsing pesan error library.
+    """
+
+
 def decrypt_token(encrypted: str) -> str:
-    """Decrypt token dari storage."""
-    return _fernet.decrypt(encrypted.encode()).decode()
+    """
+    Decrypt token dari storage.
+
+    Tidak pernah melempar exception library mentah. Fernet.InvalidToken
+    (dan AttributeError kalau `encrypted` None) diterjemahkan ke
+    TokenDecryptError, sehingga pemanggil punya satu titik tangkap.
+    """
+    if not encrypted:
+        raise TokenDecryptError("credential tidak tersimpan (nilainya kosong)")
+    try:
+        return _fernet.decrypt(encrypted.encode()).decode()
+    except TokenDecryptError:
+        raise
+    except Exception as exc:
+        raise TokenDecryptError(
+            "credential tidak bisa didekripsi: FERNET_KEY mungkin berbeda "
+            "dari saat credential ini disimpan, atau nilainya rusak"
+        ) from exc
+
+
+def decrypt_stored_token(encrypted: str) -> str:
+    """
+    Decrypt credential yang dibaca dari database.
+
+    Versi siap-HTTP: kegagalan decrypt pada credential tersimpan adalah
+    masalah sisi server (key salah/rusak), bukan input klien. Tanpa pembungkus
+    ini semua pemakaian decrypt_token() di main.py berujung 500 dengan
+    traceback Fernet.InvalidToken — error 500 berisi stack trace library
+    kepada klien, plus pesan yang tidak bisa ditindaklanjuti.
+
+    -> 500 kalau key/config bermasalah, -> 400 kalau credential memang tidak
+    pernah disimpan (provider/LLM key belum diisi).
+    """
+    if not encrypted:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Credential untuk operasi ini belum diisi. Simpan API key-nya "
+                "dulu lewat pengaturan provider sebelum dipakai."
+            ),
+        )
+    try:
+        return decrypt_token(encrypted)
+    except TokenDecryptError:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Credential tersimpan tidak bisa didekripsi. Pastikan FERNET_KEY "
+                "di backend sama dengan saat credential disimpan, lalu simpan "
+                "ulang API key-nya."
+            ),
+        ) from None
+
+
+def decrypt_client_token(encrypted: str) -> str:
+    """
+    Decrypt nilai yang datang dari BODY request (input klien).
+
+    Dipisah dari decrypt_stored_token() karena akibat kegagalannya berbeda:
+    di sini nilainya bukan milik server, jadi credential yang tidak bisa
+    dibuka adalah kesalahan pengirim -> 400 Bad Request.
+
+    Endpoint yang memakai ini tidak pernah mengirim nilai terenkripsi ke
+    klien (lihat list_llm_providers yang memilih kolom tanpa api_key), jadi
+    setiap kegagalannya pasti berasal dari luar.
+    """
+    try:
+        return decrypt_token(encrypted)
+    except TokenDecryptError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Nilai api_key pada request bukan credential terenkripsi yang "
+                "valid. Kirim ulang nilai yang benar atau kosongkan field-nya."
+            ),
+        ) from None
 
 
 _token_header_scheme = APIKeyHeader(name=TOKEN_HEADER, auto_error=False)
@@ -159,13 +258,42 @@ def _extract_token(request: Request) -> Optional[str]:
 
 
 def verify_token(candidate: Optional[str]) -> bool:
+    """
+    Timing-safe compare token kandidat terhadap API_TOKEN.
+
+    Membandingkan sebagai bytes, bukan str: secrets.compare_digest pada str
+    mewajibkan kedua sisinya ASCII dan akan melempar
+        TypeError: comparing strings with non-ASCII characters is not supported
+    begitu header token memuat satu pun karakter di luar ASCII (mis. "é").
+    Karena pemanggilnya middleware yang tidak menangkap exception, header
+    semacam itu dulu berujung 500, bukan 401. 500 di jalur auth juga mengubah
+    respons menjadi tidak terduga dan berpotensi membocorkan traceback.
+
+    UTF-8 encoding mengubah keduanya ke bytes — di sana compare_digest
+    menerima konten apa pun dan tidak pernah melempar — sambil tetap
+    mempertahankan perbandingan timing-safe.
+    """
     if not candidate:
         return False
-    return secrets.compare_digest(candidate, API_TOKEN)
+    return secrets.compare_digest(
+        candidate.encode("utf-8"),
+        API_TOKEN.encode("utf-8"),
+    )
 
 
 def require_api_key(request: Request) -> str:
-    """FastAPI dependency untuk protecting route tertentu."""
+    """
+    FastAPI dependency untuk protecting route TERTENTU.
+
+    CATATAN: enforcement utama ada di middleware global di main.py, yang
+    mencakup semua route — jadi route mana pun sudah terlindungi tanpa
+    dependency ini. Fungsi ini sengaja dipertahankan sebagai lapis pertahanan
+    tambahan yang eksplisit (defense in depth) untuk route yang mau dilindungi
+    dua kali, dan kini tercakup test di test_auth_token.py.
+
+    Bukan pengganti middleware: middleware-lah yang menjamin route baru ikut
+    terlindungi tanpa harus diubah.
+    """
     token = _extract_token(request)
     if not verify_token(token):
         raise HTTPException(

@@ -35,16 +35,31 @@ Docs    : http://localhost:8000/docs
   GET  /health                — health check
 """
 import asyncio
+import ipaddress
 import json
 import os
+import re
+import socket
+import sys
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Literal, Optional
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import sqlite3
+
+# Issue #74 fix: Pastikan stdout/stderr pakai UTF-8 agar emoji/unicode
+# pada endpoint seperti /repo_health tidak menyebabkan UnicodeEncodeError
+# pada terminal Windows (default encoding cp1252).
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 from database import init_db, DB_PATH
 import storage
@@ -104,10 +119,19 @@ app = FastAPI(
 # Wildcard membuat halaman web mana pun bisa membaca respons API kita
 # dan mengirim request bertoken. Origin sekarang
 # dibatasi ke daftar eksplisit; set lewat env SYNAPSE_ALLOWED_ORIGINS.
+#
+# allow_methods harus memuat SEMUA method yang benar-benar dipakai route.
+# Daftar lama ("GET","POST","OPTIONS") membuang PUT/PATCH/DELETE, padahal
+# ketiganya punya route nyata: PUT /api/projects/{id}/llm-config (:1255),
+# PATCH /api/llm/providers/{id} (:943), DELETE /api/llm/providers/{id}
+# (:1001). Akibatnya preflight membalas tanpa method itu dan browser
+# memblokir request silang-originnya — endpoint terlihat ada tapi tidak
+# pernah bisa dipakai dari frontend lintas origin.
+# OPTIONS ikut dicantumkan supaya daftar ini tetap dibaca apa adanya.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=auth.allowed_origins(),
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", auth.TOKEN_HEADER, "Authorization"],
     allow_credentials=False,
     max_age=600,
@@ -120,6 +144,7 @@ app.add_middleware(
 async def enforce_api_token(request: Request, call_next):
     if request.method == "OPTIONS" or auth.is_public_path(request.url.path):
         return await call_next(request)
+
     token = auth._extract_token(request)
     if not auth.verify_token(token):
         return JSONResponse(
@@ -136,7 +161,69 @@ async def enforce_api_token(request: Request, call_next):
     return await call_next(request)
 
 
+# M6 FIX: batas ukuran body request.
+#
+# FastAPI/Pydantic membatasi isinya, tapi TIDAK membatasi berapa banyak byte
+# yang dibaca dari koneksi: body dibaca dulu, baru diparse. Tanpa batas sini,
+# satu request `POST` berukuran beberapa GB cukup untuk menghabiskan memori
+# proses — endpoint mana pun bisa dipakai sebagai pemantik OOM tanpa token
+# pun pernah diperiksa (middleware ini berjalan paling luar, sebelum auth).
+#
+# Content-Length diperiksa lebih dulu supaya request yang jelas-jelas
+# terlalu besar ditolak sebelum satu byte pun dibaca.
+#
+# CATATAN JUJUR: ini menangani klien yang menyatakan ukurannya. Klien yang
+# berbohong (CL kecil lalu tetap men-stream) tetap perlu ditahan di lapis
+# edge — nginx `client_max_body_size` atau `uvicorn --limit-max-requests`.
+# Membungkus `receive` di middleware untuk menghitung byte sungguhan berarti
+# menyentuh API privat Starlette, dan nilainya tidak sebanding dengan
+# risikonya selama edge juga menegakkan batas yang sama.
+MAX_REQUEST_BODY_BYTES = int(
+    os.environ.get("SYNAPSE_MAX_BODY_BYTES", str(32 * 1024 * 1024))
+)
+
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return await call_next(request)
+
+    declared = request.headers.get("content-length")
+    if declared is None:
+        # Tanpa CL (chunked) tidak bisa dinilai di awal; biarkan route yang
+        # memutuskan. Edge-lah yang menangani kasus ini.
+        return await call_next(request)
+
+    try:
+        size = int(declared)
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Header Content-Length tidak valid"},
+        )
+
+    if size < 0:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Header Content-Length tidak valid"},
+        )
+
+    if size > MAX_REQUEST_BODY_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": (
+                    f"Body terlalu besar ({size} byte, maksimal "
+                    f"{MAX_REQUEST_BODY_BYTES} byte)"
+                )
+            },
+        )
+
+    return await call_next(request)
+
+
 # Handler startup sudah dipindah ke lifespan() di atas.
+
 
 
 # ---------------------------------------------------------------------------
@@ -144,33 +231,52 @@ async def enforce_api_token(request: Request, call_next):
 # ---------------------------------------------------------------------------
 
 class UnderstandRepoRequest(BaseModel):
-    repo_path: str
+    # M6: seluruh field string di blok ini dulu tanpa batas. Repo path,
+    # topik, nama node, dan id operasi adalah identifier — nilainya memang
+    # pendek, jadi membiarkannya tanpa batas hanya membuka satu jalan untuk
+    # memasukkan payload raksasa ke database dan ke respons SSE.
+    repo_path: str = Field(max_length=4096)
 
 class ExplainTopicRequest(BaseModel):
-    topic: str
+    topic: str = Field(max_length=512)
 
 class ReviewArtifactRequest(BaseModel):
-    path_or_diff: str
+    # path_or_diff memuat diff yang bisa besar, jadi batasnya longgar —
+    # dan tetap dibatasi MAX_REQUEST_BODY_BYTES di middleware.
+    path_or_diff: str = Field(max_length=10_000_000)
 
 class FindPathRequest(BaseModel):
-    from_node: str
-    to_node: str
+    from_node: str = Field(max_length=512)
+    to_node: str = Field(max_length=512)
 
 class SuggestRefactorRequest(BaseModel):
-    node_name: str
+    node_name: str = Field(max_length=512)
 
 class ProposeOperationRequest(BaseModel):
-    tool_name: str
+    # H4 FIX: dulu ketiganya tanpa batas sama sekali.
+    #
+    # `target` dipakai MENTAH oleh guardian sebagai id sekaligus nama node
+    # graph (`f"operation_target::{target}"`), jadi string sepanjang apa pun
+    # yang dikirim klien ikut tersimpan di database dan muncul di seluruh
+    # endpoint /graph/*. Batas 512 karakter jauh di atas target yang wajar
+    # (nama file, simbol, id repo) tapi cukup untuk mencegah pembesaran graph
+    # dari satu request.
+    #
+    # `tool_name` dibatasi panjangnya saja, bukan pola karakternya: guardian
+    # memang HARUS menerima tool_name yang aneh dan menjadikannya fail-closed
+    # (lihat security/tests/test_adversarial.py A5b yang menguji persis itu).
+    # Membuangnya di lapis HTTP akan menghapus pengujian jalur fail-closed.
+    tool_name: str = Field(min_length=1, max_length=128)
     params: dict = {}
-    target: str
+    target: str = Field(min_length=1, max_length=512)
 
 class ExecuteOperationRequest(BaseModel):
-    operation_id: str
+    operation_id: str = Field(max_length=64)  # UUID = 36 karakter
 
 class ApproveOperationRequest(BaseModel):
-    operation_id: str
-    decision: str  # 'approved' | 'denied'
-    note: str = ""
+    operation_id: str = Field(max_length=64)
+    decision: str  # diverifikasi ulang di guardian.approve_operation()
+    note: str = Field(default="", max_length=4096)
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +373,7 @@ def reset_settings():
 
 
 @app.get("/browse", tags=["Settings"])
-def browse(path: str = Query("", description="Path relatif terhadap repo root")):
+def browse(path: str = Query("", max_length=4096, description="Path relatif terhadap repo root")):
     try:
         return settings_store.browse(path)
     except FileNotFoundError as exc:
@@ -631,11 +737,66 @@ def get_graph_summary():
 # ---------------------------------------------------------------------------
 
 class GitHubOAuthStartRequest(BaseModel):
-    redirect_uri: str = "http://localhost:3000/auth/github/callback"
+    redirect_uri: str = Field(
+        default="http://localhost:3000/auth/github/callback", max_length=2048
+    )
 
 class GitHubPATRequest(BaseModel):
-    pat: str
+    pat: str = Field(max_length=512)
     scopes: list[str] = ["repo", "read:org", "read:user"]
+
+
+# M7 FIX: redirect_uri dulu diterima apa adanya lalu di-interpolasi langsung
+# ke URL authorize GitHub tanpa encoding dan tanpa validasi.
+#
+# Dua akibatnya:
+#   1. Injeksi parameter. Nilai berisi "&" memotong redirect_uri sendiri dan
+#      menambahkan query param lain ke URL authorize (mis. mengubah scope
+#      atau allow_signup). URL harus di-encode.
+#   2. Open redirect. redirect_uri bisa diarahkan ke domain mana pun; meski
+#      GitHub sendiri menolak URI yang tidak terdaftar, mengandalkan penolakan
+#      pihak ketiga berarti kebijakan kita tidak punya arti.
+#
+# Default hanya localhost (itulah nilai defaultnya), dan domain lain harus
+# diizinkan eksplisit lewat SYNAPSE_OAUTH_REDIRECT_ALLOW, dipisah koma.
+_OAUTH_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
+def _oauth_redirect_allowed(raw: str) -> bool:
+    if not raw or len(raw) > 2048:
+        return False
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return False
+    # fragment tidak pernah dikirim balik ke server dan hanya membingungkan
+    # perbandingan; userinfo (user:pass@) tidak ada gunanya di redirect URI.
+    if parts.scheme not in ("http", "https"):
+        return False
+    if not parts.netloc or parts.fragment or parts.username:
+        return False
+    if parts.hostname in _OAUTH_LOCAL_HOSTS:
+        return True
+    allow = {
+        item.strip().rstrip("/")
+        for item in os.environ.get("SYNAPSE_OAUTH_REDIRECT_ALLOW", "").split(",")
+        if item.strip()
+    }
+    return raw.rstrip("/") in allow
+
+
+def _require_valid_redirect(raw: str) -> str:
+    if not _oauth_redirect_allowed(raw):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "redirect_uri tidak diizinkan. Hanya http(s) ke localhost "
+                "yang diterima; domain lain harus didaftarkan di "
+                "SYNAPSE_OAUTH_REDIRECT_ALLOW (comma-separated)."
+            ),
+        )
+    return raw
+
 
 @app.get("/api/github/auth/url", tags=["GitHub"])
 def github_oauth_url(redirect_uri: str = "http://localhost:3000/auth/github/callback"):
@@ -644,8 +805,18 @@ def github_oauth_url(redirect_uri: str = "http://localhost:3000/auth/github/call
     client_id = os.getenv("GITHUB_CLIENT_ID")
     if not client_id:
         raise HTTPException(status_code=500, detail="GITHUB_CLIENT_ID not configured")
+    # M7: validasi dulu, baru di-encode. quote(safe="") mengubah "&", "?" dan
+    # "=" di dalam redirect_uri jadi %26/%3F/%3D sehingga nilai itu tidak lagi
+    # bisa menambahkan query param sendiri ke URL authorize.
+    redirect_uri = _require_valid_redirect(redirect_uri)
     scope = "repo read:org read:user"
-    url = f"https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&scope={scope}&state=synapse"
+    url = (
+        "https://github.com/login/oauth/authorize"
+        f"?client_id={quote(client_id, safe='')}"
+        f"&redirect_uri={quote(redirect_uri, safe='')}"
+        f"&scope={quote(scope, safe='')}"
+        "&state=synapse"
+    )
     return {"url": url, "state": "synapse"}
 
 @app.get("/api/github/callback", tags=["GitHub"])
@@ -658,6 +829,11 @@ def github_callback(code: str, state: str = "", redirect_uri: str = "http://loca
     if not client_id or not client_secret:
         raise HTTPException(status_code=500, detail="GitHub OAuth not configured")
     
+    # M7: redirect_uri yang sama harus valid di callback — nilai ini
+    # dikirim balik ke GitHub saat penukaran code, dan GitHub mencocokkannya
+    # dengan nilai di langkah authorize.
+    redirect_uri = _require_valid_redirect(redirect_uri)
+
     # Exchange code for token
     resp = requests.post(
         "https://github.com/login/oauth/access_token",
@@ -741,7 +917,7 @@ def github_pat(req: GitHubPATRequest):
 def github_user():
     """Get current authenticated GitHub user."""
     import sqlite3
-    from auth import decrypt_token
+    from auth import decrypt_stored_token
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
@@ -750,7 +926,7 @@ def github_user():
     conn.close()
     if not row:
         return {"ok": False, "connected": False}
-    token = decrypt_token(row["access_token"])
+    token = decrypt_stored_token(row["access_token"])
     import requests
     resp = requests.get(
         "https://api.github.com/user",
@@ -761,10 +937,17 @@ def github_user():
     return {"ok": True, "connected": True, "user": resp.json(), "type": row["type"]}
 
 @app.get("/api/github/repos", tags=["GitHub"])
-def github_repos(per_page: int = 100, page: int = 1):
+def github_repos(
+    per_page: int = Query(100, ge=1, le=100),
+    page: int = Query(1, ge=1, le=10000),
+):
     """List repositories accessible by the authenticated user."""
+    # M6: kedua nilai dulu bebas. per_page raksasa / page negatif dikirim
+    # apa adanya ke api.github.com — GitHub membatasi per_page ke 100, jadi
+    # angka besar hanya membuang-buang waktu dan membingungkan log sisi
+    # mereka tanpa memberi apa pun kepada pemanggil.
     import sqlite3
-    from auth import decrypt_token
+    from auth import decrypt_stored_token
     import requests
     
     conn = sqlite3.connect(DB_PATH)
@@ -776,7 +959,7 @@ def github_repos(per_page: int = 100, page: int = 1):
     if not row:
         raise HTTPException(status_code=401, detail="No GitHub connection")
     
-    token = decrypt_token(row["access_token"])
+    token = decrypt_stored_token(row["access_token"])
     import requests
     resp = requests.get(
         f"https://api.github.com/user/repos?per_page={per_page}&page={page}&sort=updated",
@@ -786,13 +969,58 @@ def github_repos(per_page: int = 100, page: int = 1):
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch repos")
     return {"ok": True, "repos": resp.json()}
 
+def _github_repo_segment(value: str, field: str, allow_slash: bool = False) -> str:
+    """
+    Segmen URL GitHub (owner, repo, branch).
+
+    M8 FIX: nilai ini dulu dipasang mentah ke
+    `https://api.github.com/repos/{owner}/{repo}/...`. FastAPI memang tidak
+    memuat "/" literal dalam path param, tapi nilai yang dikirim ter-encode
+    (%2F, %3F, %23) di-DECODE ulang sebelum masuk ke handler, sehingga
+    pemanggil tetap bisa memasukkan "/", "?" atau "#" ke dalam URL tujuan —
+    termasuk `..` yang mengubah struktur path. Permintaan tetap berakhir di
+    api.github.com, tapi strukturnya bukan lagi endpoint yang dimaksud.
+
+    Dibatasi ke charset nama repo/branch di GitHub, lalu di-encode ulang.
+    `allow_slash` hanya untuk branch (`feature/x`) — owner dan repo selalu
+    satu segmen tunggal.
+    """
+    if not value or len(value) > 256:
+        raise HTTPException(status_code=400, detail=f"{field} tidak valid")
+    if value in (".", "..") or ".." in value.split("/"):
+        raise HTTPException(status_code=400, detail=f"{field} tidak valid")
+    pattern = r"[A-Za-z0-9._\-]+(/[A-Za-z0-9._\-]+)*" if allow_slash else r"[A-Za-z0-9._\-]+"
+    if not re.fullmatch(pattern, value):
+        raise HTTPException(status_code=400, detail=f"{field} tidak valid")
+    return quote(value, safe="")
+
+
+def _github_repo_path(value: str) -> str:
+    """
+    Path file di dalam repo (`src/main.go`). Boleh memuat "/" karena memang
+    struktur direktori, tapi tidak boleh memuat "..", "?" atau "#" yang bisa
+    mengubah URL tujuan, dan tetap di-encode ulang.
+    """
+    if not value or len(value) > 1024:
+        raise HTTPException(status_code=400, detail="path tidak valid")
+    if ".." in value.split("/") or value.startswith("/"):
+        raise HTTPException(status_code=400, detail="path tidak valid")
+    if not re.fullmatch(r"[A-Za-z0-9._\-]+(/[A-Za-z0-9._\-]+)*", value):
+        raise HTTPException(status_code=400, detail="path tidak valid")
+    return quote(value, safe="/")
+
+
 @app.get("/api/github/repos/{owner}/{repo}/tree", tags=["GitHub"])
 def github_repo_tree(owner: str, repo: str, branch: str = "main", recursive: bool = True):
     """Get repository file tree."""
     import sqlite3
-    from auth import decrypt_token
+    from auth import decrypt_stored_token
     import requests
-    
+
+    owner = _github_repo_segment(owner, "owner")
+    repo = _github_repo_segment(repo, "repo")
+    branch = _github_repo_segment(branch, "branch", allow_slash=True)
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
@@ -802,7 +1030,7 @@ def github_repo_tree(owner: str, repo: str, branch: str = "main", recursive: boo
     if not row:
         raise HTTPException(status_code=401, detail="No GitHub connection")
     
-    token = decrypt_token(row["access_token"])
+    token = decrypt_stored_token(row["access_token"])
     import requests
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive={1 if recursive else 0}"
     resp = requests.get(
@@ -817,9 +1045,14 @@ def github_repo_tree(owner: str, repo: str, branch: str = "main", recursive: boo
 def github_file_content(owner: str, repo: str, path: str, branch: str = "main"):
     """Get file content from repository."""
     import sqlite3
-    from auth import decrypt_token
+    from auth import decrypt_stored_token
     import requests
-    
+
+    owner = _github_repo_segment(owner, "owner")
+    repo = _github_repo_segment(repo, "repo")
+    branch = _github_repo_segment(branch, "branch", allow_slash=True)
+    path = _github_repo_path(path)
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
@@ -829,9 +1062,9 @@ def github_file_content(owner: str, repo: str, path: str, branch: str = "main"):
     if not row:
         raise HTTPException(status_code=401, detail="No GitHub connection")
     
-    token = decrypt_token(row["access_token"])
+    token = decrypt_stored_token(row["access_token"])
     import requests
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={quote(branch, safe='')}"
     resp = requests.get(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
@@ -845,8 +1078,99 @@ def github_file_content(owner: str, repo: str, path: str, branch: str = "main"):
 # LLM Provider Registry
 # ---------------------------------------------------------------------------
 
+# M9 FIX: base_url provider adalah TUJUAN REQUEST KELUAR yang dikendalikan
+# pengguna — server lah yang menghubunginya, bukan browser. Nilai itu dulu
+# diterima apa adanya, sehingga `base_url = "http://169.254.169.254/latest/meta-data/"`
+# membuat Synapse ikut menembak metadata cloud (IAM credential) atau layanan
+# internal yang tidak terekspos ke internet.
+#
+# Kebijakannya bertingkap karena kebutuhan nyata bertabrakan dengan SSRF:
+#   - struktur URL SELALU divalidasi (scheme http/https saja, ada host,
+#     tanpa userinfo/fragment) -> `file://`, `ftp://` dan URL aneh tertutup;
+#   - alamat privat ditolak untuk provider SaaS publik (openai/anthropic/...),
+#     di mana tujuan loopback atau RFC1918 tidak pernah sah;
+#   - untuk `ollama` dan `openai-compatible`, localhost JUSTRU tujuan yang
+#     normal (Ollama default di 11434), jadi ditolak hanya kalau operator
+#     menyetel SYNAPSE_BLOCK_PRIVATE_UPSTREAM=1.
+#   - SYNAPSE_ALLOW_PRIVATE_UPSTREAM=1 mematikan penolakan privat sepenuhnya
+#     untuk operator yang sadar risikonya.
+#
+# CATATAN JUJUR: pemeriksaan ini berjalan SEBELUM request, sementara
+# resolusi DNS bisa berubah di antara keduanya (DNS rebinding). Menutupnya
+# penuh berarti membungkus transport HTTP dengan pinning IP, yang tidak
+# sebanding di sini karena tetap butuh token API untuk mencapai endpoint ini.
+_PUBLIC_SAE_TYPES = frozenset({"openai", "anthropic", "ibm", "nvidia", "deepseek"})
+
+
+def _is_private_host(hostname: str) -> bool | None:
+    """True = privat/loopback/link-local, False = publik, None = tak bisa dinilai."""
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError:
+        return None  # gagal resolve: biarkan; request-nya sendiri akan gagal
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return True
+        return False
+    return None
+
+
+def _validate_upstream_base_url(raw: str | None, provider_type: str) -> str | None:
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+
+    if len(value) > 2048:
+        raise HTTPException(status_code=400, detail="base_url terlalu panjang")
+
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="base_url tidak valid")
+
+    if parts.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail="base_url harus memakai skema http atau https",
+        )
+    if not parts.hostname:
+        raise HTTPException(status_code=400, detail="base_url tidak punya host")
+    if parts.username or parts.password:
+        raise HTTPException(
+            status_code=400,
+            detail="base_url tidak boleh memuat kredensial; pakai field api_key",
+        )
+    if parts.fragment:
+        raise HTTPException(status_code=400, detail="base_url tidak boleh memuat fragment")
+
+    allow_private = os.environ.get("SYNAPSE_ALLOW_PRIVATE_UPSTREAM", "") == "1"
+    force_block = os.environ.get("SYNAPSE_BLOCK_PRIVATE_UPSTREAM", "") == "1"
+    check_private = force_block or (
+        provider_type in _PUBLIC_SAE_TYPES and not allow_private
+    )
+    if check_private and not allow_private:
+        if _is_private_host(parts.hostname) is True:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"base_url menunjuk alamat privat/loopback untuk provider "
+                    f"'{provider_type}'. Set SYNAPSE_ALLOW_PRIVATE_UPSTREAM=1 "
+                    f"kalau ini memang disengaja."
+                ),
+            )
+    return value
+
+
 class LLMProviderCreate(BaseModel):
-    name: str
+    # name ikut membentuk primary key (`f"{type}:{name}"`), jadi panjangnya
+    # dibatasi supaya satu request tidak bisa menggelembungkan id provider (M6).
+    name: str = Field(max_length=256)
     type: Literal["openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama", "openai-compatible"]
     base_url: str | None = None
     api_key: str | None = None
@@ -858,7 +1182,7 @@ class LLMProviderCreate(BaseModel):
     enabled: bool = True
 
 class LLMProviderUpdate(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, max_length=256)
     type: Literal["openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama", "openai-compatible"] | None = None
     base_url: str | None = None
     api_key: str | None = None
@@ -905,7 +1229,11 @@ def create_llm_provider(req: LLMProviderCreate):
     import json
     from auth import encrypt_token
     from datetime import datetime
-    
+
+    # M9: tujuan request keluar divalidasi SEBELUM disimpan, supaya baris yang
+    # sudah ada di database juga tidak pernah lolos begitu saja nanti.
+    req.base_url = _validate_upstream_base_url(req.base_url, req.type)
+
     conn = sqlite3.connect(DB_PATH)
     provider_id = f"{req.type}:{req.name}"
     try:
@@ -953,6 +1281,11 @@ def update_llm_provider(provider_id: str, req: LLMProviderUpdate):
         updates.append("type = ?")
         params.append(req.type)
     if req.base_url is not None:
+        # M9: validasi memakai type BARU kalau request ikut mengubah type,
+        # kalau tidak type yang sudah tersimpan — kebijakan SSRF-nya harus
+        # mengikuti provider yang benar-benar akan dipakai.
+        effective_type = req.type if req.type is not None else (existing["type"] or "")
+        req.base_url = _validate_upstream_base_url(req.base_url, effective_type)
         updates.append("base_url = ?")
         params.append(req.base_url)
     if req.api_key is not None:
@@ -1048,7 +1381,7 @@ async def llm_chat(req: ChatCompletionRequest):
     import json
     import asyncio
     import httpx
-    from auth import decrypt_token
+    from auth import decrypt_stored_token
     
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -1057,7 +1390,7 @@ async def llm_chat(req: ChatCompletionRequest):
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found or disabled")
     
-    api_key = decrypt_token(provider["api_key"]) if provider["api_key"] else None
+    api_key = decrypt_stored_token(provider["api_key"]) if provider["api_key"] else None
     if not api_key and provider["type"] != "ollama":
         raise HTTPException(status_code=400, detail="Provider not configured with API key")
     
@@ -1123,21 +1456,21 @@ async def llm_chat(req: ChatCompletionRequest):
 
 
 class ExplainRequest(BaseModel):
-    provider_id: str
-    model: str | None = None
-    topic: str
+    provider_id: str = Field(max_length=64)
+    model: str | None = Field(default=None, max_length=128)
+    topic: str = Field(max_length=512)
     context_limit: int = 5
 
 class ReviewRequest(BaseModel):
-    provider_id: str
-    model: str | None = None
-    path_or_diff: str
-    context: str | None = None
+    provider_id: str = Field(max_length=64)
+    model: str | None = Field(default=None, max_length=128)
+    path_or_diff: str = Field(max_length=10_000_000)
+    context: str | None = Field(default=None, max_length=1_000_000)
 
 class RefactorRequest(BaseModel):
-    provider_id: str
-    model: str | None = None
-    node_name: str
+    provider_id: str = Field(max_length=64)
+    model: str | None = Field(default=None, max_length=128)
+    node_name: str = Field(max_length=512)
 
 @app.post("/api/llm/explain", tags=["LLM"])
 async def llm_explain(req: ExplainRequest):
@@ -1271,14 +1604,25 @@ class RAGIngestRequest(BaseModel):
     model: str | None = None
     api_key: str | None = None   # BUG-NEW-4 FIX: field hilang, dipakai di baris 1288
     files: list[str]  # file paths or contents
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
+    # chunk_size/chunk_overlap dulu bebas nilainya. Akibatnya:
+    #   chunk_size <= 0  -> syarat `len(...) >= chunk_size` selalu benar, jadi
+    #                       SEMUA baris terkirim sebagai chunk terpisah. Satu
+    #                       file 100rb baris berarti 100rb panggilan API pihak
+    #                       ketiga dari satu request, dan itu DoS mandiri yang
+    #                       dibayar pemilik API key.
+    #   chunk_size raksasa -> 1 chunk meledak melewati context window provider.
+    # Batas di atas (8000 karakter) masih jauh di bawah context window mana pun
+    # (8k token ~ 32k karakter) dan membatasi biaya per request.
+    chunk_size: int = Field(default=1000, ge=1, le=8000)
+    chunk_overlap: int = Field(default=200, ge=0, le=4000)
 
 class RAGSearchRequest(BaseModel):
-    provider_id: str
-    model: str | None = None
-    query: str
-    top_k: int = 5
+    provider_id: str = Field(max_length=64)
+    model: str | None = Field(default=None, max_length=128)
+    query: str = Field(max_length=8192)
+    # top_k tanpa batas berarti satu request bisa meminta jutaan baris
+    # embedding dari SQLite dan meledakkan memori respons.
+    top_k: int = Field(default=5, ge=1, le=50)
 
 def _looks_like_path(value: str) -> bool:
     r"""
@@ -1354,9 +1698,9 @@ async def rag_ingest(req: RAGIngestRequest):
     import json
     import hashlib
     import httpx
-    from auth import decrypt_token
+    from auth import decrypt_stored_token, decrypt_client_token
 
-    # Validasi SELURUH entri lebih dulu, sebelum query DB, decrypt_token, atau
+    # Validasi SELURUH entri lebih dulu, sebelum query DB, decrypt, atau
     # panggilan jaringan apa pun. Kalau validasi dilakukan setelahnya,
     # request berbahaya bisa lolos, atau pun tertutup 404 "Provider not found"
     # sehingga penolakan aslinya tidak pernah terlihat.
@@ -1369,7 +1713,11 @@ async def rag_ingest(req: RAGIngestRequest):
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found or disabled")
     
-    api_key = decrypt_token(req.api_key) if req.api_key else None
+    # api_key berasal dari BODY request, bukan dari database — klien tidak
+    # pernah menerima nilai terenkripsi dari endpoint mana pun (lihat
+    # list_llm_providers yang hanya memilih kolom tanpa api_key). Kegagalan
+    # decrypt di sini karena itu salah klien -> 400, bukan 500.
+    api_key = decrypt_client_token(req.api_key) if req.api_key else None
     model = req.model or "text-embedding-3-small"
     
     # Generate embeddings
@@ -1388,15 +1736,45 @@ async def rag_ingest(req: RAGIngestRequest):
             chunks.append('\n'.join(chunk))
     
     # Generate embeddings
+    #
+    # Dibuka sekali di luar loop karena decrypt_stored_token() tidak murah dan
+    # nilainya sama untuk semua chunk. Variabel `headers` di versi lama dihitung
+    # di dalam loop tapi TIDAK PERNAH dipakai — post() memakai dict inline
+    # sendiri, sehingga decrypt dijalankan dua kali per chunk hanya untuk
+    # dibuang.
+    embed_api_key = decrypt_stored_token(provider['api_key'])
+    embed_headers = {
+        "Authorization": f"Bearer {embed_api_key}",
+        "Content-Type": "application/json",
+    }
+    base_url = provider["base_url"] or "https://api.openai.com/v1"
     embeddings = []
     async with httpx.AsyncClient(timeout=30.0) as client:
         for chunk in chunks:
             payload = {"model": model, "input": chunk}
-            headers = {"Authorization": f"Bearer {decrypt_token(provider['api_key'])}", "Content-Type": "application/json"}
-            base_url = provider["base_url"] or "https://api.openai.com/v1"
-            resp = await client.post(f"{base_url}/embeddings", json=payload, headers={"Authorization": f"Bearer {decrypt_token(provider['api_key'])}", "Content-Type": "application/json"}, timeout=30.0)
-            if resp.status_code == 200:
-                embeddings.append({"chunk": chunk, "embedding": resp.json()["data"][0]["embedding"]})
+            resp = await client.post(
+                f"{base_url}/embeddings",
+                json=payload,
+                headers=embed_headers,
+                timeout=30.0,
+            )
+            # Diam-diam melewatkan chunk yang gagal (versi lama) membuat
+            # sebagian dokumen tidak pernah masuk index tanpa satu pun
+            # error yang terlihat — retrieval lalu mengembalikan hasil
+            # parsial yang tampak sah. Gagal keras dengan kode provider
+            # supaya ingest gagal penuh dan bisa diulang.
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Provider menolak chunk embedding (HTTP "
+                        f"{resp.status_code}). Ingest dibatalkan agar index "
+                        f"tidak tersimpan parsial."
+                    ),
+                )
+            embeddings.append(
+                {"chunk": chunk, "embedding": resp.json()["data"][0]["embedding"]}
+            )
     
     # Store in DB (simple approach - store in rag_chunks table)
     from datetime import datetime as _dt  # BUG-NEW-5 FIX: datetime tidak diimport di scope ini
@@ -1426,7 +1804,7 @@ async def rag_search(req: RAGSearchRequest):
     import json
     import numpy as np
     import httpx
-    from auth import decrypt_token
+    from auth import decrypt_stored_token
     
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -1437,14 +1815,14 @@ async def rag_search(req: RAGSearchRequest):
     
     # Generate query embedding
     model = req.model or "text-embedding-3-small"
-    api_key = decrypt_token(provider["api_key"])
+    api_key = decrypt_stored_token(provider["api_key"])
     base_url = provider["base_url"] or "https://api.openai.com/v1"
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            f"{provider['base_url'] or 'https://api.openai.com/v1'}/embeddings",
+            f"{base_url}/embeddings",
             json={"model": model, "input": req.query},
-            headers={"Authorization": f"Bearer {decrypt_token(provider['api_key'])}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             timeout=30.0
         )
         if resp.status_code != 200:

@@ -16,12 +16,35 @@ invariants:
     applies_to: db.run_migration
     check: sqlite_tables_exist
     params:
-      tables: [nodes, edges, operations, approvals]
-      db_path: "synapse.db"   # default; bisa dioverride via params['db_path']
+      # H5 FIX: daftar ini dulu hanya [nodes, edges, operations, approvals]
+      # — empat tabel kontrak dari SYNAPSE.md 4.2 — padahal skema di
+      # database.py punya DELAPAN. Empat tabel yang tidak dicek persis yang
+      # menyimpan kredensial dan konfigurasi:
+      #     github_connections  token OAuth GitHub
+      #     llm_providers       API key LLM (ter-encrypt dengan FERNET_KEY)
+      #     repo_refs           pemetaan repo -> LLM/RAG
+      #     project_llm_configs konfigurasi LLM per proyek
+      # Migration yang menjatuhkan salah satunya lolos verifier, tidak pernah
+      # di-rollback, dan kehilangannya diam-diam. Daftarnya sekarang mengikuti
+      # skema penuh, bukan hanya tabel yang mudah terlihat.
+      tables:
+        - nodes
+        - edges
+        - operations
+        - approvals
+        - github_connections
+        - repo_refs
+        - llm_providers
+        - project_llm_configs
+      # db_path sengaja TIDAK diisi di sini. Nilai lama "synapse.db" bersifat
+      # relatif terhadap CWD proses, sehingga verifier memeriksa file yang
+      # berbeda tergantung uvicorn dijalankan dari mana (lihat
+      # guardian._resolve_db_path). Dibiarkan kosong agar memakai DB kanonik.
     on_fail: rollback
     description: >
-      Setelah migration, pastikan keempat tabel kontrak (SYNAPSE.md 4.2)
-      masih ada. Jika hilang, langsung rollback — migration merusak skema dasar.
+      Setelah migration, pastikan seluruh tabel skema — termasuk yang
+      memuat kredensial — masih ada. Jika hilang, langsung rollback:
+      migration merusak skema dasar dan konfigurasi tersimpan.
 
   - id: db_wal_mode
     applies_to: db.run_migration
@@ -29,7 +52,9 @@ invariants:
     params:
       pragma: journal_mode
       expected_value: wal
-      db_path: "synapse.db"
+      # H5: tanpa db_path, check di-resolve ke DB kanonik lewat _db_path(),
+      # sehingga mengikuti SYNAPSE_DB_PATH dan override test. Nilai lama
+      # "synapse.db" relatif terhadap CWD dan menunjuk file berbeda.
     on_fail: warn
     description: >
       WAL mode harus aktif untuk performa baca-tulis paralel FastAPI.
@@ -41,7 +66,7 @@ invariants:
     params:
       table: nodes
       min_count: 0      # boleh kosong; cukup pastikan tabel bisa di-query
-      db_path: "synapse.db"
+      # H5: tanpa db_path, check di-resolve ke DB kanonik lewat _db_path().
     on_fail: rollback
     description: >
       Pastikan tabel 'nodes' bisa di-query tanpa error setelah migration.
