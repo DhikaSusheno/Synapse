@@ -10,7 +10,7 @@ import type { NavPage } from "@/components/LeftNav";
 import { mapPending, stamp } from "@/lib/derive";
 import { decideOperation } from "@/lib/operations";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "/backend";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
 
 // --- Dynamic imports (no SSR) ---

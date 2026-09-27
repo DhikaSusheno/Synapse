@@ -17,7 +17,7 @@ export type StorageOverview = {
   tables: Record<string, string[]>;
 };
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "/backend";
 const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
 
 let cache: PlatformSettings | null = null;

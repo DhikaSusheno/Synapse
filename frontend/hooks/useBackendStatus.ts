@@ -9,7 +9,7 @@
 
 import { useEffect, useState } from "react";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "/backend";
 const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
 
 export type BackendMode = "live" | "mock" | "checking" | "offline";

@@ -9,7 +9,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { LiveOp } from "@/lib/derive";
 import { isOpen } from "@/lib/derive";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "/backend";
 const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
 
 export interface LiveOpsState {
