@@ -3,7 +3,7 @@
 // components/GitHubRepoPicker.tsx
 // Modal untuk memilih repository GitHub
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import { useGitHubRepo, GitHubRepo } from "@/hooks/useGitHubRepo";
 
 interface GitHubRepoPickerProps {
@@ -13,14 +13,26 @@ interface GitHubRepoPickerProps {
 }
 
 export default function GitHubRepoPicker({ isOpen, onClose, onSelect }: GitHubRepoPickerProps) {
-  const { repos, loading, error, fetchRepos } = useGitHubRepo();
+  const { repos, loading, error, notConnected, fetchRepos } = useGitHubRepo();
   const [search, setSearch] = useState("");
 
+  // Daftar diambil saat modal dibuka, bukan saat mount: komponen ini mount
+  // sekali di halaman Settings, jadi mount-time fetch akan berjalan tanpa
+  // ada yang melihat hasilnya.
   useEffect(() => {
-    if (isOpen) {
-      // Fetch repos when modal opens
-    }
-  }, [isOpen]);
+    if (!isOpen) return;
+    setSearch("");
+    void fetchRepos();
+  }, [isOpen, fetchRepos]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isOpen, onClose]);
 
   const filteredRepos = repos.filter((repo) =>
     repo.full_name.toLowerCase().includes(search.toLowerCase()) ||
@@ -73,6 +85,14 @@ export default function GitHubRepoPicker({ isOpen, onClose, onSelect }: GitHubRe
             <div className="flex items-center justify-center py-8">
               <div className="animate-spin rounded-full h-6 w-6 border-2 border-blue-500 border-t-transparent" />
               <span className="ml-2 text-xs text-slate-400">Memuat repository...</span>
+            </div>
+          ) : notConnected ? (
+            <div className="text-center py-8 text-slate-400 text-xs space-y-1">
+              <p>Belum ada koneksi GitHub.</p>
+              <p className="text-slate-500">
+                Hubungkan lewat tab <span className="font-mono text-slate-300">GitHub</span> di Settings
+                (Personal Access Token atau OAuth).
+              </p>
             </div>
           ) : repos.length === 0 ? (
             <div className="text-center py-8 text-slate-500 text-xs">

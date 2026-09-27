@@ -1,14 +1,9 @@
 "use client";
 
 import { useState } from "react";
+import type { FileTreeNode } from "@/lib/fileTree";
 
-export interface FileTreeNode {
-  id: string;
-  name: string;
-  path: string;
-  type: "file" | "dir";
-  children?: FileTreeNode[];
-}
+export type { FileTreeNode };
 
 interface RowProps {
   node: FileTreeNode;

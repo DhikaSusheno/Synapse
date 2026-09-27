@@ -42,7 +42,7 @@ from typing import AsyncGenerator, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 import sqlite3
 
@@ -637,28 +637,60 @@ class GitHubPATRequest(BaseModel):
     pat: str
     scopes: list[str] = ["repo", "read:org", "read:user"]
 
+def _github_oauth_redirect_uri(request: Request) -> str:
+    """
+    Redirect URI untuk tukar-kode jadi token, diturunkan dari host yang benar-benar
+    menghubungi backend.
+
+    Default lama menunjuk ke http://localhost:3000/auth/github/callback - route
+    Next.js yang tidak pernah ada. GitHub lalu mengirim `code` ke sana, tidak ada
+    yang menukar kode itu, dan user terkunci di halaman 404. Yang lebih buruk,
+   menukar kode di dalam browser justru membuka jalan token GitHub lolos ke
+   client, padahal kontrak repo ini: token tidak pernah ada di browser.
+    """
+    return f"{str(request.base_url).rstrip('/')}/api/github/callback"
+
+
 @app.get("/api/github/auth/url", tags=["GitHub"])
-def github_oauth_url(redirect_uri: str = "http://localhost:3000/auth/github/callback"):
+def github_oauth_url(request: Request, redirect_uri: str | None = None):
     """Get GitHub OAuth authorization URL."""
-    import os
+    from urllib.parse import urlencode
     client_id = os.getenv("GITHUB_CLIENT_ID")
-    if not client_id:
-        raise HTTPException(status_code=500, detail="GITHUB_CLIENT_ID not configured")
+    client_secret = os.getenv("GITHUB_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="GitHub OAuth not configured (GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET)",
+        )
+    redirect_uri = redirect_uri or _github_oauth_redirect_uri(request)
     scope = "repo read:org read:user"
-    url = f"https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&scope={scope}&state=synapse"
-    return {"url": url, "state": "synapse"}
+    # redirect_uri harus persis sama dengan yang dipakai saat tukar kode,
+    # jadi keduanya di-encode lewat dict, bukan dirakit dengan f-string.
+    query = urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": "synapse",
+        }
+    )
+    url = f"https://github.com/login/oauth/authorize?{query}"
+    return {"url": url, "state": "synapse", "redirect_uri": redirect_uri}
 
 @app.get("/api/github/callback", tags=["GitHub"])
-def github_callback(code: str, state: str = "", redirect_uri: str = "http://localhost:3000/auth/github/callback"):
+def github_callback(request: Request, code: str, state: str = "", redirect_uri: str | None = None):
     """Handle GitHub OAuth callback, exchange code for access token."""
-    import os
-    import requests
     client_id = os.getenv("GITHUB_CLIENT_ID")
     client_secret = os.getenv("GITHUB_CLIENT_SECRET")
     if not client_id or not client_secret:
         raise HTTPException(status_code=500, detail="GitHub OAuth not configured")
-    
+
+    # Harus identik dengan yang dikirim ke GitHub di /api/github/auth/url,
+    # kalau tidak GitHub menolak tukar kode dengan "redirect_uri mismatch".
+    redirect_uri = redirect_uri or _github_oauth_redirect_uri(request)
+
     # Exchange code for token
+    import requests
     resp = requests.post(
         "https://github.com/login/oauth/access_token",
         data={
@@ -688,8 +720,6 @@ def github_callback(code: str, state: str = "", redirect_uri: str = "http://loca
     user = user_resp.json()
     
     # Store connection
-    import sqlite3
-    from datetime import datetime
     from auth import encrypt_token
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -702,7 +732,33 @@ def github_callback(code: str, state: str = "", redirect_uri: str = "http://loca
     conn.commit()
     conn.close()
     
-    return {"ok": True, "user": {"login": user["login"], "avatar": user.get("avatar_url", "")}, "redirect": "http://localhost:3000/settings?tab=github"}
+    # Browser mendarat di sini dari GitHub, jadi balas dengan redirect supaya
+    # user mendarat di aplikasi. Pesan status lewat query string karena
+    # respons JSON di address bar tidak ada tombol balik ke app.
+    #
+    # PENTING: aplikasi ini single-page shell di "/". Navigasi ke Settings
+    # berjalan client-side (activePage di app/page.tsx); tidak ada route
+    # /settings, jadi redirect ke sana berakhir di 404 Next. Karena itu
+    # page=settings ikut dikirim dan dibaca app/page.tsx untuk halaman awal.
+    from urllib.parse import urlencode
+    qs = urlencode({
+        "page": "settings",
+        "tab": "github",
+        "github": "connected",
+        "login": user["login"],
+    })
+    return RedirectResponse(url=f"http://localhost:3000/?{qs}", status_code=303)
+
+
+@app.delete("/api/github/connection", tags=["GitHub"])
+def github_disconnect():
+    """Disconnect GitHub: hapus semua token yang tersimpan."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute("DELETE FROM github_connections")
+    removed = cur.rowcount
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": max(removed, 0)}
 
 @app.post("/api/github/auth/pat", tags=["GitHub"])
 def github_pat(req: GitHubPATRequest):
@@ -917,7 +973,10 @@ def create_llm_provider(req: LLMProviderCreate):
             (
                 provider_id, req.name, req.type, req.base_url,
                 encrypt_token(req.api_key) if req.api_key else None,
-                json.dumps(req.models), req.default_model or req.models[0] if req.models else "",
+                # `a or b[0] if c else d` di-parse sebagai `(a or b[0]) if c else d`,
+                # jadi default_model yang diisi user hilang begitu models kosong.
+                json.dumps(req.models),
+                req.default_model or (req.models[0] if req.models else ""),
                 req.max_tokens, int(req.supports_tools), int(req.supports_vision),
                 int(req.enabled), guardian._utcnow_iso(), guardian._utcnow_iso()
             )

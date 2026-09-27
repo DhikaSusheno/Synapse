@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import type { Operation } from "@/lib/types";
-import type { NavPage } from "@/components/LeftNav";
+import { NAV_PAGES, type NavPage } from "@/components/LeftNav";
 import { mapPending, stamp } from "@/lib/derive";
 import { decideOperation } from "@/lib/operations";
 
@@ -262,7 +262,18 @@ function OperationsPage() {
 
 // --- HomePage ---
 export default function HomePage() {
-  const [activePage, setActivePage]     = useState<NavPage>("overview");
+  // GitHub OAuth mendarat kembali di app lewat redirect backend ke
+  // "/?page=settings&tab=github&...". Aplikasi ini single-page shell, jadi
+  // "page" di query string yang memilih halaman awal - tanpa ini user
+  // mendarat di Overview dan tidak tahu koneksinya berhasil.
+  // Nilai tak dikenal diabaikan, bukan dipaksa jadi halaman pertama.
+  const [activePage, setActivePage]     = useState<NavPage>(() => {
+    if (typeof window === "undefined") return "overview";
+    const fromQuery = new URLSearchParams(window.location.search).get("page");
+    return (NAV_PAGES as readonly string[]).includes(fromQuery ?? "")
+      ? (fromQuery as NavPage)
+      : "overview";
+  });
   const [graphCount, setGraphCount]     = useState({ nodes: 0, links: 0 });
   const [ops, handleOpDecided]          = useOperations();
 

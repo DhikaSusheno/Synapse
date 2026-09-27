@@ -1,6 +1,6 @@
 "use client";
 // components/pages/AgentsPage.tsx
-// Halaman Agents â€” sesuai design section 4
+// Halaman Agents — sesuai design section 4
 // FE-1 @nabilfauzandafa
 //
 // Data live: /operations (via useLiveOps) + /graph/summary + SSE /stream.
@@ -150,7 +150,7 @@ export default function AgentsPage() {
               </div>
               <div className="flex items-center justify-between">
                 <div className="text-center">
-                  <div className="text-xl font-bold text-white">{loading ? "â€¦" : agentTasks[name]}</div>
+                  <div className="text-xl font-bold text-white">{loading ? "…" : agentTasks[name]}</div>
                   <div className="text-[10px] text-slate-500">
                     {name === "guardian" ? "Open ops" : name === "cortex" ? "Symbols" : "Files"}
                   </div>
@@ -169,7 +169,7 @@ export default function AgentsPage() {
 
       {/* Bottom 2-col */}
       <div className="grid grid-cols-2 gap-4">
-        {/* Current Tasks â€” operasi yang masih jalan */}
+        {/* Current Tasks — operasi yang masih jalan */}
         <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-4 space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-sm font-semibold text-white">Current Tasks</span>
@@ -179,7 +179,7 @@ export default function AgentsPage() {
           </div>
           {openOps.length === 0 ? (
             <div className="text-[10px] text-slate-600 py-4 text-center">
-              {loading ? "Loading operations..." : !USE_LIVE ? "Live data OFF â€” set NEXT_PUBLIC_USE_LIVE_SSE=true." : offline ? "Backend offline â€” no data." : "Tidak ada operasi terbuka."}
+              {loading ? "Loading operations..." : !USE_LIVE ? "Live data OFF — set NEXT_PUBLIC_USE_LIVE_SSE=true." : offline ? "Backend offline — no data." : "Tidak ada operasi terbuka."}
             </div>
           ) : (
             <div className="space-y-2">
@@ -236,7 +236,7 @@ export default function AgentsPage() {
 
       {/* Agent Activity Chart + Conflicts + Recent Actions */}
       <div className="grid grid-cols-3 gap-4">
-        {/* Activity Chart â€” histogram operasi 5 jam terakhir */}
+        {/* Activity Chart — histogram operasi 5 jam terakhir */}
         <div className="col-span-2 bg-[#0d1117] rounded-xl border border-slate-800/60 p-4 space-y-2">
           <div className="flex items-center justify-between">
             <span className="text-sm font-semibold text-white">Agent Activity</span>
