@@ -15,7 +15,7 @@ Skenario yang dicakup:
 """
 import sqlite3
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +27,8 @@ def _insert_existing_op(db_path, target_node_id: str, status: str = "pending",
     """Insert operasi fiktif di DB untuk setup test konflik."""
     import uuid
     op_id = str(uuid.uuid4())
-    created = (datetime.utcnow() - timedelta(minutes=minutes_ago)).isoformat()
+    created = (datetime.now(timezone.utc).replace(tzinfo=None)
+               - timedelta(minutes=minutes_ago)).isoformat()
     conn = sqlite3.connect(str(db_path))
     conn.execute(
         "INSERT INTO nodes (id, type, name) VALUES (?, 'operation', ?) ON CONFLICT(id) DO NOTHING",

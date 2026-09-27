@@ -5,6 +5,29 @@ aiofiles==23.2.1
 python-multipart==0.0.9
 PyYAML==6.0.1
 
+# --- runtime dependencies yang sebelumnya hilang ---------------------------
+# Keempatnya di-import oleh kode produksi dan TIDAK ikut ter-install lewat
+# dependency fastapi, jadi `pip install -r requirements.txt` menghasilkan
+# backend yang tidak bisa start. Lihat issue #61.
+#
+# cryptography  auth.py membutuhkannya untuk Fernet; dipakai encrypt_token()
+#              dan decrypt_token() yang menyimpan GitHub PAT + API key LLM.
+#              Tanpa ini: ModuleNotFoundError saat import auth, backend mati total.
+# requests     main.py memakainya untuk memanggil GitHub API (/api/github/*).
+#              Tanpa ini: endpoint tersebut balas 500 saat dipanggil.
+# numpy        main.py memakainya untuk cosine similarity di RAG (/api/rag/*).
+# httpx        main.py memakainya sebagai AsyncClient untuk panggilan LLM
+#              provider yang tidak diblokir.
+#
+# pins mengikuti versi yang sudah diverifikasi jalan di test suite.
+# CATATAN numpy: sengaja di-pin 2.4.6, bukan 2.5.x. NumPy 2.5.0 dan
+# seterusnya memerlukan Python >=3.12 sedangkan CI memakai Python 3.11, jadi 2.5.x akan gagal install
+# di CI. 2.4.6 adalah rilis terakhir yang masih menyediakan wheel cp311.
+cryptography==50.0.1
+requests==2.34.2
+numpy==2.4.6
+httpx==0.28.1
+
 # --- tree-sitter ------------------------------------------------------------
 # tree-sitter-languages==1.10.2 TIDAK LAGI dipakai dan sengaja dihapus.
 # Paket itu dibundel dengan Language() versi lama; di tree-sitter >= 0.22

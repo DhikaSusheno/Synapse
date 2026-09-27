@@ -277,3 +277,78 @@ def test_public_paths_allowlist():
 def test_guard_paths_are_not_public():
     for path in ("/propose_operation", "/approve_operation", "/execute_operation"):
         assert not auth.is_public_path(path), f"{path} tidak boleh publik"
+
+
+# --- BUG-14 / #62: PUBLIC_PATHS harus tetap sempit --------------------------
+# Daftar lama (19 entri) membocorkan /graph/* dan /api/github/auth/pat, dan
+# memuat 6 placeholder path param yang tidak pernah match.
+
+
+def test_graph_endpoints_are_not_public():
+    """Seluruh isi graph tidak boleh terbaca tanpa token."""
+    for path in ("/graph/nodes", "/graph/edges", "/graph/summary"):
+        assert not auth.is_public_path(path), (
+            f"{path} mengekspos data graph tanpa token"
+        )
+
+
+def test_github_credential_endpoints_are_not_public():
+    """Endpoint yang menulis atau membacakan kredensial wajib bertoken."""
+    for path in (
+        "/api/github/auth/pat",
+        "/api/github/user",
+        "/api/github/callback",
+        "/api/github/repos",
+    ):
+        assert not auth.is_public_path(path), (
+            f"{path} tidak boleh bisa diakses tanpa token"
+        )
+
+
+def test_llm_provider_endpoints_are_not_public():
+    """Provider registry memuat base_url dan(models); tidak untuk publik."""
+    for path in (
+        "/api/llm/providers",
+        "/api/llm/providers/",
+        "/api/llm/providers/some-id",
+        "/api/llm/providers/some-id/models",
+    ):
+        assert not auth.is_public_path(path), f"{path} tidak boleh publik"
+
+
+def test_public_paths_have_no_route_placeholders():
+    """
+    Entri publik tidak boleh berisi placeholder FastAPI seperti {owner}.
+
+    is_public_path() menerima path konkret dari request, bukan template route.
+    Entri bertempat sedemikian tidak akan pernah cocok, jadi hanya memberi
+    rasa aman semu.
+    """
+    offenders = [p for p in auth.PUBLIC_PATHS if "{" in p or "}" in p]
+    assert not offenders, f"PUBLIC_PATHS masih punya placeholder: {offenders}"
+
+
+def test_is_public_path_normalizes_trailing_slash():
+    """FastAPI menerima /health dan /health/; keduanya dianggap sama."""
+    assert auth.is_public_path("/health")
+    assert auth.is_public_path("/health/")
+    assert auth.is_public_path("/docs/")
+
+
+def test_is_public_path_rejects_empty_and_unknown():
+    assert not auth.is_public_path("")
+    assert not auth.is_public_path("/")
+    assert not auth.is_public_path("/tidak/ada/path/ini")
+
+
+def test_extra_public_paths_env(monkeypatch):
+    """Tim tetap bisa menambah path lewat SYNAPSE_PUBLIC_PATHS."""
+    monkeypatch.setenv(
+        "SYNAPSE_PUBLIC_PATHS", "/internal/metric, /api/llm/providers ,"
+    )
+    assert auth.is_public_path("/internal/metric")
+    assert auth.is_public_path("/api/llm/providers")
+    assert not auth.is_public_path("/graph/nodes")
+
+    monkeypatch.delenv("SYNAPSE_PUBLIC_PATHS", raising=False)
+    assert not auth.is_public_path("/internal/metric")
