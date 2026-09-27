@@ -73,7 +73,7 @@ import json
 import uuid
 import sqlite3
 import shutil
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -85,6 +85,25 @@ from cortex import _emit  # pakai SSE bus milik Cortex
 def _db_path() -> str:
     """Selalu baca DB_PATH terbaru dari module - support test override."""
     return str(_database_module.DB_PATH)
+
+
+def _utcnow_iso() -> str:
+    """
+    Timestamp UTC dalam format ISO - pengganti API naive-UTC yang dihapus di
+    Python 3.12.
+
+    `tzinfo` sengaja dibuang agar hasil string-nya PERSIS sama dengan yang
+    lama ("2026-09-27T02:00:00", tanpa suffix "+00:00"). Ini penting karena
+    timestamp ini dibandingkan sebagai TEKS di SQL, bukan sebagai tipe
+    tanggal - lihat _check_conflict() yang memakai `created_at > ?`. Kalau
+    format berubah, perbandingan string itu diam-diam jadi salah.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
+
+def _utcnow_naive() -> datetime:
+    """UTC naive sebagai datetime - untuk perhitungan offset window."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # ---------------------------------------------------------------------------
 # ISSUE-46: status terminal operations
@@ -106,6 +125,24 @@ def _db_path() -> str:
 # menunggu verifikasi (guardian.py menulis 'verified' setelah
 # _verify_operation()), jadi masih boleh disettle.
 TERMINAL_STATUSES = frozenset({"verified", "rolled_back", "failed", "denied"})
+
+# BUG-09 FIX: status yang BOLEH diubah oleh approve_operation/deny_operation.
+#
+# Guard sebelumnya hanya menolak TERMINAL_STATUSES, sehingga 'executing' dan
+# 'executed_unverified' masih lolos. Rantai exploit yang diverifikasi:
+#   propose -> execute (status='executing') -> approve (status='approved')
+#          -> execute lagi (CAS Izinkan 'approved') = double execution.
+# Guard CAS di execute_operation tidak bisa menyelamatkan karena 'approved'
+# memang status yang diizinkannya.
+#
+# Jadi approvable harus jadi ALLOWLIST, bukan denylist terminal:
+#   pending  -> approve / deny   (jalur normal)
+#   approved -> deny             (revoque approval sebelum dieksekusi)
+#   approved -> approve          (idempoten)
+# Sisanya (executing, executed_unverified, verified, rolled_back, failed,
+# denied) tidak boleh disentuh approval karena operasinya sudah berjalan,
+# sudah dijalankan, atau sudah selesai.
+APPROVABLE_STATUSES = frozenset({"pending", "approved"})
 
 
 # ---------------------------------------------------------------------------
@@ -471,13 +508,37 @@ def _get_rule(tool_name: str) -> dict:
     return RULES[-1]
 
 
+def _effective_requires_approval(op) -> bool:
+    """
+    BUG-10 FIX: satu sumber kebenaran untuk 'apakah operasi ini butuh approval'.
+
+    Sebelumnya derive-nya diduplikasi di dua tempat dengan cara berbeda:
+      - execute_operation()  -> re-derive dari rule engine + kolom DB
+      - list_pending_approvals() -> HANYA baca kolom requires_approval
+    Kalau rule berubah setelah propose (mis. config diedit lalu restart), kolom
+    DB masih menyimpan nilai lama. Akibatnya operasi muncul requiring-approval
+    di execute tapi TIDAK pernah muncul di daftar pending: dead-end yang tidak
+    bisa di-approve dan tidak bisa di-execute.
+
+    Nowdef: rule engine adalah live truth, kolom DB hanya remembers bahwa
+    conflict pernah memaksa approval. Keduanya di-OR.
+    """
+    rule = _get_rule(op["tool_name"])
+    rule_requires_approval = bool(rule["require_approval"])
+    try:
+        db_requires_approval = int(op["requires_approval"] or 0) == 1
+    except (TypeError, ValueError):
+        db_requires_approval = bool(op["requires_approval"])
+    return rule_requires_approval or db_requires_approval
+
+
 def _check_conflict(conn: sqlite3.Connection, target_node_id: str) -> list[dict]:
     """
     Cek operasi lain yang menyentuh target_node_id dalam window terakhir.
     Hanya status aktif yang dihitung (sesuai SYNAPSE.md 4.5).
     """
     window_start = (
-        datetime.now(UTC) - timedelta(minutes=CONFLICT_WINDOW_MINUTES)
+        _utcnow_naive() - timedelta(minutes=CONFLICT_WINDOW_MINUTES)
     ).isoformat()
 
     rows = conn.execute(
@@ -547,7 +608,7 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
     if tool_name.startswith("db.run_migration"):
         # BUG-02 + BUG-03 FIX: gunakan db_path dari params, bukan DB_PATH global
         db_target = params.get("db_path", _db_path())
-        ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        ts = _utcnow_naive().strftime("%Y%m%dT%H%M%S")
         bak = f"{db_target}.bak.{ts}"
         try:
             src = sqlite3.connect(db_target)
@@ -568,7 +629,7 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
     if tool_name.startswith("config.write"):
         file_path = params.get("file_path", "")
         if file_path and Path(file_path).exists():
-            ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+            ts = _utcnow_naive().strftime("%Y%m%dT%H%M%S")
             bak = f"{file_path}.bak.{ts}"
             try:
                 shutil.copy2(file_path, bak)
@@ -580,7 +641,7 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
     if tool_name.startswith("file.delete"):
         file_path = params.get("file_path", "")
         if file_path and Path(file_path).exists():
-            ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+            ts = _utcnow_naive().strftime("%Y%m%dT%H%M%S")
             bak = f"{file_path}.bak.{ts}"
             try:
                 shutil.copy2(file_path, bak)
@@ -695,7 +756,7 @@ def _rollback_and_finalize(conn: sqlite3.Connection, operation_id: str,
         if mark_verified_at:
             conn2.execute(
                 "UPDATE operations SET status=?, verified_at=? WHERE id=?",
-                (new_status, datetime.now(UTC).isoformat(), operation_id),
+                (new_status, _utcnow_iso(), operation_id),
             )
         else:
             conn2.execute(
@@ -799,7 +860,7 @@ def propose_operation(tool_name: str, params: dict, target: str) -> dict:
             operation_id, tool_name, json.dumps(params), target_node_id,
             blast_radius, reversibility_class,
             1 if requires_approval else 0,
-            datetime.now(UTC).isoformat(),
+            _utcnow_iso(),
         ),
     )
 
@@ -887,11 +948,8 @@ def execute_operation(operation_id: str) -> dict:
     # Jika rule bilang require_approval=True -> WAJIB ada 'approved' di tabel approvals.
     # Selain itu, jika op di-force approved karena conflict saat propose (DB kolom=1 tapi rule=False),
     # kita tetap menghormati itu.
-    rule = _get_rule(op["tool_name"])
-    rule_requires_approval = rule["require_approval"]
-    db_requires_approval = int(op["requires_approval"])
-    # effective: True jika rule bilang wajib, ATAU jika conflict memaksanya saat propose
-    effective_requires_approval = rule_requires_approval or (db_requires_approval == 1)
+    # BUG-10 FIX: helper bersama, bukan derive ulang di tempat.
+    effective_requires_approval = _effective_requires_approval(op)
 
     approval_row = conn.execute(
         "SELECT decision FROM approvals WHERE operation_id = ?", (operation_id,)
@@ -926,7 +984,7 @@ def execute_operation(operation_id: str) -> dict:
         """UPDATE operations
            SET status='executing', executed_at=?
            WHERE id=? AND status IN ('pending', 'approved')""",
-        (datetime.now(UTC).isoformat(), operation_id),
+        (_utcnow_iso(), operation_id),
     )
     conn.commit()
 
@@ -1009,7 +1067,7 @@ def execute_operation(operation_id: str) -> dict:
 
     conn.execute(
         "UPDATE operations SET status='verified', verified_at=? WHERE id=?",
-        (datetime.now(UTC).isoformat(), operation_id),
+        (_utcnow_iso(), operation_id),
     )
     conn.commit()
 
@@ -1233,6 +1291,13 @@ def list_pending_approvals() -> dict:
     Sebelumnya WHERE status IN ('pending','approved') menyebabkan operasi yang
     sudah diapprove ikut tampil di pending list — membingungkan dan berpotensi
     double-approval dari UI.
+
+    BUG-10 FIX: filter "butuh approval" TIDAK lagi pakai kolom
+    operations.requires_approval, tapi helper yang sama dengan execute_operation
+    (_effective_requires_approval). Kolom DB cuma snapshot aturan saat propose,
+    jadi ia bisa basi kalau aturannya berubah. Kalau tidak disamakan di sini,
+    operasi bisa requiring-approval saat execute tapi tidak pernah muncul di
+    daftar ini — dead-end yang mustahil di-approve.
     """
     conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
@@ -1240,12 +1305,13 @@ def list_pending_approvals() -> dict:
         """SELECT o.*, a.decision as approval_decision
            FROM operations o
            LEFT JOIN approvals a ON a.operation_id = o.id
-           WHERE o.requires_approval = 1
-             AND o.status = 'pending'
+           WHERE o.status = 'pending'
            ORDER BY o.created_at DESC"""
     ).fetchall()
     conn.close()
-    return {"ok": True, "count": len(rows), "pending": [dict(r) for r in rows]}
+
+    pending = [dict(r) for r in rows if _effective_requires_approval(r)]
+    return {"ok": True, "count": len(pending), "pending": pending}
 
 
 # ---------------------------------------------------------------------------
@@ -1276,23 +1342,22 @@ def approve_operation(operation_id: str, decision: str, note: str = "") -> dict:
 
         new_status = "approved" if decision == "approved" else "denied"
 
-        # ISSUE-46 FIX: check DAN write dalam satu statement. Guard-nya
-        # bukan "baca status lalu tulis" (TOCTOU: dua request bisa sama-sama
-        # membaca status lama sebelum ada yang menulis), tapi kondisi status
-        # di WHERE sehingga hanya satu yang benar-benar bisa mengubah baris.
-        #
-        # Rantai exploit yang diverifikasi sebelum fix:
-        #   propose -> execute (verified) -> approve (approved) -> execute
-        # mengulang operasi yang sudah selesai dan membuatnya dieksekusi dua kali.
+        # BUG-09 FIX: guard pakai ALLOWLIST (APPROVABLE_STATUSES), bukan
+        # sekadar "bukan terminal". Listrik versioning:
+        #   - 'executing'              : operasi sedang berjalan, menimpanya
+        #                                 jadi 'approved' membuka celah re-execute
+        #                                 karena CAS execute mengizinkan 'approved'.
+        #   - 'executed_unverified'    : sudah dijalankan, approve lagi = replay.
+        #_denied_ tetap bisa muncul sebagai 'denied' setelah deny normal.
         cur = conn.execute(
-            "UPDATE operations SET status=? WHERE id=? AND status NOT IN "
-            f"({','.join('?' * len(TERMINAL_STATUSES))})",
-            (new_status, operation_id, *sorted(TERMINAL_STATUSES)),
+            "UPDATE operations SET status=? WHERE id=? AND status IN "
+            f"({','.join('?' * len(APPROVABLE_STATUSES))})",
+            (new_status, operation_id, *sorted(APPROVABLE_STATUSES)),
         )
 
         if cur.rowcount == 0:
-            # Baris tidak berubah: entah sudah terminal, atau request lain
-            # menang duluan. Baca status terbaru untuk pesan yang akurat.
+            # Baris tidak berubah: entah statusnya tidak approvable, atau
+            # request lain menang duluan. Baca status terbaru untuk pesan akurat.
             current = conn.execute(
                 "SELECT status FROM operations WHERE id = ?", (operation_id,)
             ).fetchone()
@@ -1301,11 +1366,11 @@ def approve_operation(operation_id: str, decision: str, note: str = "") -> dict:
             return {
                 "ok": False,
                 "error": (
-                    f"Operasi sudah berstatus terminal '{now}' "
-                    f"dan tidak bisa diubah lagi."
+                    f"Operasi berstatus '{now}' tidak bisa diubah statusnya "
+                    f"lewat approval (hanya 'pending'/'approved' yang boleh)."
                 ),
                 "status": now,
-                "terminal": True,
+                "terminal": now in TERMINAL_STATUSES,
             }
 
         conn.execute(
@@ -1315,7 +1380,7 @@ def approve_operation(operation_id: str, decision: str, note: str = "") -> dict:
                  SET decision=excluded.decision,
                      decided_at=excluded.decided_at,
                      note=excluded.note""",
-            (operation_id, decision, datetime.now(UTC).isoformat(), note),
+            (operation_id, decision, _utcnow_iso(), note),
         )
         conn.execute("COMMIT")
     except Exception:

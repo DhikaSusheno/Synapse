@@ -36,11 +36,13 @@ Docs    : http://localhost:8000/docs
 """
 import asyncio
 import json
-from typing import AsyncGenerator, Literal, Optional
+import os
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import sqlite3
 
@@ -49,16 +51,23 @@ import storage
 import engine
 import cortex
 import guardian
+import auth
+import settings as settings_store
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-from contextlib import asynccontextmanager
-
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
+async def lifespan(_app: FastAPI):
+    """
+    Migrasi dari decorator startup event yang sudah deprecated di FastAPI 0.109+.
+
+    Perilaku-nya sama persis: init_db() legacy, init_db() v2, set event loop
+    reference untuk _emit() yang thread-safe. Bedanya, lifespan di-charge
+    sebelum aplikasi mulai melayani request, jadi tidak ada jendela di mana
+    tabel v2 belum ada tapi endpoint sudah dipanggil.
+    """
     init_db()
     # Skema v2 (storage.py) -> file TERPISA synapse_v2.db, bukan synapse.db.
     # Tetap di-init di startup supaya tabel entities/relations/actions/decisions/
@@ -66,14 +75,13 @@ async def lifespan(app: FastAPI):
     # "no such table: entities" saat runtime.
     storage.init_db()
     # BUG-08 FIX: set event loop reference di cortex agar _emit() thread-safe
-    # (Guardian endpoint adalah sync, dipanggil dari threadpool — perlu call_soon_threadsafe)
+    # (Guardian endpoint adalah sync, dipanggil dari threadpool — perlu call_soon_threadsafe
     # BUG-E FIX: get_running_loop() adalah cara yang benar dalam async context (Python 3.7+)
     # get_event_loop() deprecated di Python 3.10+ dan error di Python 3.12+
     import asyncio
     cortex.set_event_loop(asyncio.get_running_loop())
     print("[Synapse] Server ready. Visit http://localhost:8000/docs")
     yield
-    # Shutdown (if needed)
 
 
 app = FastAPI(
@@ -83,12 +91,43 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# BUG-11 FIX: CORS tidak lagi memakai wildcard origin.
+# Wildcard membuat halaman web mana pun bisa membaca respons API kita
+# dan mengirim request bertoken. Origin sekarang
+# dibatasi ke daftar eksplisit; set lewat env SYNAPSE_ALLOWED_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=auth.allowed_origins(),
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", auth.TOKEN_HEADER, "Authorization"],
+    allow_credentials=False,
+    max_age=600,
 )
+
+# BUG-11 FIX: gerbang token untuk semua route yang butuh proteksi.
+# Exempt: /health, /docs, /redoc, /openapi.json (publik) dan preflight OPTIONS
+# (preflight memang tidak boleh membawa header kustom).
+@app.middleware("http")
+async def enforce_api_token(request: Request, call_next):
+    if request.method == "OPTIONS" or auth.is_public_path(request.url.path):
+        return await call_next(request)
+    token = auth._extract_token(request)
+    if not auth.verify_token(token):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "detail": (
+                    "Token API hilang atau tidak valid. Kirim header "
+                    f"'{auth.TOKEN_HEADER}: <token>' atau "
+                    "'Authorization: Bearer <token>'."
+                )
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await call_next(request)
+
+
+# Handler startup sudah dipindah ke lifespan() di atas.
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +207,93 @@ def review_artifact(req: ReviewArtifactRequest):
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error"))
     return result
+
+
+# ---------------------------------------------------------------------------
+# SETTINGS — persistensi platform + browse workspace
+# ---------------------------------------------------------------------------
+
+class SettingsPatch(BaseModel):
+    platform_name: Optional[str] = None
+    environment: Optional[str] = None
+    log_level: Optional[str] = None
+    dev_mode: Optional[bool] = None
+    workspace_path: Optional[str] = None
+    default_branch: Optional[str] = None
+    auto_migrate: Optional[bool] = None
+    conflict_detect: Optional[bool] = None
+    sse_enabled: Optional[bool] = None
+    approval_mode: Optional[str] = None
+    conflict_auto_deny: Optional[bool] = None
+
+
+@app.get("/settings", tags=["Settings"])
+def get_settings():
+    return {
+        "settings": settings_store.load(),
+        "defaults": settings_store.DEFAULTS,
+        "storage": _storage_overview(),
+    }
+
+
+@app.post("/settings", tags=["Settings"])
+def update_settings(patch: SettingsPatch):
+    payload = {k: v for k, v in patch.model_dump().items() if v is not None}
+    if not payload:
+        raise HTTPException(status_code=400, detail="Tidak ada perubahan untuk disimpan")
+    return {
+        "ok": True,
+        "settings": settings_store.save(payload),
+        "storage": _storage_overview(),
+    }
+
+
+@app.post("/settings/reset", tags=["Settings"])
+def reset_settings():
+    return {
+        "ok": True,
+        "settings": settings_store.reset(),
+        "storage": _storage_overview(),
+    }
+
+
+@app.get("/browse", tags=["Settings"])
+def browse(path: str = Query("", description="Path relatif terhadap repo root")):
+    try:
+        return settings_store.browse(path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except NotADirectoryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+
+def _storage_overview() -> dict:
+    tables: Dict[str, List[str]] = {}
+    files: List[dict] = []
+    for name, path in (("legacy", DB_PATH), ("v2", getattr(storage, "DB_PATH", None))):
+        if not path or not os.path.exists(path):
+            continue
+        files.append(
+            {
+                "label": name,
+                "file": os.path.basename(path),
+                "size_bytes": os.path.getsize(path),
+            }
+        )
+        try:
+            conn = sqlite3.connect(path)
+            tables[name] = sorted(
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                )
+            )
+            conn.close()
+        except sqlite3.Error:
+            tables[name] = []
+    return {"files": files, "tables": tables}
 
 
 # ---------------------------------------------------------------------------
