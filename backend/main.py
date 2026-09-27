@@ -846,6 +846,7 @@ class LLMProviderCreate(BaseModel):
     max_tokens: int = 4096
     supports_tools: bool = True
     supports_vision: bool = False
+    enabled: bool = True
 
 class LLMProviderUpdate(BaseModel):
     name: str | None = None
@@ -1132,26 +1133,25 @@ class RefactorRequest(BaseModel):
 @app.post("/api/llm/explain", tags=["LLM"])
 async def llm_explain(req: ExplainRequest):
     """Explain a topic using LLM with graph context."""
-    import sqlite3
     import json
-    from datetime import datetime
-    # Get graph context for topic
     context = engine.ask_about(req.topic)
     if not context.get("ok"):
         return context
-    
-    # Build prompt with graph context
-    system_prompt = f"""You are a senior software engineer explaining code from a knowledge graph.
-Topic: {req.topic}
-Graph Context: {json.dumps(context, indent=2)}
-Provide: definition -> mental model -> example -> complexity note -> how to use -> related nodes"""
-    
-    # Use LLM chat
-    from main import llm_chat  # import locally to avoid circular
+    system_prompt = (
+        f"You are a senior software engineer explaining code from a knowledge graph.\n"
+        f"Topic: {req.topic}\n"
+        f"Graph Context: {json.dumps(context, indent=2)}\n"
+        f"Provide: definition -> mental model -> example -> complexity note -> how to use -> related nodes"
+    )
+    # BUG-NEW-6 FIX: tidak boleh `from main import llm_chat` (circular import).
+    # Panggil langsung — kita sudah berada di dalam module main.
     return await llm_chat(ChatCompletionRequest(
         provider_id=req.provider_id,
-        model=req.model,
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Explain: {req.topic}"}],
+        model=req.model or "",
+        messages=[
+            ChatMessage(role="system", content=system_prompt),
+            ChatMessage(role="user", content=f"Explain: {req.topic}"),
+        ],
         temperature=0.3,
         max_tokens=2048,
     ))
@@ -1159,22 +1159,22 @@ Provide: definition -> mental model -> example -> complexity note -> how to use 
 @app.post("/api/llm/review", tags=["LLM"])
 async def llm_review(req: ReviewRequest):
     """Review artifact using LLM with graph context."""
-    import sqlite3
     import json
-    # Get graph context
     context = engine.review_change(req.path_or_diff)
-    
-    system_prompt = f"""You are a senior code reviewer. Review the artifact using the knowledge graph.
-Artifact: {req.path_or_diff}
-Graph Context: {json.dumps(context, indent=2)}
-Score: completeness, clarity, correctness_vs_spec, risk (0-10 each)
-Verdict: pass | needs_work | block"""
-    
-    from main import llm_chat
+    system_prompt = (
+        f"You are a senior code reviewer. Review the artifact using the knowledge graph.\n"
+        f"Artifact: {req.path_or_diff}\n"
+        f"Graph Context: {json.dumps(context, indent=2)}\n"
+        f"Score: completeness, clarity, correctness_vs_spec, risk (0-10 each)\n"
+        f"Verdict: pass | needs_work | block"
+    )
     return await llm_chat(ChatCompletionRequest(
         provider_id=req.provider_id,
-        model=req.model,
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": "Review this artifact"}],
+        model=req.model or "",
+        messages=[
+            ChatMessage(role="system", content=system_prompt),
+            ChatMessage(role="user", content="Review this artifact"),
+        ],
         temperature=0.2,
         max_tokens=2048,
     ))
@@ -1182,22 +1182,23 @@ Verdict: pass | needs_work | block"""
 @app.post("/api/llm/refactor", tags=["LLM"])
 async def llm_refactor(req: RefactorRequest):
     """Suggest refactor using LLM with graph context."""
-    import sqlite3
     import json
     context = engine.propose_refactor(req.node_name)
     if not context.get("ok"):
         return context
-    
-    system_prompt = f"""You are a senior architect. Suggest refactors for this entity.
-Node: {req.node_name}
-Graph Context: {json.dumps(context, indent=2)}
-Provide: type (split_file_or_function/god_object/extract_method/etc), priority, message, example"""
-    
-    from main import llm_chat
+    system_prompt = (
+        f"You are a senior architect. Suggest refactors for this entity.\n"
+        f"Node: {req.node_name}\n"
+        f"Graph Context: {json.dumps(context, indent=2)}\n"
+        f"Provide: type (split_file_or_function/god_object/extract_method/etc), priority, message, example"
+    )
     return await llm_chat(ChatCompletionRequest(
         provider_id=req.provider_id,
-        model=req.model,
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Suggest refactors for {req.node_name}"}],
+        model=req.model or "",
+        messages=[
+            ChatMessage(role="system", content=system_prompt),
+            ChatMessage(role="user", content=f"Suggest refactors for {req.node_name}"),
+        ],
         temperature=0.3,
         max_tokens=2048,
     ))
@@ -1259,6 +1260,7 @@ def upsert_project_llm_config(project_id: str, req: ProjectLLMConfigRequest):
 class RAGIngestRequest(BaseModel):
     provider_id: str
     model: str | None = None
+    api_key: str | None = None   # BUG-NEW-4 FIX: field hilang, dipakai di baris 1288
     files: list[str]  # file paths or contents
     chunk_size: int = 1000
     chunk_overlap: int = 200
@@ -1322,6 +1324,7 @@ async def rag_ingest(req: RAGIngestRequest):
                 embeddings.append({"chunk": chunk, "embedding": resp.json()["data"][0]["embedding"]})
     
     # Store in DB (simple approach - store in rag_chunks table)
+    from datetime import datetime as _dt  # BUG-NEW-5 FIX: datetime tidak diimport di scope ini
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""CREATE TABLE IF NOT EXISTS rag_chunks (
         id TEXT PRIMARY KEY,
@@ -1334,7 +1337,7 @@ async def rag_ingest(req: RAGIngestRequest):
         chunk_id = hashlib.md5(emb["chunk"].encode()).hexdigest()
         conn.execute(
             "INSERT OR REPLACE INTO rag_chunks (id, chunk, embedding, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-            (chunk_id, emb["chunk"], json.dumps(emb["embedding"]), json.dumps({"provider": req.provider_id, "model": model}), datetime.utcnow().isoformat())
+            (chunk_id, emb["chunk"], json.dumps(emb["embedding"]), json.dumps({"provider": req.provider_id, "model": model}), _dt.utcnow().isoformat())
         )
     conn.commit()
     conn.close()
