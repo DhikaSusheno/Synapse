@@ -61,28 +61,14 @@ API_TOKEN: str = _ENV_TOKEN if _ENV_TOKEN else secrets.token_urlsafe(32)
 if not _ENV_TOKEN:
     _LOG.warning(
         "SYNAPSE_API_TOKEN tidak disetel - backend membuat token acak. "
-        "Token untukdevelopment ini: %s",
+        "Token untuk development ini: %s",
         API_TOKEN,
     )
-else:
-    if len(API_TOKEN) < 16:
-        _LOG.warning(
-            "SYNAPSE_API_TOKEN terlalu pendek (<16 karakter) - disarankan pakai "
-            "token acak yang panjang."
-        )
-
-if not _ENV_TOKEN:
+elif len(API_TOKEN) < 16:
     _LOG.warning(
-        "SYNAPSE_API_TOKEN tidak disetel - backend membuat token acak. "
-        "Token untukdevelopment ini: %s",
-        API_TOKEN,
+        "SYNAPSE_API_TOKEN terlalu pendek (<16 karakter) - disarankan pakai "
+        "token acak yang panjang."
     )
-else:
-    if len(API_TOKEN) < 16:
-        _LOG.warning(
-            "SYNAPSE_API_TOKEN terlalu pendek (<16 karakter) - disarankan pakai "
-            "token acak yang panjang."
-        )
 
 # Fernet key untuk encrypt/decrypt token (simpan di env FERNET_KEY)
 _FERNET_KEY = os.environ.get("FERNET_KEY", "").strip()
