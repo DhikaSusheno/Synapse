@@ -47,12 +47,64 @@ from pydantic import BaseModel
 import sqlite3
 
 from database import init_db, DB_PATH
+from database import BUSY_TIMEOUT_MS
 import storage
 import engine
 import cortex
 import guardian
 import auth
 import settings as settings_store
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """
+    Set journal_mode=WAL kalau belum, dan telenkan "database is locked".
+
+    PRAGMA journal_mode=WAL butuh lock eksklusif sesaat, dan lock eksklusif
+    tidak dihormati busy_timeout - SQLite mengembalikan SQLITE_BUSY seketika.
+    Mode WAL sendiri persisten di dalam file DB, jadi setelah pertama kali
+    berhasil, pemanggilan berikutnya hanya membaca "wal" dan tidak butuh lock
+    eksklusif. Kegagalan yang tersisa cuma pada koneksi pertama ke file baru
+    ketika ada writer lain yang sedang aktif; DB tetap benar, hanya tanpa
+    concurrent read yang menjadi keunggulan WAL.
+    """
+    try:
+        if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+            conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
+
+
+def _db_conn(path=None, **kwargs) -> sqlite3.Connection:
+    """
+    sqlite3.connect() dengan busy_timeout + WAL + foreign_keys aktif.
+
+    Semua koneksi DB v1 di main.py lewat sini. Alasannya konkret: default
+    sqlite3 punya busy_timeout=0, jadi begitu ada writer lain yang sedang
+    commit, koneksi ini langsung melempar "database is locked". Di path ingest
+    dan approve-operation itu berarti request gagal padahal DB-nya sehat -
+    dan karena itu sering muncul sebagai "bug acak" yang sulit direproduksi.
+
+    Sengaja membaca DB_PATH global modul INI, bukan database.DB_PATH, karena
+    test meng-override main.DB_PATH (backend/tests/test_issue_regressions.py).
+    Kalau memanggil database.connect(), override itu tidak ikut terbaca dan
+    test ikut gagal. kwargs diteruskan ke sqlite3.connect.
+
+    PRAGMA foreign_keys=ON tidak disetel di sini: main.py membuka DB ini hanya
+    untuk SELECT pada helper _load_provider_row, jadi tidak ada INSERT yang
+    bisa melanggar FK, dan PRAGMA yang tak terpakai hanya menambah pekerjaan
+    di setiap koneksi.
+    """
+    conn = sqlite3.connect(
+        str(path if path is not None else DB_PATH),
+        timeout=BUSY_TIMEOUT_MS / 1000.0,
+        **kwargs,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    _enable_wal(conn)
+    return conn
+
 
 # ---------------------------------------------------------------------------
 # Batas ukuran ingest
@@ -292,7 +344,7 @@ def _storage_overview() -> dict:
             }
         )
         try:
-            conn = sqlite3.connect(path)
+            conn = _db_conn(path)
             tables[name] = sorted(
                 row[0]
                 for row in conn.execute(
@@ -493,7 +545,7 @@ def list_operations(
     Dengan Literal, FastAPI mengembalikan 422 + daftar nilai yang diizinkan,
     dan enum-nya ikut muncul di OpenAPI docs.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.row_factory = sqlite3.Row
     if status:
         rows = conn.execute(
@@ -578,6 +630,20 @@ async def stream_events():
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Timeout panggilan GitHub
+# ---------------------------------------------------------------------------
+# Semua endpoint GitHub pakai requests (sinkron) dan berjalan sebagai `def`,
+# jadi dieksekusi di threadpool anyio. Tanpa timeout, satu koneksi yang
+# di-blackhole (proxy kantor, DNS menggantung, insiden GitHub) menahan thread
+# selamanya. Default anyio cuma 40 thread, jadi 40 request seperti itu sudah
+#enough untuk membuat seluruh backend tidak merespons - termasuk /health.
+#
+# Dipisah connect/read karena OAuth token exchange boleh lebih lambat dari
+# GET biasa.
+GITHUB_TIMEOUT = (10, 30)   # (connect, read) dalam detik
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +734,7 @@ def github_callback(code: str, state: str = "", redirect_uri: str = "http://loca
             "redirect_uri": redirect_uri,
         },
         headers={"Accept": "application/json"},
+        timeout=GITHUB_TIMEOUT,
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=400, detail=f"OAuth failed: {resp.text}")
@@ -681,6 +748,7 @@ def github_callback(code: str, state: str = "", redirect_uri: str = "http://loca
     user_resp = requests.get(
         "https://api.github.com/user",
         headers={"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"},
+        timeout=GITHUB_TIMEOUT,
     )
     if user_resp.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to fetch user info")
@@ -691,7 +759,7 @@ def github_callback(code: str, state: str = "", redirect_uri: str = "http://loca
     import sqlite3
     from datetime import datetime
     from auth import encrypt_token
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.execute(
         """INSERT OR REPLACE INTO github_connections 
            (id, type, access_token, scope, user_login, user_avatar, updated_at)
@@ -716,6 +784,7 @@ def github_pat(req: GitHubPATRequest):
     resp = requests.get(
         "https://api.github.com/user",
         headers={"Authorization": f"Bearer {req.pat}", "Accept": "application/vnd.github+json"},
+        timeout=GITHUB_TIMEOUT,
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=401, detail="Invalid PAT")
@@ -723,7 +792,7 @@ def github_pat(req: GitHubPATRequest):
     user = resp.json()
     scopes = req.scopes
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     from auth import encrypt_token
     conn.execute(
         """INSERT OR REPLACE INTO github_connections 
@@ -742,7 +811,7 @@ def github_user():
     """Get current authenticated GitHub user."""
     import sqlite3
     from auth import decrypt_token
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
@@ -755,6 +824,7 @@ def github_user():
     resp = requests.get(
         "https://api.github.com/user",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=GITHUB_TIMEOUT,
     )
     if resp.status_code != 200:
         return {"ok": False, "connected": False, "error": "Token expired or invalid"}
@@ -767,7 +837,7 @@ def github_repos(per_page: int = 100, page: int = 1):
     from auth import decrypt_token
     import requests
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
@@ -781,6 +851,7 @@ def github_repos(per_page: int = 100, page: int = 1):
     resp = requests.get(
         f"https://api.github.com/user/repos?per_page={per_page}&page={page}&sort=updated",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=GITHUB_TIMEOUT,
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch repos")
@@ -793,7 +864,7 @@ def github_repo_tree(owner: str, repo: str, branch: str = "main", recursive: boo
     from auth import decrypt_token
     import requests
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
@@ -808,6 +879,7 @@ def github_repo_tree(owner: str, repo: str, branch: str = "main", recursive: boo
     resp = requests.get(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=GITHUB_TIMEOUT,
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch tree: {resp.text}")
@@ -820,7 +892,7 @@ def github_file_content(owner: str, repo: str, path: str, branch: str = "main"):
     from auth import decrypt_token
     import requests
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
@@ -835,6 +907,7 @@ def github_file_content(owner: str, repo: str, path: str, branch: str = "main"):
     resp = requests.get(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=GITHUB_TIMEOUT,
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch file: {resp.text}")
@@ -873,7 +946,7 @@ class LLMProviderUpdate(BaseModel):
 def list_llm_providers():
     """List all configured LLM providers."""
     import sqlite3
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT id, name, type, base_url, models, default_model, max_tokens, supports_tools, supports_vision, enabled, created_at, updated_at FROM llm_providers ORDER BY created_at"
@@ -906,7 +979,7 @@ def create_llm_provider(req: LLMProviderCreate):
     from auth import encrypt_token
     from datetime import datetime
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     provider_id = f"{req.type}:{req.name}"
     try:
         conn.execute(
@@ -937,7 +1010,7 @@ def update_llm_provider(provider_id: str, req: LLMProviderUpdate):
     from auth import encrypt_token
     from datetime import datetime
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.row_factory = sqlite3.Row
     existing = conn.execute("SELECT * FROM llm_providers WHERE id = ?", (provider_id,)).fetchone()
     if not existing:
@@ -991,7 +1064,7 @@ def update_llm_provider(provider_id: str, req: LLMProviderUpdate):
 def delete_llm_provider(provider_id: str):
     """Delete a custom LLM provider (built-in providers cannot be deleted)."""
     import sqlite3
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.row_factory = sqlite3.Row
     existing = conn.execute("SELECT * FROM llm_providers WHERE id = ?", (provider_id,)).fetchone()
     if not existing:
@@ -1010,7 +1083,7 @@ def delete_llm_provider(provider_id: str):
 def list_provider_models(provider_id: str):
     """List available models for a provider."""
     import sqlite3
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT models, default_model FROM llm_providers WHERE id = ?", (provider_id,)).fetchone()
     conn.close()
@@ -1041,6 +1114,30 @@ class ChatCompletionRequest(BaseModel):
     tools: list[dict] | None = None
     tool_choice: str | None = None
 
+
+def _load_provider_row(provider_id: str):
+    """
+    Baca satu baris llm_providers. Sengaja sinkron, SELALU dipanggil lewat
+    asyncio.to_thread() dari dalam async def.
+
+    Kenapa harus di-thread: sqlite3 itu blocking. dipanggil langsung di dalam
+    `async def`, dia membekukan event loop FastAPI, dan karena hanya ada satu
+    thread event loop, /health ikut mati. Terukur: 500 baris sqlite = 2,7 detik
+    freeze, 2.000 baris = 11,3 detik, sementara /health yang tidak menyentuh
+    SQLite sama sekali tidak responsif.
+    """
+    import sqlite3
+
+    conn = _db_conn(DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT * FROM llm_providers WHERE id = ? AND enabled = 1", (provider_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+
 @app.post("/api/llm/chat", tags=["LLM"])
 async def llm_chat(req: ChatCompletionRequest):
     """Chat completion with LLM provider."""
@@ -1049,11 +1146,9 @@ async def llm_chat(req: ChatCompletionRequest):
     import asyncio
     import httpx
     from auth import decrypt_token
-    
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    provider = conn.execute("SELECT * FROM llm_providers WHERE id = ? AND enabled = 1", (req.provider_id,)).fetchone()
-    conn.close()
+
+    # sqlite3 = blocking -> lewat threadpool, bukan langsung di event loop.
+    provider = await asyncio.to_thread(_load_provider_row, req.provider_id)
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found or disabled")
     
@@ -1143,7 +1238,9 @@ class RefactorRequest(BaseModel):
 async def llm_explain(req: ExplainRequest):
     """Explain a topic using LLM with graph context."""
     import json
-    context = engine.ask_about(req.topic)
+    import asyncio
+    # engine.ask_about() query SQLite sinkron -> to_thread.
+    context = await asyncio.to_thread(engine.ask_about, req.topic)
     if not context.get("ok"):
         return context
     system_prompt = (
@@ -1169,7 +1266,9 @@ async def llm_explain(req: ExplainRequest):
 async def llm_review(req: ReviewRequest):
     """Review artifact using LLM with graph context."""
     import json
-    context = engine.review_change(req.path_or_diff)
+    import asyncio
+    # engine.review_change() baca file + query SQLite -> to_thread.
+    context = await asyncio.to_thread(engine.review_change, req.path_or_diff)
     system_prompt = (
         f"You are a senior code reviewer. Review the artifact using the knowledge graph.\n"
         f"Artifact: {req.path_or_diff}\n"
@@ -1192,7 +1291,9 @@ async def llm_review(req: ReviewRequest):
 async def llm_refactor(req: RefactorRequest):
     """Suggest refactor using LLM with graph context."""
     import json
-    context = engine.propose_refactor(req.node_name)
+    import asyncio
+    # engine.propose_refactor() query SQLite sinkron -> to_thread.
+    context = await asyncio.to_thread(engine.propose_refactor, req.node_name)
     if not context.get("ok"):
         return context
     system_prompt = (
@@ -1231,7 +1332,7 @@ class ProjectLLMConfigRequest(BaseModel):
 def get_project_llm_config(project_id: str):
     """Get LLM configuration for a project."""
     import sqlite3
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT * FROM project_llm_configs WHERE project_id = ?", (project_id,)
@@ -1248,7 +1349,7 @@ def upsert_project_llm_config(project_id: str, req: ProjectLLMConfigRequest):
     import json
     from datetime import datetime
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_conn(DB_PATH)
     conn.execute(
         """INSERT OR REPLACE INTO project_llm_configs
            (project_id, provider_id, model, temperature, max_tokens, system_prompt, rag_enabled, rag_top_k, updated_at)
@@ -1347,46 +1448,107 @@ def _resolve_ingest_entry(entry: str) -> str:
     return content
 
 
+def _chunk_texts(texts: list[str], chunk_size: int, chunk_overlap: int) -> list[str]:
+    """
+    Potong beberapa teks menjadi potongan overlap. SINKRON, wajib via to_thread.
+
+    Perilaku sengaja dipertahankan persis seperti loop inline yang
+    menggantikannya, termasuk `chunk_overlap // 50` yang terlihat aneh -
+    mengubahnya akan mengubah batas chunk dan karena itu mengubah fingerprint
+    md5 yang dipakai sebagai PRIMARY KEY rag_chunks. Itu keputusan sendiri,
+    bukan bagian dari perbaikan event loop.
+    """
+    chunks: list[str] = []
+    for content in texts:
+        lines = content.split('\n')
+        chunk: list[str] = []
+        for line in lines:
+            chunk.append(line)
+            if len('\n'.join(chunk)) >= chunk_size:
+                chunks.append('\n'.join(chunk))
+                overlap = chunk[-chunk_overlap // 50:] if chunk_overlap else []
+                chunk = overlap
+        if chunk:
+            chunks.append('\n'.join(chunk))
+    return chunks
+
+
+def _store_rag_chunks(embeddings: list[dict], provider_id: str, model: str) -> int:
+    """
+    Tulis embedding ke rag_chunks. SINKRON, wajib via to_thread.
+
+    Satu transaksi untuk semua baris, bukan commit per baris. Versi lama
+    melakukan conn.execute + conn.commit() di dalam loop - itu 1.000 commit
+    untuk 1.000 chunk, dan masing-masing commit Blogs file lock, jadi ada
+    jendela di mana writer lain Transiently gagal dengan
+    "database is locked".
+    """
+    import hashlib
+    import json
+    import sqlite3
+
+    if not embeddings:
+        return 0
+
+    conn = _db_conn(DB_PATH)
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS rag_chunks (
+            id TEXT PRIMARY KEY,
+            chunk TEXT NOT NULL,
+            embedding TEXT NOT NULL,
+            metadata TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        rows = [
+            (
+                hashlib.md5(emb["chunk"].encode()).hexdigest(),
+                emb["chunk"],
+                json.dumps(emb["embedding"]),
+                json.dumps({"provider": provider_id, "model": model}),
+            )
+            for emb in embeddings
+        ]
+        conn.executemany(
+            "INSERT OR REPLACE INTO rag_chunks (id, chunk, embedding, metadata, created_at)"
+            " VALUES (?, ?, ?, ?, datetime('now'))",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(embeddings)
+
+
 @app.post("/api/rag/ingest", tags=["RAG"])
 async def rag_ingest(req: RAGIngestRequest):
     """Ingest files into RAG vector store."""
     import sqlite3
     import json
     import hashlib
+    import asyncio
     import httpx
     from auth import decrypt_token
 
     # Validasi SELURUH entri lebih dulu, sebelum query DB, decrypt_token, atau
     # panggilan jaringan apa pun. Kalau validasi dilakukan setelahnya,
     # request berbahaya bisa lolos, atau pun tertutup 404 "Provider not found"
-    # sehingga penolakan aslinya tidak pernah terlihat.
-    resolved = [_resolve_ingest_entry(entry) for entry in req.files]
+    # sehingga penolakan aslinya tidak pernah terlihat. _resolve_ingest_entry()
+    # menyentuh disk, jadi ikut di-thread.
+    resolved = await asyncio.to_thread(
+        lambda: [_resolve_ingest_entry(entry) for entry in req.files]
+    )
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    provider = conn.execute("SELECT * FROM llm_providers WHERE id = ? AND enabled = 1", (req.provider_id,)).fetchone()
-    conn.close()
+    # sqlite3 blocking -> to_thread.
+    provider = await asyncio.to_thread(_load_provider_row, req.provider_id)
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found or disabled")
-    
+
     api_key = decrypt_token(req.api_key) if req.api_key else None
     model = req.model or "text-embedding-3-small"
-    
-    # Generate embeddings
-    chunks = []
-    for content in resolved:
-        lines = content.split('\n')
-        chunk = []
-        for line in lines:
-            chunk.append(line)
-            if len('\n'.join(chunk)) >= req.chunk_size:
-                chunks.append('\n'.join(chunk))
-                # overlap
-                overlap = chunk[-req.chunk_overlap//50:] if req.chunk_overlap else []
-                chunk = overlap
-        if chunk:
-            chunks.append('\n'.join(chunk))
-    
+
+    # Chunking murni CPU + join string, blocking -> to_thread.
+    chunks = await asyncio.to_thread(_chunk_texts, resolved, req.chunk_size, req.chunk_overlap)
+
     # Generate embeddings
     embeddings = []
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1398,26 +1560,12 @@ async def rag_ingest(req: RAGIngestRequest):
             if resp.status_code == 200:
                 embeddings.append({"chunk": chunk, "embedding": resp.json()["data"][0]["embedding"]})
     
-    # Store in DB (simple approach - store in rag_chunks table)
-    from datetime import datetime as _dt  # BUG-NEW-5 FIX: datetime tidak diimport di scope ini
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS rag_chunks (
-        id TEXT PRIMARY KEY,
-        chunk TEXT NOT NULL,
-        embedding TEXT NOT NULL,  -- JSON array
-        metadata TEXT,  -- JSON
-        created_at TEXT DEFAULT (datetime('now'))
-    )""")
-    for emb in embeddings:
-        chunk_id = hashlib.md5(emb["chunk"].encode()).hexdigest()
-        conn.execute(
-            "INSERT OR REPLACE INTO rag_chunks (id, chunk, embedding, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-            (chunk_id, emb["chunk"], json.dumps(emb["embedding"]), json.dumps({"provider": req.provider_id, "model": model}), guardian._utcnow_iso())
-        )
-    conn.commit()
-    conn.close()
-    
-    return {"ok": True, "chunks": len(embeddings)}
+    # Store in DB - blocking -> to_thread. Satu transaksi, bukan commit per baris.
+    written = await asyncio.to_thread(
+        _store_rag_chunks, embeddings, req.provider_id, model
+    )
+
+    return {"ok": True, "chunks": written}
 
 @app.post("/api/rag/search", tags=["RAG"])
 async def rag_search(req: RAGSearchRequest):
@@ -1425,21 +1573,20 @@ async def rag_search(req: RAGSearchRequest):
     import sqlite3
     import json
     import numpy as np
+    import asyncio
     import httpx
     from auth import decrypt_token
-    
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    provider = conn.execute("SELECT * FROM llm_providers WHERE id = ? AND enabled = 1", (req.provider_id,)).fetchone()
-    conn.close()
+
+    # sqlite3 blocking -> to_thread.
+    provider = await asyncio.to_thread(_load_provider_row, req.provider_id)
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found or disabled")
-    
+
     # Generate query embedding
     model = req.model or "text-embedding-3-small"
     api_key = decrypt_token(provider["api_key"])
     base_url = provider["base_url"] or "https://api.openai.com/v1"
-    
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             f"{provider['base_url'] or 'https://api.openai.com/v1'}/embeddings",
@@ -1450,16 +1597,32 @@ async def rag_search(req: RAGSearchRequest):
         if resp.status_code != 200:
             raise HTTPException(status_code=500, detail="Failed to generate query embedding")
         query_embedding = np.array(resp.json()["data"][0]["embedding"])
-    
-    # Search in DB
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT id, chunk, embedding, metadata FROM rag_chunks").fetchall()
-    conn.close()
-    
+
+    # Baca DB + hitung cosine similarity: blocking (I/O + numpy di atas SEMUA
+    # baris) -> to_thread, supaya /health tetap responsif selama pencarian.
+    return await asyncio.to_thread(
+        _rag_search_sync, query_embedding, req.top_k
+    )
+
+
+def _rag_search_sync(query_embedding, top_k: int) -> dict:
+    """Bagian sinkron dari rag_search. Selalu dipanggil via asyncio.to_thread."""
+    import json
+    import sqlite3
+    import numpy as np
+
+    conn = _db_conn(DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, chunk, embedding, metadata FROM rag_chunks"
+        ).fetchall()
+    finally:
+        conn.close()
+
     if not rows:
         return {"ok": True, "results": []}
-    
+
     # Compute cosine similarity
     results = []
     for row in rows:
@@ -1472,9 +1635,9 @@ async def rag_search(req: RAGSearchRequest):
                 "similarity": float(sim),
                 "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
             })
-    
+
     results.sort(key=lambda x: x["similarity"], reverse=True)
-    return {"ok": True, "results": results[:req.top_k]}
+    return {"ok": True, "results": results[:top_k]}
 
 
 # ---------------------------------------------------------------------------

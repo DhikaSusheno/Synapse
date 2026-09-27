@@ -28,12 +28,76 @@ import uuid
 from pathlib import Path
 
 # Default punya file sendiri, sengaja tidak "synapse.db" (dipakai database.py).
-DB_PATH = Path(os.environ.get("SYNAPSE_DB_PATH", "synapse_v2.db"))
+#
+# Path di-anchor ke lokasi file ini, bukan ke CWD proses. Sebelumnya
+# `Path(..., "synapse_v2.db")` relatif, sehingga DB v2 dibuat di tempat server
+# dijalankan: menjalankan pytest dari repo root vs dari backend/ membuka dua
+# file kosong yang berbeda. Diverifikasi dengan init_db() dari dua CWD.
+# Env override tetap SYNAPSE_DB_PATH (v2 saja; v1 punya SYNAPSE_DB_PATH_V1).
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = Path(
+    os.environ.get("SYNAPSE_DB_PATH", "").strip()
+    or os.path.join(_BASE_DIR, "synapse_v2.db")
+)
+
+# Berapa lama menunggu lock writer lain sebelum menyerah.
+#
+# Tanpa ini sqlite3.connect() punya busy_timeout = 0, artinya error
+# "database is locked" langsung dilempar begitu lock tidak tersedia. Ini yang
+# membuat 15 dari 16 thread gagal dalam uji concurrency upsert_entity(). 15
+# detik memberi jeda wajar untuk writer yang sedang commit, dan tetap di bawah
+# batas keep-alive normal sehingga tidak menggantung request.
+BUSY_TIMEOUT_MS = 15_000
 
 # Koneksi per-thread: FastAPI menjalankan sync endpoint di threadpool, dan
 # sqlite3.Connection tidak aman dipakai lintas thread. Setiap thread punya
 # koneksinya sendiri; _local.conn dibuat lazily pada pemakaian pertama.
 _local = threading.local()
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """
+    Set journal_mode=WAL kalau belum, dan telenkan "database is locked".
+
+    PRAGMA journal_mode=WAL butuh lock eksklusif sesaat, dan lock eksklusif
+    tidak dihormati busy_timeout - SQLite mengembalikan SQLITE_BUSY seketika.
+    Mode WAL sendiri persisten di dalam file DB, jadi setelah pertama kali
+    berhasil, pemanggilan berikutnya hanya membaca "wal" dan tidak butuh lock
+    eksklusif. Kegagalan yang tersisa cuma pada koneksi pertama ke file baru
+    ketika ada writer lain yang sedang aktif; DB tetap benar, hanya tanpa
+    concurrent read yang menjadi keunggulan WAL.
+    """
+    try:
+        if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+            conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
+
+
+def connect(path=None, **kwargs) -> sqlite3.Connection:
+    """
+    sqlite3.connect() dengan busy_timeout + WAL + foreign_keys aktif.
+
+    Dipakai oleh get_conn() dan semua tempat yang butuh path dinamis.
+
+    check_same_thread sengaja TIDAK di-nonaktifkan. Koneksi di bawah di-cache
+    di threading.local(), jadi satu koneksi hanya pernah disentuh thread yang
+    membuatnya - justru kondisi yang(check_same_thread default = True) izinkan.
+    Flag itu cuma mematikan pemeriksaan, tidak membuat sqlite3 jadi thread-safe.
+    """
+    conn = sqlite3.connect(
+        str(path if path is not None else DB_PATH),
+        timeout=BUSY_TIMEOUT_MS / 1000.0,
+        **kwargs,
+    )
+    conn.row_factory = sqlite3.Row
+    # PRAGMA busy_timeout diset eksplisit, bukan hanya parameter timeout:
+    # yang dipegang SQLite saat benar-benar menunggu lock writer lain adalah
+    # busy_timeout, dan nilainya harus ikut ke setiap koneksi baru.
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    _enable_wal(conn)
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
 def get_conn() -> sqlite3.Connection:
@@ -46,14 +110,11 @@ def get_conn() -> sqlite3.Connection:
       - override di test harus dilakukan SEBELUM get_conn() dipanggil, atau
         panggil reset_conn() lebih dulu.
     Untuk pemakaian yang butuh path dinamis, buka koneksi sendiri via
-    sqlite3.connect(path) seperti guardian.py lakukan.
+    connect(path) seperti guardian.py lakukan.
     """
     conn = getattr(_local, "conn", None)
     if conn is None:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
+        conn = connect()
         _local.conn = conn
     return conn
 
@@ -218,52 +279,72 @@ def upsert_entity(
 
     Versi hanya naik bila label/attributes_json benar-benar berbeda, supaya
     re-ingest repo yang tidak berubah tidak membikin version melonjak terus.
+
     """
     import json
 
     payload = json.dumps(attributes or {}, sort_keys=True)
     conn = get_conn()
-    row = conn.execute(
-        "SELECT label, attributes_json FROM entities WHERE id=?", (entity_id,)
-    ).fetchone()
+    # SELECT-then-INSERT di luar transaksi eksplisit adalah race TOCTOU:
+    #   thread A: SELECT  -> tidak ada
+    #   thread B: SELECT  -> tidak ada     (A belum commit)
+    #   thread A: INSERT  -> menang
+    #   thread B: INSERT  -> "UNIQUE constraint failed: entities.id"
+    # Bukti konkret di repo ini: 16 thread yang meng-upsert entity id sama
+    # bersamaan. Sebelum fix, sqlite3 punya busy_timeout=0 sehingga begitu dua
+    # thread berebut lock, SQLite melempar "database is locked" alih-alih
+    # menunggu giliran - 15 dari 16 thread gagal.
+    #
+    # BEGIN IMMEDIATE mengambil lock RESERVED sebelum SELECT pertama, jadi
+    # read-modify-write ini jadi serial dan thread lain menunggu (sampai
+    # BUSY_TIMEOUT_MS). DEFERRED (default) tidak menolong: lock baru diambil
+    # saat write pertama, setelah SELECT-nya terlanjur salah.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT label, attributes_json FROM entities WHERE id=?", (entity_id,)
+        ).fetchone()
 
-    if row is None:
+        if row is None:
+            conn.execute(
+                """INSERT INTO entities
+                       (id, kind, label, attributes_json, complexity, line_start,
+                        line_count, parent_id, symbol_kind, source_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (entity_id, kind, label, payload, complexity, line_start,
+                 line_count, parent_id, symbol_kind, source_path),
+            )
+            conn.commit()
+            return True
+
+        if row["label"] == label and (row["attributes_json"] or "") == payload:
+            # Konten tidak berubah — hanya segarkan kolom metrics (mis. line_start
+            # bergeser kalau ada file di atasnya yang berubah) tanpa menaikkan version.
+            conn.execute(
+                """UPDATE entities
+                      SET complexity=?, line_start=?, line_count=?, parent_id=?,
+                          symbol_kind=?, source_path=?, updated_at=datetime('now')
+                    WHERE id=?""",
+                (complexity, line_start, line_count, parent_id, symbol_kind,
+                 source_path, entity_id),
+            )
+            conn.commit()
+            return False
+
         conn.execute(
-            """INSERT INTO entities
-                   (id, kind, label, attributes_json, complexity, line_start,
-                    line_count, parent_id, symbol_kind, source_path)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (entity_id, kind, label, payload, complexity, line_start,
-             line_count, parent_id, symbol_kind, source_path),
+            """UPDATE entities
+                  SET kind=?, label=?, attributes_json=?, version=version+1,
+                      complexity=?, line_start=?, line_count=?, parent_id=?,
+                      symbol_kind=?, source_path=?, updated_at=datetime('now')
+                WHERE id=?""",
+            (kind, label, payload, complexity, line_start, line_count, parent_id,
+             symbol_kind, source_path, entity_id),
         )
         conn.commit()
         return True
-
-    if row["label"] == label and (row["attributes_json"] or "") == payload:
-        # Konten tidak berubah — hanya segarkan kolom metrics (mis. line_start
-        # bergeser kalau ada file di atasnya yang berubah) tanpa menaikkan version.
-        conn.execute(
-            """UPDATE entities
-                  SET complexity=?, line_start=?, line_count=?, parent_id=?,
-                      symbol_kind=?, source_path=?, updated_at=datetime('now')
-                WHERE id=?""",
-            (complexity, line_start, line_count, parent_id, symbol_kind,
-             source_path, entity_id),
-        )
-        conn.commit()
-        return False
-
-    conn.execute(
-        """UPDATE entities
-              SET kind=?, label=?, attributes_json=?, version=version+1,
-                  complexity=?, line_start=?, line_count=?, parent_id=?,
-                  symbol_kind=?, source_path=?, updated_at=datetime('now')
-            WHERE id=?""",
-        (kind, label, payload, complexity, line_start, line_count, parent_id,
-         symbol_kind, source_path, entity_id),
-    )
-    conn.commit()
-    return True
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def upsert_relation(
@@ -276,21 +357,31 @@ def upsert_relation(
     ingest tidak gagal utuh gara-gara satu referensi menggantung.
     """
     conn = get_conn()
-    for endpoint in (from_id, to_id):
-        if conn.execute(
-            "SELECT 1 FROM entities WHERE id=?", (endpoint,)
-        ).fetchone() is None:
-            return None
+    # Sama seperti upsert_entity: pemeriksaan ujung + INSERT adalah
+    # read-modify-write, jadi harus berada dalam satu transaksi dengan lock
+    # diambil di awal. Tanpa itu, pemeriksaan bisa lulus untuk entity yang
+    # baru saja dihapus, dan INSERT bisa bentrok dengan writer lain.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for endpoint in (from_id, to_id):
+            if conn.execute(
+                "SELECT 1 FROM entities WHERE id=?", (endpoint,)
+            ).fetchone() is None:
+                conn.rollback()
+                return None
 
-    rel_id = f"{from_id}::{relation_type}::{to_id}"
-    conn.execute(
-        """INSERT INTO relations (id, from_id, to_id, relation_type, weight)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET weight=excluded.weight""",
-        (rel_id, from_id, to_id, relation_type, weight),
-    )
-    conn.commit()
-    return rel_id
+        rel_id = f"{from_id}::{relation_type}::{to_id}"
+        conn.execute(
+            """INSERT INTO relations (id, from_id, to_id, relation_type, weight)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET weight=excluded.weight""",
+            (rel_id, from_id, to_id, relation_type, weight),
+        )
+        conn.commit()
+        return rel_id
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def record_audit(entity_id: str | None, event: str, detail: dict | None = None) -> str:

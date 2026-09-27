@@ -19,12 +19,91 @@ Kedua skema hidup berdampingan di file BERBEDA, jadi:
     executed_unverified->done_unverified, rolled_back->reverted,
     approvals.decision 'denied' -> decisions.result 'rejected')
 
-Override path v2 lewat env var SYNAPSE_DB_PATH (lihat storage.py).
+Override path:
+  - v1 (file ini)  : SYNAPSE_DB_PATH_V1
+  - v2 (storage.py) : SYNAPSE_DB_PATH
+
+Dua env itu sengaja terpisah. Kalau keduanya memakai nama yang sama, menyetel
+satu untuk tes diam-diam akan mengarahkan kedua skema ke file yang sama dan
+menghancurkan pemisahan yang dijaga di atas.
 """
+import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path("synapse.db")
+# Path ABSOLUT, di-anchor ke lokasi file ini - bukan ke direktori kerja proses.
+#
+# Sebelumnya `Path("synapse.db")` bersifat relatif, jadi file DB dibuat di
+# tempat uvicorn dijalankan. Konsekuensinya nyata dan sudah dibuktikan:
+# menjalankan backend dari repo root vs dari backend/ menghasilkan DUA
+# database kosong yang berbeda, sehingga semua data seolah "hilang" hanya
+# karena cara server dijalankan. Diverifikasi dengan menjalankan init_db()
+# dari dua CWD berbeda.
+#
+# Di-anchor ke BASE_DIR supaya hasilnya sama dari mana pun server dijalankan.
+# Override lewat env SYNAPSE_DB_PATH_V1 (lihat docstring modul).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = Path(
+    os.environ.get("SYNAPSE_DB_PATH_V1", "").strip()
+    or os.path.join(BASE_DIR, "synapse.db")
+)
+
+# Berapa lama koneksi ini menunggu lock writer lain sebelum menyerah.
+# Default sqlite3 adalah 0, jadi begitu DB sedang ditulis "database is locked"
+# langsung dilempar. guardian.py menjalankan verifikasi integrity saat
+# backlog approval, sementara ingest bisa sedang commit pada saat bersamaan.
+# Di sini lewat connect() supaya semua caller konsisten.
+BUSY_TIMEOUT_MS = 15_000
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """
+    Set journal_mode=WAL kalau belum, dan telenkan "database is locked".
+
+    Kenapa tidak bisa asal set: PRAGMA journal_mode=WAL butuh lock eksklusif
+    sesaat untuk mengubah header file DB, dan lock eksklusif itu tidak
+    dihormati busy_timeout - SQLite mengembalikan SQLITE_BUSY seketika. Efeknya
+    terlihat saat approve_operation() (guardian) dan ingest menulis bersamaan:
+    satu koneksi melempar OperationalError dari PRAGMA, bukan dari pekerjaan
+    yang sebenarnya penting.
+
+    Mode WAL sendiri persisten di dalam file DB. Jadi begitu pertama kali
+    berhasil, pemanggilan berikutnya membaca "wal" dan tidak butuh lock
+    eksklusif sama sekali. Kegagalan di sini cuma terjadi pada koneksi
+    pertama ke file DB baru saat ada writer lain yang sedang aktif; SQLite
+    meanwhile memakai mode default, yang tetap menghasilkan DB yang benar -
+    hanya tanpa concurrent read yang memberi keuntungan WAL.
+    """
+    try:
+        if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+            conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
+
+
+def connect(path=None, **kwargs) -> sqlite3.Connection:
+    """
+    sqlite3.connect() dengan busy_timeout + WAL + foreign_keys aktif.
+
+    Semua file DB v1 (guardian, ingest) sebaiknya lewat sini, bukan
+    sqlite3.connect() langsung, supaya pengaturan ini tidak hilang saat ada
+    call site baru.
+
+    kwargs diteruskan ke sqlite3.connect. Yang dipakai saat ini:
+    isolation_level=None (mode autocommit) - dibutuhkan approve_operation(),
+    yang mengelola BEGIN IMMEDIATE / ROLLBACK-nya sendiri.
+    """
+    conn = sqlite3.connect(
+        str(path if path is not None else DB_PATH),
+        timeout=BUSY_TIMEOUT_MS / 1000.0,
+        **kwargs,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    _enable_wal(conn)
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
 
 # GLITCH-4: get_conn() (thread-local connection) DIHAPUS. Fungsi itu dead code
 # — tidak pernah dipanggil dari guardian.py maupun cortex.py, keduanya membuka
@@ -38,10 +117,7 @@ DB_PATH = Path("synapse.db")
 
 def init_db() -> None:
     """Buat semua tabel jika belum ada."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = connect()
     cur = conn.cursor()
 
     cur.executescript("""

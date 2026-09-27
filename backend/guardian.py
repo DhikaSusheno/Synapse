@@ -87,6 +87,25 @@ def _db_path() -> str:
     return str(_database_module.DB_PATH)
 
 
+def _connect(path: str | None = None, **kwargs) -> sqlite3.Connection:
+    """
+    Buka koneksi DB v1 dengan busy_timeout + WAL + foreign_keys aktif.
+
+    Semua sqlite3.connect() di module ini lewat sini. Alasannya konkret:
+    guardian berjalan bersamaan dengan ingest (yang sedang commit), dan sqlite3
+    punya busy_timeout default 0 - begitu lock sedang dipegang, koneksi langsung
+    melempar "database is locked" dan verifikasi integrity / rollback gagal
+    padahal DB-nya sehat. Jalankan lewat _database_module.connect() supaya
+    timeout, WAL, dan foreign_keys selalu sama di semua call site.
+
+    Path dibaca lewat _db_path() setiap kali dipanggil agar override di test
+    (yang mengubah database.DB_PATH) tetap berlaku. kwargs diteruskan;
+    approve_operation() memakai isolation_level=None karena mengelola
+    BEGIN IMMEDIATE / ROLLBACK-nya sendiri.
+    """
+    return _database_module.connect(path if path is not None else _db_path(), **kwargs)
+
+
 def _utcnow_iso() -> str:
     """
     Timestamp UTC dalam format ISO - pengganti API naive-UTC yang dihapus di
@@ -220,7 +239,7 @@ def _check_sqlite_tables_exist(inv_params: dict, op_params: dict) -> tuple[bool,
     if not Path(db_path).exists():
         return False, f"DB tidak ada: {db_path}"
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         try:
             present = {
                 r[0] for r in conn.execute(
@@ -246,7 +265,7 @@ def _check_sqlite_pragma(inv_params: dict, op_params: dict) -> tuple[bool, str]:
     if not pragma.replace("_", "").isalnum():
         return False, f"nama pragma tidak valid: {pragma!r}"
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         try:
             actual = str(conn.execute(f"PRAGMA {pragma}").fetchone()[0])
         finally:
@@ -267,7 +286,7 @@ def _check_sqlite_row_count_gte(inv_params: dict, op_params: dict) -> tuple[bool
     if not table.replace("_", "").isalnum():
         return False, f"nama tabel tidak valid: {table!r}"
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         try:
             count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         finally:
@@ -321,7 +340,7 @@ def _check_operation_status_not(inv_params: dict, op_params: dict,
     if not operation_id:
         return True, "tanpa operation_id - dilewati"
     try:
-        conn = sqlite3.connect(_db_path())
+        conn = _connect(_db_path())
         try:
             row = conn.execute(
                 "SELECT status FROM operations WHERE id = ?", (operation_id,)
@@ -611,9 +630,9 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
         ts = _utcnow_naive().strftime("%Y%m%dT%H%M%S")
         bak = f"{db_target}.bak.{ts}"
         try:
-            src = sqlite3.connect(db_target)
+            src = _connect(db_target)
             try:
-                dst = sqlite3.connect(bak)
+                dst = _connect(bak)
                 try:
                     src.backup(dst)
                 finally:
@@ -752,7 +771,7 @@ def _rollback_and_finalize(conn: sqlite3.Connection, operation_id: str,
     new_status = "rolled_back" if rollback_ok else "failed"
 
     try:
-        conn2 = sqlite3.connect(_db_path())
+        conn2 = _connect(_db_path())
         if mark_verified_at:
             conn2.execute(
                 "UPDATE operations SET status=?, verified_at=? WHERE id=?",
@@ -825,7 +844,7 @@ def propose_operation(tool_name: str, params: dict, target: str) -> dict:
       4. Simpan ke operations dengan status 'pending'
       5. Emit SSE operation_proposed
     """
-    conn = sqlite3.connect(_db_path())
+    conn = _connect(_db_path())
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
 
@@ -928,7 +947,7 @@ def execute_operation(operation_id: str) -> dict:
     BUG-04 FIX: snapshot diambil di sini, tepat sebelum eksekusi.
     RACE FIX: atomic CAS UPDATE mencegah concurrent double-execute.
     """
-    conn = sqlite3.connect(_db_path())
+    conn = _connect(_db_path())
     conn.row_factory = sqlite3.Row
 
     row = conn.execute(
@@ -1225,7 +1244,7 @@ def _exec_migration(params: dict) -> tuple[bool, str]:
     if not sql:
         return False, "Tidak ada SQL di params['sql']"
     try:
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         conn.isolation_level = None  # autocommit off, kita kelola sendiri
         conn.execute("BEGIN")
         try:
@@ -1299,7 +1318,7 @@ def list_pending_approvals() -> dict:
     operasi bisa requiring-approval saat execute tapi tidak pernah muncul di
     daftar ini — dead-end yang mustahil di-approve.
     """
-    conn = sqlite3.connect(_db_path())
+    conn = _connect(_db_path())
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """SELECT o.*, a.decision as approval_decision
@@ -1322,7 +1341,7 @@ def approve_operation(operation_id: str, decision: str, note: str = "") -> dict:
     if decision not in ("approved", "denied"):
         return {"ok": False, "error": "decision harus 'approved' atau 'denied'"}
 
-    conn = sqlite3.connect(_db_path(), isolation_level=None)
+    conn = _connect(_db_path(), isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
         # BEGIN IMMEDIATE mengambil lock RESERVED sekarang, bukan saat commit,
