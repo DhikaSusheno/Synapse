@@ -68,12 +68,21 @@ export function useLLMChat(providerId: string, model: string): UseLLMChatReturn 
       });
       
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
+        let errDetail = `HTTP ${res.status}`;
+        try {
+          const errJson = await res.json();
+          if (errJson.detail) errDetail = errJson.detail;
+          else if (errJson.message) errDetail = errJson.message;
+        } catch {
+          // ignore
+        }
+        throw new Error(errDetail);
       }
       
       const reader = res.body?.getReader();
       const decoder = new TextDecoder();
       let assistantMessage = "";
+      let buffer = "";
       
       // Add empty assistant message for streaming
       setMessages(prev => [...prev, { role: "assistant", content: "" }]);
@@ -83,17 +92,24 @@ export function useLLMChat(providerId: string, model: string): UseLLMChatReturn 
           const { done, value } = await reader.read();
           if (done) break;
           
-          const chunk = new TextDecoder().decode(value);
-          const lines = chunk.split("\n");
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
           
           for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              const data = line.slice(6);
+            const trimmed = line.trim();
+            if (trimmed.startsWith("data: ")) {
+              const data = trimmed.slice(6).trim();
               if (data === "[DONE]") continue;
               
               try {
                 const parsed = JSON.parse(data);
-                const content = parsed.choices?.[0]?.delta?.content || "";
+                const content =
+                  parsed.choices?.[0]?.delta?.content ||
+                  parsed.message?.content ||
+                  parsed.response ||
+                  parsed.content ||
+                  "";
                 if (content) {
                   assistantMessage += content;
                   setMessages(prev => {
@@ -107,6 +123,29 @@ export function useLLMChat(providerId: string, model: string): UseLLMChatReturn 
                 }
               } catch {
                 // Ignore parse errors
+              }
+            }
+          }
+        }
+        
+        if (buffer.trim()) {
+          const trimmed = buffer.trim();
+          if (trimmed.startsWith("data: ")) {
+            const data = trimmed.slice(6).trim();
+            if (data !== "[DONE]") {
+              try {
+                const parsed = JSON.parse(data);
+                const content =
+                  parsed.choices?.[0]?.delta?.content ||
+                  parsed.message?.content ||
+                  parsed.response ||
+                  parsed.content ||
+                  "";
+                if (content) {
+                  assistantMessage += content;
+                }
+              } catch {
+                // ignore
               }
             }
           }

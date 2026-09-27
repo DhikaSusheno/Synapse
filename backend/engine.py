@@ -1123,19 +1123,90 @@ def _relevance(label: str, topic_lower: str) -> float:
     return 0.5
 
 
+# Cortex mengirim topik dalam bentuk KALIMAT, bukan nama entitas: tree file
+# mengisi "How does <nama> work?" dan quick action pun menulis
+# "Jelaskan <nama>". Pencocokan di bawah adalah `LIKE '%topic%'` terhadap
+# `entities.label`, jadi kalimat utuh itu tidak akan pernah match dan
+# explain_topic selalu balas 404 "Tidak ditemukan entitas yang cocok".
+#
+# Buang pembungkus kalimat tanya sebelum mencari. Menyelamatkannya: kalau
+# memang nama entitas (mis. "main.py"), pollanya tidak berubah dan tidak ada
+# yang dilepas. Kalau tidak ada yang cocok, topik asli tetap dikembalikan
+# ke pemanggil supaya pesan errornya menyebut apa yang diketik user.
+_TOPIC_WRAPPERS = (
+    re.compile(r"^\s*how\s+(?:does|do|is|are|can)\s+", re.I),
+    re.compile(r"^\s*what\s+(?:is|are|does|do)\s+", re.I),
+    re.compile(r"^\s*(?:please\s+)?explain\s+(?:how\s+|what\s+|why\s+)?", re.I),
+    re.compile(r"^\s*(?:jelaskan|gimana|bagaimana|kegu mana)\s+", re.I),
+    re.compile(r"^\s*(?:apa|siapa|mengapa|kenapa)\s+(?:itu\s+|adalah\s+)?", re.I),
+    re.compile(r"^\s*tolong\s+", re.I),
+)
+_TOPIC_TRAILERS = re.compile(
+    r"\s+(?:work|works|working|berfungsi|terjadi|do|does|berada|terjady)\s*[?.!]*\s*$",
+    re.I,
+)
+
+
+def normalize_topic(topic: str) -> str:
+    """Buang pembungkus kalimat tanya, sisakan nama entitas yang dicari."""
+    text = (topic or "").strip()
+    if not text:
+        return ""
+    for _ in range(3):  # "How does the guardian module work?" bisa berlapis
+        before = text
+        for pattern in _TOPIC_WRAPPERS:
+            new = pattern.sub("", text, count=1)
+            if new != text:
+                text = new.strip()
+                break
+        text = _TOPIC_TRAILERS.sub("", text).strip()
+        if text == before:
+            break
+    return text.strip(" ?.!\t") or (topic or "").strip()
+
+
+def _near_misses(conn, topic_lower: str, limit: int = 5) -> list[str]:
+    """Label yang paling mirip, untuk dicantumkan di pesan 404.
+
+    Tanpa ini, 404 hanya misinformation "tidak ditemukan" padahal graph-nya
+    penuh - user lalu menebak nama sendiri.
+    """
+    tokens = [t for t in re.split(r"[^a-z0-9_.]+", topic_lower) if len(t) > 2]
+    if not tokens:
+        return []
+    where = " OR ".join("LOWER(label) LIKE ?" for _ in tokens)
+    params = [f"%{t}%" for t in tokens]
+    try:
+        rows = conn.execute(
+            f"SELECT label FROM entities WHERE {where} LIMIT ?", (*params, limit * 4)
+        ).fetchall()
+    except Exception:
+        return []
+    seen: list[str] = []
+    for row in rows:
+        label = row["label"]
+        if label and label not in seen:
+            seen.append(label)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
 def ask_about(topic: str) -> dict:
     """
     Jawab pertanyaan tentang sebuah entitas di graph.
 
     relevance: exact 1.0 | prefix 0.8 | partial 0.5. Kalau tidak ada yang
-    cocok, return ok=False — bukan diam-diam mengembalikan entitas acak.
+    cocok, return ok=False - bukan diam-diam mengembalikan entitas acak.
     """
     g = _get_graph()
-    topic_lower = topic.strip().lower()
+    original_topic = topic
+    topic_lower = normalize_topic(topic).lower()
     if not topic_lower:
         return {"ok": False, "topic": topic, "message": "Topic kosong."}
 
     conn = get_conn()
+
     rows = conn.execute(
         """SELECT id, kind, label, attributes_json, complexity, symbol_kind,
                   source_path, line_start
@@ -1169,9 +1240,19 @@ def ask_about(topic: str) -> dict:
     matches.sort(key=lambda m: (m["relevance"], m["complexity"]), reverse=True)
 
     if not matches:
+        # Balas dengan kandidat yang mirip. Tanpa ini, kalimat 404 menyuruh
+        # user menebak nama entitas padahal graph-nya ada. Quick action
+        # action Explain yang gagal terlihat seperti graph-nya kosong.
+        suggestions = _near_misses(conn, topic_lower)
+        message = f"Tidak ditemukan entitas yang cocok dengan '{topic}' di graph."
+        if suggestions:
+            message += " Mungkin maksudmu: " + ", ".join(suggestions) + "."
         return {
-            "ok": False, "topic": topic,
-            "message": f"Tidak ditemukan entitas yang cocok dengan '{topic}' di graph.",
+            "ok": False,
+            "topic": original_topic,
+            "searched": topic,
+            "suggestions": suggestions,
+            "message": message,
         }
 
     primary = matches[0]
@@ -1201,7 +1282,7 @@ def ask_about(topic: str) -> dict:
             }
             related.append(entry)
             # Caller = simbol yang menunjuk ke simbol ini. File dan dokumen
-            # juga_edge ke simbol, tapi itu bukan "pemanggil".
+            # juga edge ke simbol, tapi itu bukan "pemanggil".
             if data.get("kind") == "symbol":
                 callers.append(entry)
 

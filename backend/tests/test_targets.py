@@ -847,19 +847,70 @@ class _FakeAsyncClient:
 
     calls: list[dict] = []
     payload: dict = {"choices": [{"message": {"content": "pong"}}]}
+    # BUG-45: kalau client ini di-`aclose()` sebelum generator stream
+    # dijalankan, request streaming harus gagal keras - itu persis kondisi
+    # yang membuat browser melihat "NetworkError".
+    closed_error: Exception | None = None
+    # Baris SSE yang dipalsukan, dipakai jalur stream=True.
+    stream_lines: list[str] = []
+    stream_status: int = 200
+    stream_body: bytes = b""
 
     def __init__(self, *args, **kwargs):
-        pass
+        self._closed = False
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *exc):
+        # httpx yang asli benar-benar menutup koneksi pool di sini. Kalau
+        # pemalsu ini tidak menutup, regresi BUG-45 (pakai client yang sudah
+        # keluar dari `async with`) lolos dari test.
+        self._closed = True
         return False
 
+    async def aclose(self):
+        self._closed = True
+
+    def _check_open(self):
+        if self._closed and type(self).closed_error is not None:
+            raise type(self).closed_error
+
     async def post(self, url, json=None, headers=None, timeout=None):
+        self._check_open()
         type(self).calls.append({"url": url, "json": json, "headers": headers})
         return _FakeResponse(type(self).payload)
+
+    def stream(self, method, url, json=None, headers=None, timeout=None):
+        self._check_open()
+        type(self).calls.append({"url": url, "json": json, "headers": headers})
+        return _FakeStreamCM(url)
+
+
+class _FakeStreamResponse:
+    """Response streaming: lines untuk 200, body bytes untuk error."""
+
+    def __init__(self, url):
+        self.status_code = _FakeAsyncClient.stream_status
+        self._url = url
+
+    async def aiter_lines(self):
+        for line in _FakeAsyncClient.stream_lines:
+            yield line
+
+    async def aread(self):
+        return _FakeAsyncClient.stream_body
+
+
+class _FakeStreamCM:
+    def __init__(self, url):
+        self._resp = _FakeStreamResponse(url)
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
 
 
 @pytest.fixture()
@@ -867,61 +918,10 @@ def fake_llm(monkeypatch):
     import httpx
 
     _FakeAsyncClient.calls = []
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
-    return _FakeAsyncClient
-
-
-def _register(client, db_path, monkeypatch, **overrides):
-    import database
-
-    # Tabel llm_providers dibuat oleh database.init_db(), bukan oleh
-    # TestClient. database.DB_PATH juga harus diarahkan ke sandbox yang sama
-    # dengan main.DB_PATH - kalau tidak, init menulis synapse.db sungguhan di
-    # backend/ lalu endpoint-nya tetap menabrak "no such table".
-    monkeypatch.setattr(database, "DB_PATH", db_path)
-    database.init_db()
-    body = {
-        "name": "team",
-        "type": "openai",
-        "api_key": "sk-test",
-        "models": ["gpt-4o"],
-        "default_model": "gpt-4o",
-    }
-    body.update(overrides)
-    res = client.post("/api/llm/providers", json=body)
-    assert res.status_code == 200, res.text
-    return res.json()["id"]
-
-
-def test_chat_succeeds_and_uses_builtin_base_url(client, sandbox, fake_llm, monkeypatch):
-    """Chat harus benar-benar jalan dan memakai base_url default dari tipe."""
-    pid = _register(client, sandbox["db"], monkeypatch)
-    res = client.post(
-        "/api/llm/chat",
-        json={"provider_id": pid, "messages": [{"role": "user", "content": "ping"}]},
-    )
-    assert res.status_code == 200, res.text
-    assert res.json()["choices"][0]["message"]["content"] == "pong"
-    assert len(fake_llm.calls) == 1
-    call = fake_llm.calls[0]
-    assert call["url"] == "https://api.openai.com/v1/chat/completions"
-    assert call["headers"]["Authorization"] == "Bearer sk-test"
-    assert call["json"]["model"] == "gpt-4o", "model harus default_model provider"
-
-
-def test_chat_without_base_url_on_disk_uses_type_default(client, sandbox, fake_llm, monkeypatch):
-    """base_url kosong di DB tidak boleh jadi 500, hanya boleh pakai default tipe."""
-    pid = _register(client, sandbox["db"], monkeypatch, type="deepseek")
-    res = client.post(
-        "/api/llm/chat",
-        json={"provider_id": pid, "messages": [{"role": "user", "content": "ping"}]},
-    )
-    assert res.status_code == 200, res.text
-    assert fake_llm.calls[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
-
-
-def test_explicit_base_url_wins_over_type_default(client, sandbox, fake_llm, monkeypatch):
-    pid = _register(client, sandbox["db"], monkeypatch, base_url="http://10.0.0.5:8000/v1/")
+    _FakeAsyncClient.closed_error = RuntimeError("client already closed")
+    _FakeAsyncClient.stream_lines = []
+    _FakeAsyncClient.stream_status = 200
+    _FakeAsyncClient.stream_body = b""
     res = client.post(
         "/api/llm/chat",
         json={"provider_id": pid, "messages": [{"role": "user", "content": "ping"}]},
@@ -929,13 +929,178 @@ def test_explicit_base_url_wins_over_type_default(client, sandbox, fake_llm, mon
     assert res.status_code == 200, res.text
     # Slash ganda di akhir akan bikin path "/v1//chat/completions" dan 404 dari
     # server yang sebenarnya, jadi rstrip("/") itu wajib.
-    assert fake_llm.calls[0]["url"] == "http://10.0.0.5:8000/v1/chat/completions"
+    assert fake_llm.calls[0]["url"] == "https://gw.example.com/v1/chat/completions"
+
+
+def test_public_provider_type_rejects_private_base_url(client, sandbox, fake_llm, monkeypatch):
+    """M9/SSRF: base_url adalah tujuan request keluar, jadi alamat privat tidak
+    boleh bisa ditembak lewat provider bertipe SaaS publik.
+
+    Test di atasnya memakai host publik karena sengaja; test ini yang memastikan
+    10.0.0.5 (RFC1918) ditolak, bukan lolos. Melonggarkan ini berarti siapa pun
+    yang bisa menyimpan provider bisa membuat Synapse menembak metadata cloud
+    atau layanan internal.
+    """
+    import database
+
+    monkeypatch.setattr(database, "DB_PATH", sandbox["db"])
+    database.init_db()
+    res = client.post(
+        "/api/llm/providers",
+        json={
+            "name": "internal",
+            "type": "openai",
+            "api_key": "sk-test",
+            "base_url": "http://10.0.0.5:8000/v1/",
+        },
+    )
+    assert res.status_code == 400, res.text
+    assert "privat" in res.json()["detail"]
+    assert fake_llm.calls == []
+
+
+def test_local_openai_compatible_base_url_is_allowed(client, sandbox, fake_llm, monkeypatch):
+    """LM Studio/vLLM lokal itu openai-compatible, bukan tipe publik - jadi
+    localhost tetap sah untuk tipe itu meski M9 menyekat alamat privat."""
+    pid = _register(
+        client,
+        sandbox["db"],
+        monkeypatch,
+        type="openai-compatible",
+        base_url="http://localhost:1234/v1",
+    )
+    res = client.post(
+        "/api/llm/chat",
+        json={"provider_id": pid, "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert res.status_code == 200, res.text
+    assert fake_llm.calls[0]["url"] == "http://localhost:1234/v1/chat/completions"
+
+
+# --- BUG-45: streaming chat mati dengan "NetworkError ..." di browser ---------
+#
+# LLMChatPanel mengirim stream=True. llm_chat() dulu membuka
+# `async with httpx.AsyncClient(...)` di LUAR generator dan mengembalikan
+# StreamingResponse dari dalamnya, jadi konteksnya sudah tertutup saat
+# FastAPI meng-iterate generator. Request ke provider mati di tengah jalan,
+# koneksi HTTP terputus, dan fetch() di browser ditolak - bukan 500, bukan
+# 502. Sementara /api/llm/explain (stream=False) tetap jalan, jadi bug ini
+# selalu terlihat seperti "chat rusak, provider jalan".
+#
+# _FakeAsyncClient.closed_error membuat pola lama meledak dengan
+# "client already closed" saat diuji, jadi regresinya harus terdeteksi.
+
+
+def test_chat_stream_sends_sse_lines(client, sandbox, fake_llm, monkeypatch):
+    pid = _register(client, sandbox["db"], monkeypatch)
+    fake_llm.stream_lines = [
+        '{"choices":[{"delta":{"content":"Ha"}}]}',
+        '{"choices":[{"delta":{"content":"lo"}}]}',
+        "[DONE]",
+    ]
+    res = client.post(
+        "/api/llm/chat",
+        json={
+            "provider_id": pid,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": True,
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.headers["content-type"].startswith("text/event-stream")
+    body = res.text
+    assert 'data: {"choices":[{"delta":{"content":"Ha"}}]}' in body
+    assert 'data: {"choices":[{"delta":{"content":"lo"}}]}' in body
+    assert fake_llm.calls[0]["url"] == "https://api.openai.com/v1/chat/completions"
+    assert fake_llm.calls[0]["json"]["stream"] is True
+
+
+def test_chat_stream_client_is_not_closed_before_generator_runs(
+    client, sandbox, fake_llm, monkeypatch
+):
+    """Regresi BUG-45: client harus hidup sepanjang stream.
+
+    Kalau client ditutup sebelum generator dijalankan, pemalsunya melempar
+    RuntimeError("client already closed") - bentuk yang di browser menjadi
+    fetch() ditolak tanpa status HTTP sama sekali.
+    """
+    pid = _register(client, sandbox["db"], monkeypatch)
+    fake_llm.stream_lines = ['{"choices":[{"delta":{"content":"ok"}}]}']
+    res = client.post(
+        "/api/llm/chat",
+        json={
+            "provider_id": pid,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": True,
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert "ok" in res.text
+    assert "client already closed" not in res.text
+
+
+def test_chat_stream_provider_error_becomes_502_not_dead_connection(
+    client, sandbox, fake_llm, monkeypatch
+):
+    """Provider yang membalas 401 harus jadi error yang bisa ditampilkan.
+
+    Tanpa pengecekan status sebelum StreamingResponse dikembalikan, error
+    provider mematikan koneksi dan browser hanya melihat NetworkError tanpa
+    penjelasan sama sekali.
+    """
+    pid = _register(client, sandbox["db"], monkeypatch)
+    fake_llm.stream_status = 401
+    fake_llm.stream_body = b'{"error":{"message":"invalid api key"}}'
+    res = client.post(
+        "/api/llm/chat",
+        json={
+            "provider_id": pid,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": True,
+        },
+    )
+    assert res.status_code == 502, res.text
+    detail = res.json()["detail"]
+    assert "401" in detail
+    assert "invalid api key" in detail
+
+
+def test_chat_stream_ollama_uses_native_stream_path(client, sandbox, fake_llm, monkeypatch):
+    """Ollama stream harus lewat /api/chat dan tetap hidup setelah return."""
+    pid = _register(
+        client,
+        sandbox["db"],
+        monkeypatch,
+        type="ollama",
+        api_key="",
+        models=["llama3.1"],
+        default_model="llama3.1",
+    )
+    fake_llm.stream_lines = ['{"message":{"content":"halo"}}']
+    res = client.post(
+        "/api/llm/chat",
+        json={
+            "provider_id": pid,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": True,
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert fake_llm.calls[0]["url"] == "http://localhost:11434/api/chat"
+    assert "halo" in res.text
 
 
 def test_chat_sends_no_auth_header_when_no_api_key(client, sandbox, fake_llm, monkeypatch):
     """openai-compatible lokal (LM Studio/vLLM) tidak punya key dan tidak boleh
     mengirim header Authorization: kosong, karena beberapa server menolaknya."""
-    pid = _register(client, sandbox["db"], monkeypatch, api_key="", base_url="http://localhost:1234/v1")
+    pid = _register(
+        client,
+        sandbox["db"],
+        monkeypatch,
+        type="openai-compatible",
+        api_key="",
+        base_url="http://localhost:1234/v1",
+    )
     res = client.post(
         "/api/llm/chat",
         json={"provider_id": pid, "messages": [{"role": "user", "content": "ping"}]},
@@ -1499,3 +1664,52 @@ def test_security_page_data_comes_from_scoped_operations(client, sandbox):
     # SecurityPage/OperationsPage/AgentsPage semua memanggil endpoint ini.
     rows = client.get("/operations", params={"limit": 100}).json()
     assert all(row["target_id"] == "repo-b" for row in rows)
+
+def test_sse_proxy_normalizes_lines_and_handles_errors():
+    import asyncio
+    import main
+    from fastapi import HTTPException
+
+    class MockAsyncResponse:
+        def __init__(self, status_code, lines=None, body=b""):
+            self.status_code = status_code
+            self._lines = lines or []
+            self._body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+        async def aiter_lines(self):
+            for l in self._lines:
+                yield l
+
+        async def aread(self):
+            return self._body
+
+    async def _run():
+        # 1. Normal response streaming
+        def mock_open_ok(client):
+            return MockAsyncResponse(200, lines=["data: {\"test\": 1}", "raw text line"])
+
+        res = await main._sse_proxy(mock_open_ok, "test_provider")
+        chunks = []
+        async for chunk in res.body_iterator:
+            chunks.append(chunk)
+
+        combined = "".join(chunks)
+        assert "data: {\"test\": 1}\n\n" in combined
+        assert "data: raw text line\n\n" in combined
+
+        # 2. Provider 401 error before streaming
+        def mock_open_err(client):
+            return MockAsyncResponse(401, body=b"Unauthorized key")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await main._sse_proxy(mock_open_err, "openai")
+        assert exc_info.value.status_code == 502
+        assert "Unauthorized key" in exc_info.value.detail
+
+    asyncio.run(_run())

@@ -389,7 +389,7 @@ export default function CortexPage() {
                   if (node.type === "dir") return;
                   setSelectedFile(node.id);
                   setArtifactPath(node.id);
-                  setExplainTopic(`How does ${node.name} work?`);
+                  setExplainTopic(node.name);
                 }}
                 className={`w-full flex items-center gap-1.5 px-3 py-1 text-[10px] text-left transition-colors ${
                   selectedFile === node.id ? "bg-blue-600/20 text-blue-400" : "text-slate-400 hover:bg-slate-800/60"
@@ -630,7 +630,7 @@ export default function CortexPage() {
                   <div className="flex flex-wrap gap-1.5">
                     {health.hub_nodes.map((n) => (
                       <span key={n.id} className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800/60 border border-slate-700/60 text-slate-300 font-mono">
-                        {n.name} <span className="text-slate-500">Â·{n.degree}</span>
+                        {n.name} <span className="text-slate-500">·{n.degree}</span>
                       </span>
                     ))}
                   </div>
@@ -678,7 +678,7 @@ export default function CortexPage() {
                   <tr key={row.id} className="border-t border-slate-800/60">
                     <td className="py-1 pr-2 truncate">
                       {row.name}
-                      {row.file && <span className="text-slate-600"> Â· {row.file}:{row.line}</span>}
+                      {row.file && <span className="text-slate-600"> · {row.file}:{row.line}</span>}
                     </td>
                     <td className="py-1">{row.complexity}</td>
                     <td className="py-1 text-slate-500">{row.lines}</td>
@@ -705,7 +705,7 @@ export default function CortexPage() {
               className="flex-1 bg-slate-800/60 border border-slate-700/60 rounded-lg px-3 py-2 text-xs text-slate-300 outline-none placeholder-slate-600 font-mono"
               placeholder="from node"
             />
-            <span className="self-center text-slate-600 text-xs">&rarr;</span>
+            <span className="self-center text-slate-600 text-xs">→</span>
             <input
               value={pathTo}
               onChange={(e) => setPathTo(e.target.value)}
@@ -726,14 +726,14 @@ export default function CortexPage() {
           ) : pathResult ? (
             <div className="space-y-2 pt-2 border-t border-slate-800/60">
               <div className="text-[10px] text-slate-500">
-                {pathResult.path_length} hop Â· {pathResult.direction}
+                {pathResult.path_length} hop · {pathResult.direction}
               </div>
               <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-mono">
                 {pathResult.path.map((n, i) => (
                   <span key={n.id} className="flex items-center gap-1.5">
                     {i > 0 && (
                       <span className="text-slate-600">
-                        {pathResult.edges[i - 1]?.relationship ?? "&rarr;"}
+                        {pathResult.edges[i - 1]?.relationship ?? "\u2192"}
                         {pathResult.edges[i - 1]?.traversed === "reverse" ? " (rev)" : ""}
                       </span>
                     )}

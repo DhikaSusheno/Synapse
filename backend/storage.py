@@ -14,9 +14,10 @@ Kolom version di entities dipakai untuk tracking re-ingest: ketika isi sebuah
 file berubah, version naik dan attributes_json diperbarui, sehingga simpul lama
 bisa diinvalidasi lewat perbandingan version.
 
-Path DB: file TERPISA dari schema legacy. Default Path("synapse_v2.db") supaya
-tidak bentrok dengan database.py yang memakai Path("synapse.db") — dua skema
-berdampingan di file berbeda, tanpa FK/INDEX silang. Override via env var:
+Path DB: file TERPISA dari schema legacy. Default `synapse_v2.db` di direktori
+yang sama dengan modul ini supaya tidak bentrok dengan database.py yang memakai
+`synapse.db` - dua skema berdampingan di file berbeda, tanpa FK/INDEX silang.
+Keduanya di-anchor ke lokasi modul, bukan ke CWD. Override via env var:
 
     SYNAPSE_DB_PATH=/tmp/synapse-test.db pytest
 """
@@ -28,7 +29,18 @@ import uuid
 from pathlib import Path
 
 # Default punya file sendiri, sengaja tidak "synapse.db" (dipakai database.py).
-DB_PATH = Path(os.environ.get("SYNAPSE_DB_PATH", "synapse_v2.db"))
+#
+# Path default DIKECAK ke direktori modul ini, bukan ke CWD proses: path
+# relatif membuat database ikut berpindah setiap kali server dijalankan dari
+# direktori berbeda, sehingga state terbelah jadi beberapa file yang saling
+# tidak tahu-menahu (lihat database.DB_PATH untuk kronologinya).
+# Nilai env SYNAPSE_DB_PATH tetap dipakai apa adanya lalu di-resolve jadi absolut
+# SEKALI di import — memang keputusan eksplisit pemilik, tapi di-freeze supaya
+# tidak ikut berubah kalau direktori kerja berganti di tengah jalan.
+_DEFAULT_DB = Path(__file__).resolve().parent / "synapse_v2.db"
+_env_db = os.environ.get("SYNAPSE_DB_PATH", "").strip()
+DB_PATH = Path(_env_db).resolve() if _env_db else _DEFAULT_DB
+
 
 # Koneksi per-thread: FastAPI menjalankan sync endpoint di threadpool, dan
 # sqlite3.Connection tidak aman dipakai lintas thread. Setiap thread punya

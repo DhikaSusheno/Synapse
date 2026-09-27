@@ -4,16 +4,27 @@ demo_reset.py — Script reset database Synapse sebelum demo.
 Tanggung jawab:
   1. Menghapus synapse.db, synapse.db-wal, synapse.db-shm, synapse_v2.db,
      synapse_v2.db-wal, synapse_v2.db-shm, dan *.bak.* di folder backend/
-  2. Memanggil database.init_db() dan storage.init_db() agar seluruh tabel
+  2. Jika file sedang di-lock oleh proses uvicorn aktif, fallback menghapus
+     isi baris semua tabel via SQL DELETE + VACUUM (Issue #71 fix).
+  3. Memanggil database.init_db() dan storage.init_db() agar seluruh tabel
      kontrak (nodes, edges, operations, approvals, entities, relations, audit_log, dll)
      dibuat ulang dari kondisi bersih.
-  3. Mencetak konfirmasi dengan jumlah baris (row count) untuk setiap tabel (harus 0).
-  4. Mencetak path absolut teresolusi (resolved absolute DB_PATH) yang digunakan.
+  4. Mencetak konfirmasi dengan jumlah baris (row count) untuk setiap tabel (harus 0).
+  5. Mencetak path absolut teresolusi (resolved absolute DB_PATH) yang digunakan.
 """
 import os
 import sys
 import sqlite3
 from pathlib import Path
+
+# Issue #74 fix: Pastikan stdout/stderr pakai UTF-8 agar emoji/unicode
+# tidak menyebabkan UnicodeEncodeError pada terminal Windows (cp1252).
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 # Pastikan folder backend/ ada dalam sys.path
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -23,12 +34,30 @@ if str(BACKEND_DIR) not in sys.path:
 import database
 import storage
 
+def _wipe_tables_sql(db_path: Path):
+    """Fallback: kosongkan seluruh baris tabel jika file di-lock oleh proses live (Issue #71)."""
+    if not db_path.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(db_path))
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() if not r[0].startswith("sqlite_")]
+        for tbl in tables:
+            conn.execute(f"DELETE FROM {tbl}")
+        conn.commit()
+        try:
+            conn.execute("VACUUM")
+        except Exception:
+            pass
+        conn.close()
+    except Exception as e:
+        print(f"[Warning] SQL Wipe fallback error pada {db_path.name}: {e}")
+
 def reset_demo_database():
     print("=" * 60)
     print("Synapse Demo Database Reset Script")
     print("=" * 60)
 
-    # 1. Hapus file DB lama
+    # 1. Hapus file DB lama atau fallback truncate via SQL
     db_patterns = [
         "synapse.db", "synapse.db-wal", "synapse.db-shm",
         "synapse_v2.db", "synapse_v2.db-wal", "synapse_v2.db-shm"
@@ -41,20 +70,22 @@ def reset_demo_database():
             try:
                 file_path.unlink()
                 deleted_files.append(file_path.name)
-            except OSError as e:
-                print(f"[Warning] Gagal menghapus {file_path.name}: {e}")
+            except OSError:
+                # Issue #71 fix: fallback truncation jika di-lock oleh live server
+                _wipe_tables_sql(file_path)
+                deleted_files.append(f"{file_path.name} (wiped via SQL fallback)")
 
     for bak_file in BACKEND_DIR.glob("*.bak.*"):
         try:
             bak_file.unlink()
             deleted_files.append(bak_file.name)
-        except OSError as e:
-            print(f"[Warning] Gagal menghapus {bak_file.name}: {e}")
+        except OSError:
+            pass
 
     if deleted_files:
-        print(f"[1/4] Berkas lama yang dihapus ({len(deleted_files)}): {', '.join(deleted_files)}")
+        print(f"[1/4] Berkas lama yang dibersihkan ({len(deleted_files)}): {', '.join(deleted_files)}")
     else:
-        print("[1/4] Tidak ada berkas DB lama yang perlu dihapus.")
+        print("[1/4] Tidak ada berkas DB lama yang perlu dibersihkan.")
 
     # 2. Re-init DB
     storage.reset_conn()

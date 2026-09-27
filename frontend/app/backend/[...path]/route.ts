@@ -35,6 +35,11 @@
 // SYNAPSE_PROXY_ALLOWED_ORIGINS untuk daftar origin yang memang diizinkan.
 
 import { NextRequest } from "next/server";
+import {
+  crossSiteDenial,
+  missingTokenDenial,
+  parseAllowedOrigins,
+} from "@/lib/proxyGuard";
 
 const BACKEND = process.env.BACKEND_URL ?? "http://localhost:8000";
 const TOKEN = process.env.SYNAPSE_API_TOKEN ?? "";
@@ -42,11 +47,8 @@ const TOKEN = process.env.SYNAPSE_API_TOKEN ?? "";
 // Opsional. Kalau diisi (dipisah koma), Origin/STOLEN wajib salah satu dari
 // daftar ini. Kalau kosong, tidak ada pembatasan Origin - andalkan
 // Sec-Fetch-Site saja.
-const ALLOWED_ORIGINS = new Set(
-  (process.env.SYNAPSE_PROXY_ALLOWED_ORIGINS ?? "")
-    .split(",")
-    .map((o) => o.trim())
-    .filter(Boolean)
+const ALLOWED_ORIGINS = parseAllowedOrigins(
+  process.env.SYNAPSE_PROXY_ALLOWED_ORIGINS
 );
 
 const HOP_BY_HOP = new Set([
@@ -70,10 +72,6 @@ const HOP_BY_HOP = new Set([
 // dengan nilai berbeda dan hasilnya bergantung pada urutan penulisan.
 const CLIENT_HEADERS_DENIED = new Set(["authorization", "x-synapse-token"]);
 
-// Nilai Sec-Fetch-Site yang menandakan request datang dari aplikasi ini
-// sendiri, jadi aman untuk diinjeksi token.
-const SAFE_FETCH_SITES = new Set(["same-origin", "same-site", "none"]);
-
 type RouteContext = { params: Promise<{ path?: string[] }> };
 
 function jsonError(status: number, error: string, hint?: string): Response {
@@ -83,42 +81,24 @@ function jsonError(status: number, error: string, hint?: string): Response {
   });
 }
 
-/** Tolak request yang jelas berasal dari origin lain, atau dari browser foreign. */
-function rejectCrossSite(request: NextRequest): Response | null {
-  const fetchSite = request.headers.get("sec-fetch-site");
-  if (fetchSite && !SAFE_FETCH_SITES.has(fetchSite.toLowerCase())) {
-    return jsonError(
-      403,
-      "Cross-site request ditolak",
-      "Proxy hanya melayani request dari aplikasi Synapse itu sendiri"
-    );
-  }
-
-  if (ALLOWED_ORIGINS.size > 0) {
-    const origin = request.headers.get("origin");
-    // Origin hanya dikirim browser pada request non-GET. Untuk GET, andalkan
-    // Sec-Fetch-Site yang sudah dicek di atas.
-    if (origin && !ALLOWED_ORIGINS.has(origin)) {
-      return jsonError(403, "Origin tidak diizinkan", `Origin: ${origin}`);
-    }
-  }
-
-  return null;
-}
-
 async function proxy(request: NextRequest, context: RouteContext): Promise<Response> {
   // #63: gagal-cepat kalau server tidak punya token. Tanpa guard ini proxy
   // meneruskan request apa adanya ke backend dan hopeful tidak di-401.
-  if (!TOKEN) {
-    return jsonError(
-      503,
-      "SYNAPSE_API_TOKEN belum di-set di server",
-      "Proxy tidak akan meneruskan request tanpa kredensial"
-    );
+  const tokenDenied = missingTokenDenial(TOKEN);
+  if (tokenDenied) {
+    return jsonError(tokenDenied.status, tokenDenied.error, tokenDenied.hint);
   }
 
-  const blocked = rejectCrossSite(request);
-  if (blocked) return blocked;
+  // Guard CSRF/gagal-alih-alih di lib/proxyGuard.ts — dipakai bersama oleh
+  // proxy ini dan app/api/graph/route.ts.
+  const denied = crossSiteDenial(
+    request.headers.get("sec-fetch-site"),
+    request.headers.get("origin"),
+    ALLOWED_ORIGINS
+  );
+  if (denied) {
+    return jsonError(denied.status, denied.error, denied.hint);
+  }
 
   // Next 15 membuat params berupa Promise. Menunggu di sini wajib; kalau
   // diakses sinkron, segments selalu kosong dan semua request jatuh ke root.
@@ -155,10 +135,14 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<Respo
       redirect: "manual",
     });
   } catch {
+    // L5 FIX: jangan ikut mencetak BACKEND_URL pada respons. Nilai itu
+    // adalah topologi internal server (host/port yang biasanya tidak
+    // diekspos) dan tidak ada gunanya bagi pemanggil — yang bisa
+    // ditindaklanjuti klien hanyalah "backend tidak terjangkau".
     return jsonError(
       503,
       "Backend tidak dapat dijangkau",
-      `Pastikan uvicorn jalan dan BACKEND_URL benar (${BACKEND})`
+      "Pastikan proses uvicorn berjalan dan variabel BACKEND_URL di server benar"
     );
   }
 

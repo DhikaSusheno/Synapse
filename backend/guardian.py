@@ -70,15 +70,18 @@ Bug fixes (dari security/TEST_SCENARIOS.md Bug Findings Log):
 """
 
 import json
+import os
 import uuid
-import sqlite3
 import shutil
+import sqlite3
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
 
 import database as _database_module
+import settings as _settings
 from cortex import _emit  # pakai SSE bus milik Cortex
 
 
@@ -226,8 +229,32 @@ def _resolve_db_path(inv_params: dict, op_params: dict) -> str:
     """
     Prioritas: params['db_path'] dari operasi > db_path default di YAML > DB_PATH.
     params operasi menang supaya test override & multi-DB tetap benar.
+
+    H5 FIX: path RELATIF tidak lagi di-resolve terhadap CWD proses.
+
+    `synapse.invariants.yaml` menyimpan `db_path: "synapse.db"` — relatif.
+    Python men-resolve path relatif terhadap direktori kerja saat ini, jadi
+    verifier mengecek file yang berbeda tergantung dari mana uvicorn/pytest
+    dijalankan. Terbukti nyata di checkout ini:
+
+        C:\\...\\Synapse\\synapse.db        0 baris   <- shell kosong, dibuat
+                                                         di CWD oleh bug path lama
+        C:\\...\\Synapse\\backend\\synapse.db  1 node  <- DB yang benar-benar
+                                                         ditulis guardian
+
+    Akibatnya verifier memeriksa database yang TIDAK PERNAH disentuh
+    migration — ia lolos dengan semua tabel utuh, sementara DB aslinya
+    justru rusak dan tidak pernah di-rollback. Path relatif kini selalu
+    di-anchor ke direktori DB kanonik, sehingga hasilnya tidak lagi
+    bergantung pada CWD.
     """
-    return str(op_params.get("db_path") or inv_params.get("db_path") or _db_path())
+    raw = op_params.get("db_path") or inv_params.get("db_path")
+    if not raw:
+        return str(_db_path())
+    candidate = Path(str(raw))
+    if not candidate.is_absolute():
+        candidate = Path(_db_path()).parent / candidate
+    return str(candidate)
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +294,13 @@ def _check_sqlite_pragma(inv_params: dict, op_params: dict) -> tuple[bool, str]:
         return True, "pragma tidak diminta"
     if not pragma.replace("_", "").isalnum():
         return False, f"nama pragma tidak valid: {pragma!r}"
+    # H5 FIX: sqlite3.connect(path) pada path yang belum ada MEMBUAT file
+    # database kosong di sana. Karena itu langkah "verifikasi" berubah jadi
+    # langkah yang MENULIS — melempar file DB baru ke filesystem tiap kali
+    # eksekusi gagal menemukan DB-nya. Cek dulu keberadaannya, sama seperti
+    # _check_sqlite_tables_exist sudah lakukan.
+    if not Path(db_path).exists():
+        return False, f"DB tidak ada: {db_path}"
     try:
         conn = sqlite3.connect(db_path)
         try:
@@ -288,6 +322,10 @@ def _check_sqlite_row_count_gte(inv_params: dict, op_params: dict) -> tuple[bool
         return True, "tabel tidak diminta"
     if not table.replace("_", "").isalnum():
         return False, f"nama tabel tidak valid: {table!r}"
+    # H5 FIX: sama seperti check pragma — sqlite3.connect() membuat file
+    # kosong kalau DB-nya belum ada, sehingga verifikasi ikut menulis.
+    if not Path(db_path).exists():
+        return False, f"DB tidak ada: {db_path}"
     try:
         conn = sqlite3.connect(db_path)
         try:
@@ -460,6 +498,22 @@ def _run_global_invariants(operation_id: str) -> list[dict]:
 
 CONFLICT_WINDOW_MINUTES = 10
 
+# H4: batas panjang `target` yang dijadikan id + nama node graph.
+# Harus sama dengan batas pydantic di main.ProposeOperationRequest.target
+# supaya klien yang lolos HTTP juga lolos di guardian (dan sebaliknya).
+_MAX_TARGET_LEN = 512
+
+# M18: batas ukuran `params` setelah diserialisasi.
+#
+# params disimpan sebagai kolom TEXT di `operations` lalu dibaca kembali oleh
+# execute_operation(). Dulu tidak ada batas sama sekali, jadi satu propose
+# bisa menulis baris sebesar yang diminta pemanggil — payload itu lalu ikut
+# di-parse ulang, dan diambil lagi tiap kali eksekusi, snapshot, atau
+# riwayat operasi dibuka. 64 KiB jauh melampaui params migrasi/query yang
+# wajar, sekaligus masih kecil dibanding batas body request (32 MiB) yang
+# membatasi nilainya di lapis HTTP.
+_MAX_PARAMS_BYTES = 64 * 1024
+
 RULES = [
     {
         "match": "db.run_migration",
@@ -476,10 +530,21 @@ RULES = [
         "prefix_match": True,   # service.restart.graceful juga match
     },
     {
+        # H2 FIX: dulu require_approval=False.
+        #
+        # config.write adalah primitive TULIS FILE PALING UMUM di guardian dan
+        # eksekusinya menulis ke path apa pun yang diberikan lewat params —
+        # tanpa approval, agent yang boleh propose operasi justru bisa menulis
+        # .ssh/authorized_keys, .env (berisi SYNAPSE_API_TOKEN + FERNET_KEY),
+        # hook git, atau file source lalu mendapatkan code execution tanpa
+        # satu pun persetujuan manusia. Itu bertentangan langsung dengan
+        # janji Synapse: approval_mode "Manual (human required)".
+        # Kecocokan kasusnya persis seperti file.delete (yang sudah
+        # require_approval=True) — keduanya mengubah state disk.
         "match": "config.write",
         "blast_radius": "medium",
         "reversibility": "needs_snapshot",
-        "require_approval": False,
+        "require_approval": True,
         "prefix_match": False,  # exact only: config.write.as.root harus fail-closed
     },
     {
@@ -847,6 +912,73 @@ def propose_operation(tool_name: str, params: dict, target: str) -> dict:
       4. Simpan ke operations dengan status 'pending'
       5. Emit SSE operation_proposed
     """
+    # H4 FIX: `target` dipakai mentah sebagai id sekaligus nama node graph
+    # (baris `target_node_id = f"operation_target::{target}"` di bawah).
+    # Guardian adalah lapis keamanan, jadi validasinya juga ada di sini —
+    # bukan hanya di pydantic main.py — karena fungsi ini dipanggil langsung
+    # oleh skrip, tool, dan test, tanpa melewati HTTP sama sekali.
+    #
+    # Ditolaknya juga di sini berarti string kosong / terlalu panjang /
+    # berisi karakter kontrol tidak pernah masuk ke database sebagai node
+    # yang selanjutnya disebarkan ke seluruh endpoint /graph/*.
+    target_text = "" if target is None else str(target).strip()
+    if not target_text:
+        return {
+            "ok": False,
+            "error": "target wajib berisi teks (tidak boleh kosong/whitespace)",
+        }
+    if len(target_text) > _MAX_TARGET_LEN:
+        return {
+            "ok": False,
+            "error": (
+                f"target terlalu panjang: {len(target_text)} karakter "
+                f"(maksimal {_MAX_TARGET_LEN})"
+            ),
+        }
+    if any(ord(ch) < 32 for ch in target_text):
+        # NUL/kontrol merambat ke SQLite TEXT dan ke JSON respons, di mana
+        # pemotongan di tengah karakter bisa merusak parsing di klien.
+        return {
+            "ok": False,
+            "error": "target mengandung karakter kontrol yang tidak diizinkan",
+        }
+    target = target_text
+
+    # M18 FIX: params divalidasi dan dibatasi SEBELIMENYENTUH database.
+    #
+    # Tiga kegagalan lama, semuanya jatuh sebagai 500 tanpa konteks:
+    #   1. params bukan dict            -> json.dumps tetap jalan, tapi
+    #                                      eksekutor mengharapkan dict;
+    #   2. params tidak serialisabel    -> TypeError dari json.dumps;
+    #   3. params mengandung NaN/Inf    -> json.dumps menghasilkan "NaN",
+    #                                      yaitu JSON yang TIDAK VALID
+    #                                      (lihat allow_nan=False di bawah).
+    # Ditambah ukuran yang tidak dibatasi sama sekali: satu propose bisa
+    # menulis baris sebesar yang diminta pemanggil.
+    if not isinstance(params, dict):
+        return {
+            "ok": False,
+            "error": "params harus berupa objek JSON (dict), bukan "
+                     f"{type(params).__name__}",
+        }
+    try:
+        params_json = json.dumps(params, allow_nan=False)
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "ok": False,
+            "error": "params tidak bisa diserialisasi ke JSON "
+                     "(nilai non-JSON seperti NaN/Infinity atau objek kustom)",
+        }
+    params_bytes = len(params_json.encode("utf-8"))
+    if params_bytes > _MAX_PARAMS_BYTES:
+        return {
+            "ok": False,
+            "error": (
+                f"params terlalu besar: {params_bytes} byte "
+                f"(maksimal {_MAX_PARAMS_BYTES})"
+            ),
+        }
+
     conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -884,7 +1016,7 @@ def propose_operation(tool_name: str, params: dict, target: str) -> dict:
             requires_approval, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)""",
         (
-            operation_id, tool_name, json.dumps(params), target_node_id,
+            operation_id, tool_name, params_json, target_node_id,
             target_id,
             blast_radius, reversibility_class,
             1 if requires_approval else 0,
@@ -1030,7 +1162,43 @@ def execute_operation(operation_id: str) -> dict:
             "error": f"Status operasi '{current_status}' tidak bisa dieksekusi (sudah dieksekusi atau sedang berjalan)",
         }
 
-    params = json.loads(op["params_json"] or "{}")
+    # M18 FIX: parsing params yang defensif.
+    #
+    # Baris ini dulunya `json.loads(...)` polos, di LUAR try/except eksekusi
+    # yang ada di bawah. Dua akibatnya kalau kolomnya rusak (ditulis lama,
+    # diubah manual lewat sqlite3, atau korup): exception melesat keluar
+    # sebagai 500 tanpa konteks, DAN — yang lebih penting — operasi sudah
+    # berstatus 'executing' serta sudah commit di CAS di atas, jadi ia
+    # tersangkut di sana selamanya dan menutup antrean untuk id itu.
+    # Sekarang kegagalan parsing menandai baris 'failed' lalu kembali dengan
+    # error yang jelas, sehingga statusnya konsisten dengan hasilnya.
+    try:
+        params = json.loads(op["params_json"] or "{}")
+    except (TypeError, ValueError) as exc:
+        conn.execute(
+            "UPDATE operations SET status='failed' WHERE id=?",
+            (operation_id,),
+        )
+        conn.commit()
+        conn.close()
+        return {
+            "ok": False,
+            "error": (
+                f"params operasi tidak bisa dibaca sebagai JSON ({exc}); "
+                "operasi ditandai gagal"
+            ),
+        }
+    if not isinstance(params, dict):
+        conn.execute(
+            "UPDATE operations SET status='failed' WHERE id=?",
+            (operation_id,),
+        )
+        conn.commit()
+        conn.close()
+        return {
+            "ok": False,
+            "error": "params operasi bukan objek JSON (dict); operasi ditandai gagal",
+        }
 
     # BUG-04 FIX: ambil snapshot SEKARANG (tepat sebelum eksekusi)
     snapshot_ref, rollback_command = _take_snapshot(op["tool_name"], params)
@@ -1278,15 +1446,76 @@ def _exec_migration(params: dict) -> tuple[bool, str]:
 
 
 def _exec_config_write(params: dict) -> tuple[bool, str]:
+    """
+    Tulis file konfigurasi.
+
+    H7 FIX — dua cacat sekaligus di versi lama:
+
+    1. TIDAK ADA validasi path sama sekali. `Path(file_path).write_text(...)`
+       menerima path absolut apa pun, jadi operasi yang lolos guardian bisa
+       menulis di luar repo: ~/.ssh/authorized_keys, file sistem, .env,
+       atau base64 payload apa pun. Padahal settings.py sudah punya
+       guard dua-lapis (allowed_roots + anti-sensitif) yang dipakai endpoint
+       lain; guardian adalah satu-satunya yang tidak memakainya.
+
+    2. write_text() meng-truncate lalu menulis — bukan atomik. Proses mati di
+       tengah (crash, disk penuh, Ctrl-C) menyisakan file config KOSONG atau
+       setengah tulis, dan karena file ini bisa jadi konfigurasi yang dipakai
+       saat boot, dampaknya boot loop yang tidak bisa dijelaskan dari log.
+
+    Sekarang: guard dulu, lalu tulis lewat file tempurung di direktori yang
+    sama + os.replace() yang atomik di filesystem yang sama. Mode file asli
+    dipertahankan (mkstemp default 0600 akan menurunkan permission config
+    yang semestinya 0644).
+    """
     file_path = params.get("file_path", "")
     content = params.get("content", "")
     if not file_path:
         return False, "params['file_path'] tidak ada"
+
+    # Guard 1: path harus di dalam workspace dan bukan file sensitif.
+    if not _settings.is_writable_path(file_path):
+        return False, (
+            f"Path ditolak guardian: '{file_path}' berada di luar workspace "
+            f"yang diizinkan atau menunjuk file kredensial/database"
+        )
+
+    # Guard 2: direktori induk harus ada. os.replace() akan gagal kalau tidak,
+    # tapi cek eksplisit supaya pesannya bisa ditindaklanjuti dan supaya
+    # direktori baru tidak pernah dibuat diam-diam di luar ekspektasi.
+    target = Path(os.path.realpath(os.path.expanduser(str(file_path))))
+    parent = target.parent
+    if not parent.is_dir():
+        return False, f"Direktori induk tidak ada: {parent}"
+
+    # Pertahankan permission file yang lama; file baru memakai 0644.
     try:
-        Path(file_path).write_text(content, encoding="utf-8")
-        return True, f"Config ditulis ke {file_path}"
-    except Exception as e:
-        return False, str(e)
+        mode = target.stat().st_mode & 0o7777
+    except OSError:
+        mode = 0o644
+
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(parent), prefix=f".{target.name}.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, target)  # atomik: pembaca tidak pernah lihat separuh
+        tmp_path = None
+    except OSError as e:
+        return False, f"Gagal menulis '{target}': {e}"
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    return True, f"Config ditulis ke {file_path}"
 
 
 def _exec_file_delete(params: dict, snapshot_ref: str | None) -> tuple[bool, str]:
@@ -1298,6 +1527,15 @@ def _exec_file_delete(params: dict, snapshot_ref: str | None) -> tuple[bool, str
     file_path = params.get("file_path", "")
     if not file_path:
         return False, "params['file_path'] tidak ada"
+    # Validasi path SEBELAMANYA menolak di sini juga (lihat _exec_config_write):
+    # tanpa ini guardian bisa menghapus file apa pun yang bisa dihapus proses,
+    # termasuk yang berada jauh di luar repo — dan snapshot yang disimpan
+    # sebagai .bak akan berada di lokasi yang sama di luar workspace.
+    if not _settings.is_writable_path(file_path):
+        return False, (
+            f"Path ditolak guardian: '{file_path}' berada di luar workspace "
+            f"yang diizinkan atau menunjuk file kredensial/database"
+        )
     if not snapshot_ref:
         return False, "Tidak ada snapshot - file delete dibatalkan (fail-safe)"
     # GLITCH-5 FIX: pastikan file .bak benar-benar ada dan tidak kosong

@@ -27,7 +27,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest
+          pip install -r ../security/requirements-test.txt
 
       - name: Byte-compile (syntax check)
         run: python -m compileall -q .
@@ -52,10 +52,33 @@ jobs:
             exit 1
           fi
 
-      - name: Run pytest
+      # WAJIB dijalankan dari repo root dengan path eksplisit.
+      # Sebelumnya step ini jalan dari working-directory: backend, dan pytest
+      # hanya menerapkan `testpaths` dari pytest.ini kalau invocation dir ==
+      # rootdir. Dari backend/ pytest mengumpulkan [backend/] saja (120 test),
+      # jadi seluruh security/tests (127 test, termasuk suite regresi
+      # path-traversal isu #63/#66) TIDAK PERNAH jalan di CI — CI hijau
+      # padahal regresinya lolos senyap. Path eksplisit + guard jumlah
+      # pengumpulan bikin suite ini tidak bisa menyusut diam-diam.
+      # Referensi: pytest _pytest/config/__init__.py::_decide_args
+      - name: Run pytest (backend + security)
         env:
           SYNAPSE_API_TOKEN: ci-test-token-abcdefghijklmnop
-        run: python -m pytest -q
+        working-directory: .
+        run: |
+          set -e
+          SEC=$(python -m pytest --collect-only -q security/tests | tail -1 | awk '{print $1}')
+          BACK=$(python -m pytest --collect-only -q backend/tests | tail -1 | awk '{print $1}')
+          echo "collected: security/tests=$SEC backend/tests=$BACK"
+          if [ "${SEC:-0}" -lt 100 ]; then
+            echo "::error::security/tests cuma mengumpulkan $SEC test"
+            exit 1
+          fi
+          if [ "${BACK:-0}" -lt 100 ]; then
+            echo "::error::backend/tests cuma mengumpulkan $BACK test"
+            exit 1
+          fi
+          python -m pytest -q backend/tests security/tests
 
   frontend:
     name: Frontend checks
