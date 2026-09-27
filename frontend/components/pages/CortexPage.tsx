@@ -5,6 +5,7 @@
 
 import { useEffect, useState } from "react";
 import { buildFileTree, type TreeNode } from "@/lib/derive";
+import { num, arr, str } from "@/lib/coerce";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -193,14 +194,16 @@ export default function CortexPage() {
     if (!USE_LIVE) return;
     let cancelled = false;
 
+    // Normalisasi di trust boundary: backend boleh kirim field partial, dan
+    // `as RepoHealth` akan membuat TypeScript percaya pada value yang tidak ada.
     fetch(`${BACKEND_URL}/repo_health`, { cache: "no-store" })
-      .then(async (r) => (r.ok ? ((await r.json()) as RepoHealth) : Promise.reject(await errorDetail(r, "Gagal ambil /repo_health"))))
-      .then((d) => { if (!cancelled) { setHealth(d); setHealthError(null); } })
+      .then(async (r) => (r.ok ? ((await r.json()) as Partial<RepoHealth>) : Promise.reject(await errorDetail(r, "Gagal ambil /repo_health"))))
+      .then((d) => { if (!cancelled) { setHealth({ ...d, health_score: num(d.health_score), total_files: num(d.total_files), documented_files: num(d.documented_files), doc_coverage_percent: num(d.doc_coverage_percent), dead_code_count: num(d.dead_code_count), high_complexity_count: num(d.high_complexity_count), hub_nodes: arr(d.hub_nodes) } as RepoHealth); setHealthError(null); } })
       .catch((e: string) => { if (!cancelled) setHealthError(e); });
 
     fetch(`${BACKEND_URL}/complexity_report?top_n=10`, { cache: "no-store" })
-      .then(async (r) => (r.ok ? ((await r.json()) as ComplexityReport) : Promise.reject(await errorDetail(r, "Gagal ambil /complexity_report"))))
-      .then((d) => { if (!cancelled) { setComplexity(d); setComplexityError(null); } })
+      .then(async (r) => (r.ok ? ((await r.json()) as Partial<ComplexityReport>) : Promise.reject(await errorDetail(r, "Gagal ambil /complexity_report"))))
+      .then((d) => { if (!cancelled) { setComplexity({ ...d, results: arr(d.results), total_returned: num(d.total_returned), critical_count: num(d.critical_count), high_count: num(d.high_count), medium_count: num(d.medium_count), low_count: num(d.low_count) } as ComplexityReport); setComplexityError(null); } })
       .catch((e: string) => { if (!cancelled) setComplexityError(e); });
 
     return () => { cancelled = true; };
@@ -228,7 +231,7 @@ export default function CortexPage() {
         body: JSON.stringify({ path_or_diff: artifactPath }),
       });
       const d = await r.json();
-      if (d.ok) setReviewResult(d as ReviewScores);
+      if (d.ok) setReviewResult({ ...d, completeness: num(d.completeness), clarity: num(d.clarity), correctness_vs_spec: num(d.correctness_vs_spec), risk: num(d.risk), verdict: str(d.verdict) } as ReviewScores);
     } catch { /* ignore */ } finally { setReviewLoading(false); }
   }
 
@@ -243,7 +246,7 @@ export default function CortexPage() {
       });
       if (!r.ok) { setPathResult(null); setPathError(await errorDetail(r, "Gagal cari jalur")); return; }
       const d = await r.json();
-      if (d.ok) { setPathResult(d as FindPathResult); setPathError(null); }
+      if (d.ok) { setPathResult({ ...d, path: arr(d.path), edges: arr(d.edges), path_length: num(d.path_length) } as FindPathResult); setPathError(null); }
       else { setPathResult(null); setPathError(d.error ?? "Jalur tidak ditemukan"); }
     } catch {
       setPathResult(null);
@@ -262,7 +265,7 @@ export default function CortexPage() {
       });
       if (!r.ok) { setRefactorResult(null); setRefactorError(await errorDetail(r, "Gagal ambil saran refactor")); return; }
       const d = await r.json();
-      if (d.ok) { setRefactorResult(d as RefactorResult); setRefactorError(null); }
+      if (d.ok) { setRefactorResult({ ...d, metrics: { ...(d.metrics ?? {}), complexity: num(d.metrics?.complexity), lines: num(d.metrics?.lines), degree: num(d.metrics?.degree), in_degree: num(d.metrics?.in_degree), out_degree: num(d.metrics?.out_degree) }, suggestions: arr(d.suggestions) } as unknown as RefactorResult); setRefactorError(null); }
       else { setRefactorResult(null); setRefactorError(d.error ?? "Entitas tidak ditemukan"); }
     } catch {
       setRefactorResult(null);
@@ -270,17 +273,22 @@ export default function CortexPage() {
     } finally { setRefactorLoading(false); }
   }
 
-  const ScoreBar = ({ label, value }: { label: string; value: number }) => (
-    <div className="space-y-1">
-      <div className="flex justify-between text-[10px]">
-        <span className="text-slate-400">{label}</span>
-        <span className="text-slate-300 font-mono">{value.toFixed(1)}</span>
+  // ponytail: satu-satunya tempat yang menyentuh angka dari backend. Backend
+  // boleh kirim field ini hilang; `num` yangpegang, bukan setiap call site.
+  const ScoreBar = ({ label, value }: { label: string; value: unknown }) => {
+    const n = num(value);
+    return (
+      <div className="space-y-1">
+        <div className="flex justify-between text-[10px]">
+          <span className="text-slate-400">{label}</span>
+          <span className="text-slate-300 font-mono">{n.toFixed(1)}</span>
+        </div>
+        <div className="h-1.5 rounded-full bg-slate-800">
+          <div className="h-1.5 rounded-full bg-blue-500" style={{ width: `${Math.min(100, Math.max(0, (n / 10) * 100))}%` }} />
+        </div>
       </div>
-      <div className="h-1.5 rounded-full bg-slate-800">
-        <div className="h-1.5 rounded-full bg-blue-500" style={{ width: `${(value / 10) * 100}%` }} />
-      </div>
-    </div>
-  );
+    );
+  };
 
   return (
     <div className="flex flex-1 overflow-hidden bg-[#080d14]">
