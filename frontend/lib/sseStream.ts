@@ -1,11 +1,11 @@
 // lib/sseStream.ts
-// BUG-38: tiap halaman buka EventSource sendiri ke /stream → 4 koneksi per user.
+// BUG-38: tiap halaman buka EventSource sendiri ke /stream â†’ 4 koneksi per user.
 // Transport tunggal di sini: koneksi dibuat saat subscriber pertama, ditutup saat
 // subscriber terakhir hilang, event di-fanout ke semua subscriber.
 
 import type { SSEEvent } from "@/lib/types";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "/backend";
 
 type Handler = (event: SSEEvent) => void;
 
@@ -62,7 +62,7 @@ export function subscribeStream(handler: Handler): () => void {
   };
 }
 
-/** Jumlah koneksi /stream yang sedang terbuka — 1 per app, bukan 1 per halaman. */
+/** Jumlah koneksi /stream yang sedang terbuka â€” 1 per app, bukan 1 per halaman. */
 export function openStreamCount(): number {
   return es ? 1 : 0;
 }

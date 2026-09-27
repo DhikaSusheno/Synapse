@@ -1,13 +1,13 @@
 "use client";
 // components/pages/CortexPage.tsx
-// Halaman Cortex — sesuai design section 3
+// Halaman Cortex â€” sesuai design section 3
 // FE-1 @nabilfauzandafa
 
 import { useEffect, useState } from "react";
 import { buildFileTree, type TreeNode } from "@/lib/derive";
 import { num, arr, str } from "@/lib/coerce";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "/backend";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
 
 interface ExplainResult {
@@ -108,7 +108,7 @@ function healthClass(score: number): string {
 }
 
 // FastAPI balas error sebagai { detail: string } dengan HTTP 4xx. Tanpa ini
-// layar diam saja saat entitas tidak ketemu — bug yang sama seperti issue #39.
+// layar diam saja saat entitas tidak ketemu â€” bug yang sama seperti issue #39.
 async function errorDetail(r: Response, fallback: string): Promise<string> {
   try {
     const d = await r.json();
@@ -118,7 +118,7 @@ async function errorDetail(r: Response, fallback: string): Promise<string> {
   }
 }
 
-// Tree repo dari node graph backend (/graph/nodes) — bukan mock.
+// Tree repo dari node graph backend (/graph/nodes) â€” bukan mock.
 function useFileTree(enabled: boolean): { tree: TreeNode[]; loading: boolean; error: string | null } {
   const [tree, setTree] = useState<TreeNode[]>([]);
   const [loading, setLoading] = useState(true);
@@ -188,7 +188,7 @@ export default function CortexPage() {
   const [refactorError, setRefactorError] = useState<string | null>(null);
   const [refactorLoading, setRefactorLoading] = useState(false);
 
-  // GET /repo_health + GET /complexity_report — dua-duanya read-only, ambil sekali
+  // GET /repo_health + GET /complexity_report â€” dua-duanya read-only, ambil sekali
   // saat mount. beide endpoint sudah ada di backend tapi sebelumnya tidak pernah dipanggil.
   useEffect(() => {
     if (!USE_LIVE) return;
@@ -292,7 +292,7 @@ export default function CortexPage() {
 
   return (
     <div className="flex flex-1 overflow-hidden bg-[#080d14]">
-      {/* Left — Repo Tree */}
+      {/* Left â€” Repo Tree */}
       <div className="w-52 shrink-0 flex flex-col border-r border-slate-800/60 bg-[#0d1117] overflow-hidden">
         <div className="px-3 py-3 border-b border-slate-800/60">
           <div className="text-xs font-semibold text-white mb-2">Repository Tree</div>
@@ -308,7 +308,7 @@ export default function CortexPage() {
             <div className="px-3 py-4 text-[10px] text-red-400">{treeError}</div>
           ) : tree.length === 0 ? (
             <div className="px-3 py-4 text-[10px] text-slate-600">
-              {treeLoading ? "Loading tree..." : !USE_LIVE ? "Live data OFF — set NEXT_PUBLIC_USE_LIVE_SSE=true." : "Graph kosong. POST /understand_repo untuk ingest."}
+              {treeLoading ? "Loading tree..." : !USE_LIVE ? "Live data OFF â€” set NEXT_PUBLIC_USE_LIVE_SSE=true." : "Graph kosong. POST /understand_repo untuk ingest."}
             </div>
           ) : (
             tree.map((node) => (
@@ -333,7 +333,7 @@ export default function CortexPage() {
         </div>
       </div>
 
-      {/* Center — Explain Topic */}
+      {/* Center â€” Explain Topic */}
       <div className="flex-1 overflow-y-auto p-5 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-lg font-bold text-white">Cortex</h1>
@@ -353,7 +353,7 @@ export default function CortexPage() {
             />
             <button onClick={runExplain} disabled={explainLoading}
               className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold disabled:opacity-50 transition-colors">
-              {explainLoading ? "…" : "Explain"}
+              {explainLoading ? "â€¦" : "Explain"}
             </button>
           </div>
 
@@ -392,7 +392,7 @@ export default function CortexPage() {
             />
             <button onClick={runReview} disabled={reviewLoading}
               className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold disabled:opacity-50 transition-colors">
-              {reviewLoading ? "…" : "Run Review"}
+              {reviewLoading ? "â€¦" : "Run Review"}
             </button>
           </div>
 
@@ -414,7 +414,7 @@ export default function CortexPage() {
           )}
         </div>
 
-        {/* Repo Health — GET /repo_health */}
+        {/* Repo Health â€” GET /repo_health */}
         <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-4 space-y-3">
           <div className="flex items-center justify-between">
             <div className="text-sm font-semibold text-white">Repo Health</div>
@@ -431,9 +431,9 @@ export default function CortexPage() {
           {healthError ? (
             <div className="text-[10px] text-red-400">{healthError}</div>
           ) : !USE_LIVE ? (
-            <div className="text-[10px] text-slate-600">Live data OFF — set NEXT_PUBLIC_USE_LIVE_SSE=true.</div>
+            <div className="text-[10px] text-slate-600">Live data OFF â€” set NEXT_PUBLIC_USE_LIVE_SSE=true.</div>
           ) : !health ? (
-            <div className="text-[10px] text-slate-600">Memuat health report…</div>
+            <div className="text-[10px] text-slate-600">Memuat health reportâ€¦</div>
           ) : (
             <div className="space-y-3">
               <div className="text-xs text-slate-400">{health.summary}</div>
@@ -456,7 +456,7 @@ export default function CortexPage() {
                   <div className="flex flex-wrap gap-1.5">
                     {health.hub_nodes.map((n) => (
                       <span key={n.id} className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800/60 border border-slate-700/60 text-slate-300 font-mono">
-                        {n.name} <span className="text-slate-500">·{n.degree}</span>
+                        {n.name} <span className="text-slate-500">Â·{n.degree}</span>
                       </span>
                     ))}
                   </div>
@@ -466,7 +466,7 @@ export default function CortexPage() {
           )}
         </div>
 
-        {/* Complexity Ranking — GET /complexity_report */}
+        {/* Complexity Ranking â€” GET /complexity_report */}
         <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-4 space-y-3">
           <div className="flex items-center justify-between">
             <div className="text-sm font-semibold text-white">Complexity Ranking</div>
@@ -482,9 +482,9 @@ export default function CortexPage() {
           {complexityError ? (
             <div className="text-[10px] text-red-400">{complexityError}</div>
           ) : !USE_LIVE ? (
-            <div className="text-[10px] text-slate-600">Live data OFF — set NEXT_PUBLIC_USE_LIVE_SSE=true.</div>
+            <div className="text-[10px] text-slate-600">Live data OFF â€” set NEXT_PUBLIC_USE_LIVE_SSE=true.</div>
           ) : !complexity ? (
-            <div className="text-[10px] text-slate-600">Memuat ranking…</div>
+            <div className="text-[10px] text-slate-600">Memuat rankingâ€¦</div>
           ) : complexity.results.length === 0 ? (
             <div className="text-[10px] text-slate-600">
               Belum ada simbol terindeks. POST /understand_repo untuk ingest.
@@ -504,7 +504,7 @@ export default function CortexPage() {
                   <tr key={row.id} className="border-t border-slate-800/60">
                     <td className="py-1 pr-2 truncate">
                       {row.name}
-                      {row.file && <span className="text-slate-600"> · {row.file}:{row.line}</span>}
+                      {row.file && <span className="text-slate-600"> Â· {row.file}:{row.line}</span>}
                     </td>
                     <td className="py-1">{row.complexity}</td>
                     <td className="py-1 text-slate-500">{row.lines}</td>
@@ -520,7 +520,7 @@ export default function CortexPage() {
           )}
         </div>
 
-        {/* Find Path — POST /find_path */}
+        {/* Find Path â€” POST /find_path */}
         <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-4 space-y-3">
           <div className="text-sm font-semibold text-white">Find Path</div>
           <div className="flex gap-2">
@@ -541,18 +541,18 @@ export default function CortexPage() {
             />
             <button onClick={runFindPath} disabled={pathLoading || !USE_LIVE}
               className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold disabled:opacity-50 transition-colors">
-              {pathLoading ? "…" : "Trace"}
+              {pathLoading ? "â€¦" : "Trace"}
             </button>
           </div>
 
           {pathError ? (
             <div className="text-[10px] text-red-400">{pathError}</div>
           ) : !USE_LIVE ? (
-            <div className="text-[10px] text-slate-600">Live data OFF — set NEXT_PUBLIC_USE_LIVE_SSE=true.</div>
+            <div className="text-[10px] text-slate-600">Live data OFF â€” set NEXT_PUBLIC_USE_LIVE_SSE=true.</div>
           ) : pathResult ? (
             <div className="space-y-2 pt-2 border-t border-slate-800/60">
               <div className="text-[10px] text-slate-500">
-                {pathResult.path_length} hop · {pathResult.direction}
+                {pathResult.path_length} hop Â· {pathResult.direction}
               </div>
               <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-mono">
                 {pathResult.path.map((n, i) => (
@@ -573,7 +573,7 @@ export default function CortexPage() {
           ) : null}
         </div>
 
-        {/* Refactor Suggestions — POST /suggest_refactor */}
+        {/* Refactor Suggestions â€” POST /suggest_refactor */}
         <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-4 space-y-3">
           <div className="text-sm font-semibold text-white">Refactor Suggestions</div>
           <div className="flex gap-2">
@@ -586,14 +586,14 @@ export default function CortexPage() {
             />
             <button onClick={runSuggestRefactor} disabled={refactorLoading || !USE_LIVE}
               className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold disabled:opacity-50 transition-colors">
-              {refactorLoading ? "…" : "Suggest"}
+              {refactorLoading ? "â€¦" : "Suggest"}
             </button>
           </div>
 
           {refactorError ? (
             <div className="text-[10px] text-red-400">{refactorError}</div>
           ) : !USE_LIVE ? (
-            <div className="text-[10px] text-slate-600">Live data OFF — set NEXT_PUBLIC_USE_LIVE_SSE=true.</div>
+            <div className="text-[10px] text-slate-600">Live data OFF â€” set NEXT_PUBLIC_USE_LIVE_SSE=true.</div>
           ) : refactorResult ? (
             <div className="space-y-2 pt-2 border-t border-slate-800/60">
               <div className="flex flex-wrap gap-2 text-[10px] font-mono text-slate-500">
@@ -616,7 +616,7 @@ export default function CortexPage() {
         </div>
       </div>
 
-      {/* Right — Graph Context mini */}
+      {/* Right â€” Graph Context mini */}
       <div className="w-56 shrink-0 border-l border-slate-800/60 bg-[#0d1117] p-3 overflow-y-auto space-y-3">
         <div className="text-xs font-semibold text-white">Graph Context</div>
         <div className="bg-slate-800/40 rounded-xl border border-slate-700/60 h-40 flex items-center justify-center">
