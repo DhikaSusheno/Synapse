@@ -153,8 +153,19 @@
 - `POST /explain_topic`
 - `POST /review_artifact`
 - `GET /graph/nodes` (untuk tree)
-- `POST /find_path`
+- `GET /repo_health`
 - `GET /complexity_report`
+- `POST /find_path`
+- `POST /suggest_refactor`
+
+### Centre — kartu tambahan (live, urutan ke bawah):
+- **Repo Health** — skor 0–100 + label, summary, 4 stat (Files / Documented / Dead code / Complex), hub nodes
+- **Complexity Ranking** — tabel top 10 simbol: nama + `file:line`, complexity, lines, badge risk
+- **Find Path** — dua input (from → to), hasil jalur sebagai chain node + label relasi
+- **Refactor Suggestions** — satu input nama entitas, metrics (cx / lines / degree / docs) + daftar saran berprioritas
+
+Semuanya respek `NEXT_PUBLIC_USE_LIVE_SSE`: kalau `false`, tiap kartu menampilkan
+"Live data OFF" dan tombol nonaktif — bukan mock data.
 
 ---
 
@@ -336,10 +347,10 @@ btn-ghost: border border-slate-700/60 text-slate-400 hover:text-slate-200 hover:
 | `/understand_repo` | POST | Code Graph (trigger ingest) |
 | `/explain_topic` | POST | Code Graph (node click), Cortex |
 | `/review_artifact` | POST | Cortex |
-| `/repo_health` | GET | Overview, Agents, Security |
-| `/complexity_report` | GET | Cortex |
-| `/find_path` | POST | Cortex |
-| `/suggest_refactor` | POST | Cortex |
+| `/repo_health` | GET | Cortex (Repo Health card) |
+| `/complexity_report` | GET | Cortex (Complexity Ranking card) |
+| `/find_path` | POST | Cortex (Find Path card) |
+| `/suggest_refactor` | POST | Cortex (Refactor Suggestions card) |
 | `/list_pending_approvals` | GET | Guardian, Approvals |
 | `/propose_operation` | POST | Guardian (demo) |
 | `/approve_operation` | POST | Guardian, Approvals, GuardianPanel |
@@ -428,6 +439,7 @@ frontend/
 - [x] CodeGraphPage — graph fullscreen + node panel + SSE activity
 - [x] GuardianPage — pending op detail + reversibility + timeline
 - [x] CortexPage — repo tree dari `/graph/nodes` + explain + review + graph context
+- [x] CortexPage — 4 endpoint BE yang sebelumnya tidak pernah dipanggil: `/repo_health`, `/complexity_report`, `/find_path`, `/suggest_refactor`
 - [x] AgentsPage — 3 agent cards + tasks + SSE stream + activity chart (data live)
 - [x] SecurityPage — stats + rule engine + conflict candidates + event feed (data live)
 - [x] SettingsPage — tabs: General + MCP + Storage + Repository
