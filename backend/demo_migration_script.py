@@ -12,6 +12,7 @@ Skenario:
 Jalankan:
   set PYTHONIOENCODING=utf-8 && python demo_migration_script.py
 """
+import os
 import sys
 import time
 import json
@@ -20,15 +21,18 @@ import urllib.request
 import urllib.error
 
 BASE_URL = "http://localhost:8000"
+# Backend mewajibkan token (lihat backend/auth.py). Set SYNAPSE_API_TOKEN
+# dengan nilai yang sama seperti yang dipakai untuk menjalankan uvicorn.
+API_TOKEN = os.environ.get("SYNAPSE_API_TOKEN", "").strip()
 
 
 def api(method, path, body=None):
     url = f"{BASE_URL}{path}"
     data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(
-        url, data=data, method=method,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-    )
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if API_TOKEN:
+        headers["X-Synapse-Token"] = API_TOKEN
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
@@ -52,6 +56,11 @@ def fail(msg):
 
 
 def main():
+    if not API_TOKEN:
+        fail("SYNAPSE_API_TOKEN belum disetel. Jalankan dengan token yang sama "
+             "dengan backend, contoh: "
+             "set SYNAPSE_API_TOKEN=... && python demo_migration_script.py")
+
     sep("0. Health Check")
     r = api("GET", "/health")
     if r.get("status") != "ok":
