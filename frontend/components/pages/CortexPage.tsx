@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 // components/pages/CortexPage.tsx
 // Halaman Cortex — sesuai design section 3
 // FE-1 @nabilfauzandafa

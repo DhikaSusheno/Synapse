@@ -922,61 +922,6 @@ def fake_llm(monkeypatch):
     _FakeAsyncClient.stream_lines = []
     _FakeAsyncClient.stream_status = 200
     _FakeAsyncClient.stream_body = b""
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
-    return _FakeAsyncClient
-
-
-def _register(client, db_path, monkeypatch, **overrides):
-    import database
-
-    # Tabel llm_providers dibuat oleh database.init_db(), bukan oleh
-    # TestClient. database.DB_PATH juga harus diarahkan ke sandbox yang sama
-    # dengan main.DB_PATH - kalau tidak, init menulis synapse.db sungguhan di
-    # backend/ lalu endpoint-nya tetap menabrak "no such table".
-    monkeypatch.setattr(database, "DB_PATH", db_path)
-    database.init_db()
-    body = {
-        "name": "team",
-        "type": "openai",
-        "api_key": "sk-test",
-        "models": ["gpt-4o"],
-        "default_model": "gpt-4o",
-    }
-    body.update(overrides)
-    res = client.post("/api/llm/providers", json=body)
-    assert res.status_code == 200, res.text
-    return res.json()["id"]
-
-
-def test_chat_succeeds_and_uses_builtin_base_url(client, sandbox, fake_llm, monkeypatch):
-    """Chat harus benar-benar jalan dan memakai base_url default dari tipe."""
-    pid = _register(client, sandbox["db"], monkeypatch)
-    res = client.post(
-        "/api/llm/chat",
-        json={"provider_id": pid, "messages": [{"role": "user", "content": "ping"}]},
-    )
-    assert res.status_code == 200, res.text
-    assert res.json()["choices"][0]["message"]["content"] == "pong"
-    assert len(fake_llm.calls) == 1
-    call = fake_llm.calls[0]
-    assert call["url"] == "https://api.openai.com/v1/chat/completions"
-    assert call["headers"]["Authorization"] == "Bearer sk-test"
-    assert call["json"]["model"] == "gpt-4o", "model harus default_model provider"
-
-
-def test_chat_without_base_url_on_disk_uses_type_default(client, sandbox, fake_llm, monkeypatch):
-    """base_url kosong di DB tidak boleh jadi 500, hanya boleh pakai default tipe."""
-    pid = _register(client, sandbox["db"], monkeypatch, type="deepseek")
-    res = client.post(
-        "/api/llm/chat",
-        json={"provider_id": pid, "messages": [{"role": "user", "content": "ping"}]},
-    )
-    assert res.status_code == 200, res.text
-    assert fake_llm.calls[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
-
-
-def test_explicit_base_url_wins_over_type_default(client, sandbox, fake_llm, monkeypatch):
-    pid = _register(client, sandbox["db"], monkeypatch, base_url="https://gw.example.com/v1/")
     res = client.post(
         "/api/llm/chat",
         json={"provider_id": pid, "messages": [{"role": "user", "content": "ping"}]},
@@ -1720,7 +1665,6 @@ def test_security_page_data_comes_from_scoped_operations(client, sandbox):
     rows = client.get("/operations", params={"limit": 100}).json()
     assert all(row["target_id"] == "repo-b" for row in rows)
 
-
 def test_sse_proxy_normalizes_lines_and_handles_errors():
     import asyncio
     import main
@@ -1769,4 +1713,3 @@ def test_sse_proxy_normalizes_lines_and_handles_errors():
         assert "Unauthorized key" in exc_info.value.detail
 
     asyncio.run(_run())
-

@@ -41,14 +41,6 @@ import os
 import re
 import socket
 import sys
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Dict, List, Literal, Optional
-from urllib.parse import quote, urlsplit
-
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
 from urllib.parse import urlsplit
 import sqlite3
 
@@ -1093,24 +1085,6 @@ def _resolve_oauth_redirect(request: Request, redirect_uri: str | None) -> str:
     return _require_valid_redirect(redirect_uri or _github_oauth_redirect_uri(request))
 
 
-@app.get("/api/github/auth/url", tags=["GitHub"])
-def github_oauth_url(request: Request, redirect_uri: str | None = None):
-    """Get GitHub OAuth authorization URL."""
-    from urllib.parse import urlencode
-    client_id = os.getenv("GITHUB_CLIENT_ID")
-    client_secret = os.getenv("GITHUB_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        raise HTTPException(
-            status_code=500,
-            detail="GitHub OAuth not configured (GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET)",
-        )
-    # M7: validasi dulu, baru di-encode, supaya nilai redirect_uri tidak bisa
-    # memotong dirinya sendiri lewat "?" / "&" / "=" lalu menambahkan query
-    # param lain ke URL authorize. Query dirakit lewat dict (urlencode) supaya
-    # redirect_uri tetap persis sama dengan yang dipakai saat tukar kode di
-    # /api/github/callback.
-    redirect_uri = _resolve_oauth_redirect(request, redirect_uri)
-    scope = "repo read:org read:user"
     query = urlencode(
         {
             "client_id": client_id,
@@ -1354,19 +1328,6 @@ def _github_repo_path(value: str) -> str:
         raise HTTPException(status_code=400, detail="path tidak valid")
     return quote(value, safe="/")
 
-
-@app.get("/api/github/repos/{owner}/{repo}/tree", tags=["GitHub"])
-def github_repo_tree(owner: str, repo: str, branch: str = "main", recursive: bool = True):
-    """Get repository file tree."""
-    import requests
-
-    # M8: owner/repo/branch dibatasi ke charset GitHub lalu di-encode ulang,
-    # sehingga "?" / "#" / ".." yang lolos decode-nya tidak lagi bisa
-    # mengubah struktur URL tujuan.
-    owner = _github_repo_segment(owner, "owner")
-    repo = _github_repo_segment(repo, "repo")
-    branch = _github_repo_segment(branch, "branch", allow_slash=True)
-
     url = (
         f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}"
         f"?recursive={1 if recursive else 0}"
@@ -1578,136 +1539,6 @@ def _validate_upstream_base_url(raw: str | None, provider_type: str) -> str | No
     return value
 
 
-# Tipe provider yang dikenali. Sisanya tetap diterima: users menjalankan
-# LM Studio, vLLM, Together, Groq, atau proxy internal yang tidak ada di
-# daftar ini, dan semuanya speak OpenAI-compatible chat/completions.
-#
-# Kenapa `type` bukan Literal lagi: Literal membuat Pydantic menolak 422
-# untuk "groq" atau "lmstudio", padahal keduanya provider yang sah dan
-# bisa dikonfigurasi lewat base_url yang sama persis dengan openai-compatible.
-# Daftar ini dipakai untuk (a) memberi base_url default saat type dikenali,
-# (b) menentukan apakah boleh dihapus, bukan untuk menolak input.
-KNOWN_PROVIDER_TYPES = (
-    "openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama", "openai-compatible",
-)
-
-# Base URL default per tipe yang dikenali. Tipe di luar daftar tidak punya
-# default: pemanggil wajib menyebut base_url sendiri, karena mengarang URL
-# akan membuat request menembak endpoint yang salah tanpa melaporkan apa pun.
-PROVIDER_BASE_URLS = {
-    "openai": "https://api.openai.com/v1",
-    "anthropic": "https://api.anthropic.com/v1",
-    "nvidia": "https://integrate.api.nvidia.com/v1",
-    "deepseek": "https://api.deepseek.com/v1",
-    "ollama": "http://localhost:11434/v1",
-    "ibm": "https://us-south.ml.cloud.ibm.com/ml/v1",
-}
-
-# Tipe bawaan yang tidak boleh dihapus. openai-compatible TIDAK termasuk:
-# itu user-provided, dan memblokir penghapusan hanya akan bikin user
-# tidak bisa membersihkan provider yang tidak dipakai lagi.
-UNDELETABLE_PROVIDER_TYPES = ("openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama")
-
-
-def normalize_provider_type(raw: str) -> str:
-    """
-    Normalisasi nama tipe provider supaya yang sama tidak jadi dua provider.
-
-    Urutan kandidat PENTING. "Open AI" adalah cara orang mengetik nama yang
-    setiap hari, dan kalau spasinya diganti tanda hubung hasilnya "open-ai" -
-    nama yang tidak ada di daftar bawaan. Akibatnya provider ini kehilangan
-    base_url default dan user dipaksa mengetik URL yang sebenarnya sudah kami
-    tahu benar. Jadi kandidat yang sudah cocok dengan daftar bawaan dicoba
-    lebih dulu:
-
-        "  OpenAI "  -> "openai"   (cocok persis)
-        "Open AI"    -> "openai"   (spasi dihapus, cocok)
-        "open ai"    -> "openai"   (spasi dihapus, cocok)
-        "openai compatible" -> "openai-compatible" (cocok persis, dengan spasi)
-        "vllm"       -> "vllm"     (tidak dikenal, dipakai apa adanya)
-
-    Batasnya yang perlu diketahui: "open ai compatible" TIDAK menjadi
-    "openai-compatible". squashed-nya "openaicompatible" dan dashed-nya
-    "open-ai-compatible", keduanya tidak ada di daftar bawaan, jadi hasilnya
-    "open-ai-compatible" dan diperlakukan sebagai tipe custom. Tidak apa-apa
-    karena tipe itu memang tidak punya base_url default, tapi jangan menulis
-    kode-nya sebaliknya - frontend/lib/llmProviders.ts harus meniru urutan di
-    sini persis, bukan yang tertulis di docstring.
-
-    Regex hanya menyaring karakter yang tidak mungkin jadi nama file/URL.
-    """
-    text = (raw or "").strip().lower()
-    if not text:
-        return "openai-compatible"
-    squashed = re.sub(r"\s+", "", text)
-    dashed = "-".join(text.split())
-    for candidate in (text, squashed, dashed, dashed.replace("-", "_")):
-        if candidate in PROVIDER_BASE_URLS or candidate in KNOWN_PROVIDER_TYPES:
-            return candidate
-    # Tipe custom: buang karakter yang akan merusak id dan base_url.
-    cleaned = re.sub(r"[^a-z0-9._-]+", "-", dashed).strip("-")
-    return cleaned or "openai-compatible"
-
-
-def _as_provider_dict(provider) -> dict:
-    """Terjemahkan baris provider apa pun jadi dict biasa.
-
-    BUG-41: pemanggil mengambil provider lewat
-    `conn.execute(...).fetchone()` dengan `row_factory = sqlite3.Row`. Row
-    mendukung `row["base_url"]` tapi TIDAK punya `.get()`, jadi helper yang
-    memanggil `.get()` melempar AttributeError dan /api/llm/chat membalas 500
-    untuk semua provider - termasuk yang konfigurasinya benar.
-
-    `dict(row)` berhasil karena Row mengimplementasikan keys() dan __getitem__.
-    Ditaruh di sini, bukan di tiap pemanggil, supaya endpoint LLM baru tidak
-    harus ingat hal ini.
-    """
-    return provider if isinstance(provider, dict) else dict(provider)
-
-
-def _is_local_provider(provider) -> bool:
-    """True kalau provider kemungkinan besar jalan di localhost, jadi API key opsional.
-
-    Base URL dengan host loopback (localhost, 127.0.0.1, ::1) atau memakai
-    skema file:// dianggap lokal. Ini membiarkan ollama dan LM Studio/vLLM
-    lokal dikonfigurasi tanpa key, tanpa membuat daftar yang harus
-    ditambahkan setiap kali ada server lokal baru.
-
-    Terima dict atau sqlite3.Row; lihat _as_provider_dict.
-    """
-    provider = _as_provider_dict(provider)
-    base_url = (provider.get("base_url") or "").strip().lower()
-    if not base_url:
-        return provider.get("type") == "ollama"
-    if base_url.startswith("file://"):
-        return True
-    try:
-        host = urlsplit(base_url).hostname or ""
-    except ValueError:
-        return False
-    return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or host.endswith(".local")
-
-
-def resolve_provider_base_url(provider) -> str | None:
-    """Base URL final untuk sebuah provider, atau None kalau tidak bisa ditebak.
-
-    Urutannya: base_url eksplisit > default dari tipe yang dikenali > None.
-    None berarti pemanggil harus menolak dengan pesan jelas, bukan menembak
-    API default OpenAI karena tipe provider-nya "groq".
-
-    Terima dict atau sqlite3.Row; lihat _as_provider_dict.
-    """
-    provider = _as_provider_dict(provider)
-    explicit = (provider.get("base_url") or "").strip()
-    if explicit:
-        return explicit
-    return PROVIDER_BASE_URLS.get(provider.get("type") or "")
-
-
-class LLMProviderCreate(BaseModel):
-    # name ikut membentuk primary key (`f"{type}:{name}"`), jadi panjangnya
-    # dibatasi supaya satu request tidak bisa menggelembungkan id provider (M6).
-    name: str = Field(max_length=256)
     type: str = "openai-compatible"
     base_url: str | None = None
     api_key: str | None = None
