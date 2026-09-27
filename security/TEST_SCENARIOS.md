@@ -140,10 +140,14 @@ Tujuan: membuktikan skenario demo reliable sebelum presentasi ke juri.
 | Jam 30 | BUG-05 | — | `main.py` duplicate class `ProposeOperationRequest` & `ApproveOperationRequest` — definisi kedua override pertama dengan skema berbeda, endpoint `/approve_operation` contract tidak konsisten | [#8](https://github.com/DhikaSusheno/Synapse/issues/8) | 🟡 MEDIUM | ✅ Fixed (commit `2b1cf8b` Masrendra — duplikat dihapus) |
 | Jam 36 | BUG-07 | A9 (baru) | `execute_operation()` race condition — concurrent double-execute bisa lolos guard karena status check dan UPDATE tidak atomik. `UPDATE ... WHERE status IN (...)` + `rowcount` check diperlukan | [#12](https://github.com/DhikaSusheno/Synapse/issues/12) | 🔴 HIGH | 🔴 Open |
 | Jam 36 | BUG-08 | — | `cortex._emit()` tidak thread-safe — `asyncio.Queue.put_nowait()` dipanggil dari sync FastAPI thread pool. Saat approve/execute diklik, SSE stream bisa mati (demo-killer) | [#11](https://github.com/DhikaSusheno/Synapse/issues/11) | 🔴 HIGH | 🔴 Open |
+| Jam 42 | BUG-09 | TestCorsPreflightBehaviour | CORS allowlist wildcard `*` membiarkan origin asing melakukan preflight/request ke endpoint API sensitif (F-08, CWE-942) | [#13](https://github.com/DhikaSusheno/Synapse/issues/13) | 🔴 HIGH | ✅ Fixed / Closed |
+| Jam 42 | BUG-10 | A9 (TestTerminalStateBlocksReapproval) | `approve_operation` tidak mengecek status terminal (`verified`, `denied`, `rolled_back`, `failed`), memungkinkan re-approval & re-execution (SEC-FIX-2, CWE-664) | [#14](https://github.com/DhikaSusheno/Synapse/issues/14) | 🔴 HIGH | ✅ Fixed / Closed |
+| Jam 42 | BUG-11 | C8 (TestTargetNormalizationForcesApproval) | `propose_operation` tidak me-normalize whitespace/case/unicode pada `target`, meloloskan conflict detection & approval gate (SEC-FIX-3, CWE-693) | [#15](https://github.com/DhikaSusheno/Synapse/issues/15) | 🔴 HIGH | ✅ Fixed / Closed |
+| Jam 42 | BUG-12 | — | Silent database split & CWD-relative path inconsistency sebelum demo take (F-22) — diatasi dengan script reset `demo_reset.py` | [#16](https://github.com/DhikaSusheno/Synapse/issues/16) | 🟡 MEDIUM | ✅ Fixed / Closed |
 
 > **Catatan QC-2 (zuyss):** Test DR5 adalah **regression test** untuk BUG-03. Jika BUG-03 diperbaiki, DR5 harus pass. Jika DR5 masih fail setelah patch, berarti fix tidak lengkap.
 
-> **Catatan QC-1 (pidpid35):** BUG-08 adalah **demo-killer** — SSE real-time adalah fitur utama Synapse. Harus fix sebelum rehearsal jam 40. BUG-07 perlu ditambahkan test A9 (`TestConcurrentDoubleExecute`) setelah backend fix.
+> **Catatan QC-1 (pidpid35):** BUG-08 adalah **demo-killer** — SSE real-time adalah fitur utama Synapse. Harus fix sebelum rehearsal jam 40. BUG-07 perlu ditambahkan test A9 (`TestConcurrentDoubleExecute`) setelah backend fix. Fixes 1–4 (BUG-09..12) sudah diverifikasi live dan lolos regression suite.
 
 ---
 
