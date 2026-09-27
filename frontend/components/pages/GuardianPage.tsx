@@ -1,6 +1,6 @@
 "use client";
 // components/pages/GuardianPage.tsx
-// Halaman Guardian — sesuai design section 2
+// Halaman Guardian â€” sesuai design section 2
 // FE-1 @nabilfauzandafa
 
 import { useEffect, useState } from "react";
@@ -9,7 +9,7 @@ import { stamp } from "@/lib/derive";
 import { decideOperation } from "@/lib/operations";
 import RiskBadge from "@/components/shared/RiskBadge";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "/backend";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
 
 const TIMELINE_STEPS = ["Propose", "Snapshot", "Approve", "Execute", "Verify", "Complete"];
@@ -152,11 +152,11 @@ function PendingOpDetail({ op, onDecided }: PendingOpDetailProps) {
           <div className="flex gap-2">
             <button onClick={() => decide("approved")} disabled={loading}
               className="flex-1 py-2.5 rounded-lg bg-green-600 hover:bg-green-500 text-white text-sm font-bold disabled:opacity-50 transition-colors">
-              {loading ? "…" : "Approve"}
+              {loading ? "â€¦" : "Approve"}
             </button>
             <button onClick={() => decide("denied")} disabled={loading}
               className="flex-1 py-2.5 rounded-lg bg-red-700/80 hover:bg-red-600 text-white text-sm font-bold disabled:opacity-50 transition-colors">
-              {loading ? "…" : "Deny"}
+              {loading ? "â€¦" : "Deny"}
             </button>
           </div>
         ) : (

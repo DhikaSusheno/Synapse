@@ -6,6 +6,7 @@
 
 import Link from "next/link";
 import { useBackendStatus, type BackendMode } from "@/hooks/useBackendStatus";
+import { usePlatformSettings } from "@/lib/usePlatformSettings";
 
 export type NavPage = "overview" | "code-graph" | "guardian" | "cortex" | "agents" | "approvals" | "operations" | "security" | "settings";
 
@@ -68,19 +69,22 @@ const FOOTER_LABEL: Record<BackendMode, string> = {
 
 export default function LeftNav({ activePage, onNavigate, pendingApprovals = 0 }: Props) {
   const { mode } = useBackendStatus();
+  const { settings } = usePlatformSettings();
+  const platformName = settings?.platform_name || "Synapse";
+  const environment = settings?.environment || "Production";
   const footer = FOOTER_STATUS[mode];
 
   return (
     <nav aria-label="Primary" className="w-52 shrink-0 flex flex-col bg-[#0d1117] border-r border-slate-800/60 overflow-hidden">
       {/* Logo — Link ke /landing. Sebelumnya div biasa, tidak bisa diklik. */}
       <div className="px-4 py-4 border-b border-slate-800/60 shrink-0">
-        <Link href="/landing" className="flex items-center gap-2.5 rounded-lg group" aria-label="Synapse — about and demo guide">
+        <Link href="/landing" className="flex items-center gap-2.5 rounded-lg group" aria-label={`${platformName} — about and demo guide`}>
           <div className="w-7 h-7 rounded-lg bg-blue-500/10 border border-blue-500/30 flex items-center justify-center shrink-0 group-hover:border-blue-400/60 transition-colors">
             <LogoMark />
           </div>
           <div className="min-w-0">
-            <div className="text-sm font-bold text-white tracking-tight">SYNAPSE</div>
-            <div className="text-[10px] text-slate-500 leading-tight truncate">Understanding Layer for AI Agents</div>
+            <div className="text-sm font-bold text-white tracking-tight truncate">{platformName.toUpperCase()}</div>
+            <div className="text-[10px] text-slate-500 leading-tight truncate">{environment} &middot; Understanding Layer</div>
           </div>
         </Link>
       </div>

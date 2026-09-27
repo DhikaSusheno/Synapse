@@ -5,13 +5,25 @@
 import { NextResponse } from "next/server";
 
 const BACKEND = process.env.BACKEND_URL ?? "http://localhost:8000";
+const TOKEN = process.env.SYNAPSE_API_TOKEN ?? "";
+
+const authHeaders: Record<string, string> = TOKEN
+  ? { "X-Synapse-Token": TOKEN }
+  : {};
 
 export async function GET() {
   try {
     const [nodesRes, edgesRes] = await Promise.all([
-      fetch(`${BACKEND}/graph/nodes`, { cache: "no-store" }),
-      fetch(`${BACKEND}/graph/edges`, { cache: "no-store" }),
+      fetch(`${BACKEND}/graph/nodes`, { cache: "no-store", headers: authHeaders }),
+      fetch(`${BACKEND}/graph/edges`, { cache: "no-store", headers: authHeaders }),
     ]);
+
+    if (nodesRes.status === 401 || edgesRes.status === 401) {
+      return NextResponse.json(
+        { error: "Token API backend tidak valid - cek SYNAPSE_API_TOKEN" },
+        { status: 502 }
+      );
+    }
 
     if (!nodesRes.ok || !edgesRes.ok) {
       return NextResponse.json(

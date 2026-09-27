@@ -1,7 +1,7 @@
 "use client";
 
 // components/GuardianPanel.tsx
-// Right panel — Guardian + Cortex Insight sesuai prototype
+// Right panel â€” Guardian + Cortex Insight sesuai prototype
 // FE-1 @nabilfauzandafa
 
 import { useState } from "react";
@@ -9,7 +9,7 @@ import type { Operation, GraphNode } from "@/lib/types";
 import { stamp } from "@/lib/derive";
 import { decideOperation } from "@/lib/operations";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "/backend";
 
 interface Props {
   pendingOps: Operation[];
@@ -176,7 +176,7 @@ export default function GuardianPanel({ pendingOps, onOpDecided }: Props) {
 
   return (
     <aside className="w-72 shrink-0 flex flex-col bg-[#0d1117] border-l border-slate-800/60 overflow-hidden">
-      {/* Guardian header — fixed */}
+      {/* Guardian header â€” fixed */}
       <div className="p-3 shrink-0">
         <div className="rounded-xl border border-slate-700/60 bg-slate-800/40 p-3.5">
           <div className="flex items-center justify-between mb-1.5">

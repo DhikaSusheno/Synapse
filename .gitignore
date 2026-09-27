@@ -2,21 +2,36 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# SQLite
 *.db
 *.db.bak.*
-# Sidecar WAL SQLite. `*.db` tidak match file berakhiran -wal/-shm, jadi
-# tanpa baris ini synapse_v2.db-wal ikut ter-commit.
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
 
+# Settings platform yang di-generate runtime (backend/settings.py)
+synapse_settings.json
+
+# Node / Next.js
 node_modules/
 .next/
+out/
+dist/
 *.tsbuildinfo
 next-env.d.ts
+
+# Env
 .env
 .env.local
+.env.*.local
+
+# Scratch file debugging lokal - jangan pernah ikut commit
+backend/test_bugfix.py
+backend/test_debug.py
+backend/test_debug2.py
 
 .DS_Store
+Thumbs.db

@@ -263,17 +263,34 @@ class TestIssue46TerminalGuard:
         for decision in ("approved", "denied"):
             r = guardian.approve_operation(oid, decision)
             assert r["ok"] is False, f"{status} + {decision} seharusnya ditolak, dapat {r}"
-            assert "terminal" in r["error"], r["error"]
+            assert r.get("terminal") is True, f"{status} harus ditandai terminal: {r}"
         assert _status(db, oid) == status, "status berubah padahal ditolak"
 
-    @pytest.mark.parametrize("status", NON_TERMINAL)
-    def test_can_approve_non_terminal(self, g, status):
-        """Guard tidak boleh memblokir transisi yang sah."""
+    @pytest.mark.parametrize("status", ("pending", "approved"))
+    def test_can_approve_approvable(self, g, status):
+        """Guard hanya boleh memblokir transisi yang memang tidak sah."""
         guardian, db = g
         oid = _add_op(db, status)
         r = guardian.approve_operation(oid, "approved")
         assert r["ok"] is True, f"{status} harusnya bisa di-approve: {r}"
         assert _status(db, oid) == "approved"
+
+    @pytest.mark.parametrize("status", ("executing", "executed_unverified"))
+    def test_cannot_approve_inflight(self, g, status):
+        """
+        BUG-09: kedua status ini bukan terminal, tapi TIDAK BOLEH di-approve.
+
+        Kalau boleh, approve menulis ulang status jadi 'approved', dan CAS di
+        execute_operation() mengizinkan 'approved' - operasi dieksekusi dua
+        kali. Test lama justru mengkotbodermi ini sebagai perilaku yang
+        diharapkan; sekarang sudah dibalik.
+        """
+        guardian, db = g
+        oid = _add_op(db, status)
+        r = guardian.approve_operation(oid, "approved")
+        assert r["ok"] is False, f"{status} tidak boleh bisa di-approve: {r}"
+        assert r.get("terminal") is False, f"{status} bukan terminal: {r}"
+        assert _status(db, oid) == status, "status berubah padahal ditolak"
 
     def test_double_execution_blocked(self, g):
         """
