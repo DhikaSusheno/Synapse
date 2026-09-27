@@ -134,12 +134,68 @@ def reset() -> Dict[str, Any]:
     return dict(DEFAULTS)
 
 
+def extra_workspace_roots() -> List[str]:
+    """
+    Root TAMBAHAN yang diizinkan, dibaca dari env `SYNAPSE_EXTRA_WORKSPACE_ROOTS`.
+
+    Sengaja dipisah dari settings: siapa yang boleh memperluas batas
+    kepercayaan harus diputuskan saat deployment, bukan lewat request HTTP.
+    Lihat allowed_roots() untuk alasannya.
+    """
+    raw = os.environ.get("SYNAPSE_EXTRA_WORKSPACE_ROOTS", "").strip()
+    if not raw:
+        return []
+    roots = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            roots.append(os.path.realpath(os.path.expanduser(item)))
+        except (OSError, ValueError):
+            continue
+    return roots
+
+
+def _within(target: str, root: str) -> bool:
+    """True kalau `target` ada di dalam `root` (atau sama dengannya)."""
+    return target == root or target.startswith(root + os.sep)
+
+
 def allowed_roots() -> List[str]:
+    """
+    Direktori yang boleh dibaca endpoint Synapse.
+
+    BUG FIX: sebelumnya workspace_path dari settings ditambahkan apa adanya
+    ke allowlist. Karena workspace_path bisa diubah siapa saja lewat
+    POST /settings, satu panggilan itu cukup untuk membuat SELURUH isi
+    filesystem terbaca: allowed_roots() jadi berisi "/", is_readable_path()
+    lulus untuk file mana pun, lalu /api/rag/ingest membaca file itu dan
+    /api/rag/search mengembalikan teksnya ke pemanggil. Rantainya
+    terverifikasi eksplisit.
+
+    Sekarang workspace_path hanya ikut terizinkan kalau resolve-nya berada
+    di dalam REPO_ROOT atau di dalam root tambahan dari env. Jadi siapa pun
+    yang bisa memanggil API tidak bisa memperluas batas kepercayaan; itu
+    harus lewat konfigurasi deployment.
+    """
     roots = [REPO_ROOT]
+    for extra in extra_workspace_roots():
+        if extra not in roots:
+            roots.append(extra)
+
     workspace = load()["workspace_path"]
     candidate = workspace if os.path.isabs(workspace) else os.path.join(REPO_ROOT, workspace)
-    resolved = os.path.realpath(candidate)
-    if os.path.isdir(resolved):
+    try:
+        resolved = os.path.realpath(os.path.expanduser(candidate))
+    except (OSError, ValueError):
+        return roots
+    if not os.path.isdir(resolved):
+        return roots
+    # Hanya boleh masuk kalau sudah berada di dalam root yang dipercaya.
+    if not any(_within(resolved, root) for root in roots):
+        return roots
+    if resolved not in roots:
         roots.append(resolved)
     return roots
 

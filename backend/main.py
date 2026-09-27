@@ -302,6 +302,36 @@ def update_settings(patch: SettingsPatch):
     payload = {k: v for k, v in patch.model_dump().items() if v is not None}
     if not payload:
         raise HTTPException(status_code=400, detail="Tidak ada perubahan untuk disimpan")
+    # workspace_path jangan jadi pintu keluar dari proteksi path: kalau
+    # nilainya diterima, allowed_roots() ikut melebar dan seluruh isi
+    # filesystem jadi bisa dibaca. Jadi tolak eksplisit, jangan diam-diam
+    # mengabaikan -- jawaban "ditolak" jauh lebih berguna daripada diam,
+    # dan penolakannya eksplisit seperti guard #63/#66.
+    workspace = payload.get("workspace_path")
+    if workspace is not None:
+        candidate = (
+            workspace if os.path.isabs(workspace)
+            else os.path.join(settings_store.REPO_ROOT, workspace)
+        )
+        try:
+            resolved = os.path.realpath(os.path.expanduser(candidate))
+        except (OSError, ValueError):
+            raise HTTPException(status_code=400, detail="workspace_path tidak valid")
+        trusted = [settings_store.REPO_ROOT] + settings_store.extra_workspace_roots()
+        if not any(
+            resolved == root or resolved.startswith(root + os.sep)
+            for root in trusted
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "workspace_path di luar repo dan di luar "
+                    "SYNAPSE_EXTRA_WORKSPACE_ROOTS, jadi tidak disimpan. "
+                    "Backend hanya boleh membaca path di dalam repo. Kalau "
+                    "memang butuh workspace lain, tambahkan path-nya ke env "
+                    "SYNAPSE_EXTRA_WORKSPACE_ROOTS saat deployment."
+                ),
+            )
     return {
         "ok": True,
         "settings": settings_store.save(payload),
