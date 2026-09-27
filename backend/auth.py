@@ -72,11 +72,28 @@ elif len(API_TOKEN) < 16:
 
 # Fernet key untuk encrypt/decrypt token (simpan di env FERNET_KEY)
 _FERNET_KEY = os.environ.get("FERNET_KEY", "").strip()
+# Fernet key untuk encrypt/decrypt token (simpan di env FERNET_KEY)
+_FERNET_KEY = os.environ.get("FERNET_KEY", "").strip()
 if not _FERNET_KEY:
     _LOG.warning("FERNET_KEY tidak disetel - generate random key (token tidak persisten)")
     _fernet = Fernet(Fernet.generate_key())
 else:
-    _fernet = Fernet(_FERNET_KEY.encode() if len(_FERNET_KEY) == 32 else base64.urlsafe_b64decode(_FERNET_KEY + "=" * (-len(_FERNET_KEY) % 4)))
+    # Fernet key must be 32 url-safe base64-encoded bytes (44 chars)
+    # Accept both raw 32-byte key and base64-encoded 44-char key
+    try:
+        # Try to decode as base64 first
+        key_bytes = base64.urlsafe_b64decode(_FERNET_KEY + "=" * (-len(_FERNET_KEY) % 4))
+        if len(key_bytes) == 32:
+            _fernet = Fernet(base64.urlsafe_b64encode(key_bytes).decode())
+        else:
+            raise ValueError("Fernet key must be 32 bytes")
+    except Exception:
+        # If base64 decode fails, try as raw key
+        try:
+            _fernet = Fernet(_FERNET_KEY.encode())
+        except Exception:
+            _LOG.error("Invalid FERNET_KEY, generating random key")
+            _fernet = Fernet(Fernet.generate_key())
 
 
 def encrypt_token(token: str) -> str:
