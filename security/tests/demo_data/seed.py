@@ -6,7 +6,14 @@ untuk dipakai oleh test_demo_reliability.py.
 Fungsi create_demo_db() dipakai sebagai fixture di test_demo_reliability.py.
 """
 import sqlite3
+import sys
 from pathlib import Path
+
+BACKEND_DIR = Path(__file__).resolve().parents[3] / "backend"
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from database import _add_missing_columns  # noqa: E402
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -51,6 +58,65 @@ CREATE TABLE IF NOT EXISTS approvals (
     decided_at   TEXT DEFAULT (datetime('now')),
     note         TEXT DEFAULT ''
 );
+
+-- H5 FIX: DDL ini dulunya berhenti di approvals, padahal file ini menamai
+-- dirinya "schema lengkap". Skema produksi di database.py punya delapan
+-- tabel; empat di antaranya baru ditambahkan ke invariant
+-- db_schema_tables_exist, sehingga demo DB yang hanya punya empat tadi
+-- membuat verifier gagal — dan itu justru menandakan fixture-nya yang tidak
+-- lengkap, bukan invariant-nya yang salah. Disalin persis dari database.py
+-- supaya test berjalan di atas skema yang sama dengan produksi.
+CREATE TABLE IF NOT EXISTS github_connections (
+    id            TEXT PRIMARY KEY,
+    type          TEXT NOT NULL,
+    access_token  TEXT NOT NULL,
+    scope         TEXT,
+    user_login    TEXT,
+    user_avatar   TEXT,
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS repo_refs (
+    id              TEXT PRIMARY KEY,
+    source          TEXT NOT NULL,
+    github_owner    TEXT,
+    github_repo     TEXT,
+    github_branch   TEXT,
+    local_path      TEXT,
+    name            TEXT NOT NULL,
+    last_synced     TEXT,
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS llm_providers (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    type            TEXT NOT NULL,
+    base_url        TEXT,
+    api_key         TEXT,
+    models          TEXT,
+    default_model   TEXT,
+    max_tokens      INTEGER DEFAULT 4096,
+    supports_tools  INTEGER DEFAULT 1,
+    supports_vision INTEGER DEFAULT 0,
+    enabled         INTEGER DEFAULT 1,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS project_llm_configs (
+    project_id      TEXT PRIMARY KEY,
+    provider_id     TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    temperature     REAL DEFAULT 0.2,
+    max_tokens      INTEGER DEFAULT 4096,
+    system_prompt   TEXT,
+    rag_enabled     INTEGER DEFAULT 1,
+    rag_top_k       INTEGER DEFAULT 5,
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (provider_id) REFERENCES llm_providers(id)
+);
 """
 
 
@@ -70,6 +136,9 @@ def create_demo_db(db_path) -> Path:
     db_path = Path(db_path)
     conn = sqlite3.connect(str(db_path))
     conn.executescript(DDL)
+    # Sama seperti security/tests/conftest.py: DDL di atas salinan parsial
+    # dari database.py, jadi kolom yang ditambahkan belakangan harus ikut.
+    _add_missing_columns(conn)
 
     # Seed nodes — 12 nodes mencakup semua tipe yang dibutuhkan E8 + E8b
     seed_nodes = [

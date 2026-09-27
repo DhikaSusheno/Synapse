@@ -25,46 +25,6 @@ if str(BACKEND_DIR) not in sys.path:
 DDL = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
-
-CREATE TABLE IF NOT EXISTS nodes (
-    id          TEXT PRIMARY KEY,
-    type        TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    meta_json   TEXT DEFAULT '{}',
-    created_at  TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS edges (
-    id           TEXT PRIMARY KEY,
-    source_id    TEXT NOT NULL,
-    target_id    TEXT NOT NULL,
-    relationship TEXT NOT NULL,
-    confidence   REAL DEFAULT 1.0,
-    created_at   TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS operations (
-    id                   TEXT PRIMARY KEY,
-    tool_name            TEXT NOT NULL,
-    params_json          TEXT DEFAULT '{}',
-    target_node_id       TEXT,
-    blast_radius         TEXT DEFAULT 'unknown',
-    reversibility_class  TEXT DEFAULT 'irreversible_suspected',
-    status               TEXT DEFAULT 'pending',
-    snapshot_ref         TEXT,
-    rollback_command     TEXT,
-    requires_approval    INTEGER DEFAULT 1,
-    created_at           TEXT DEFAULT (datetime('now')),
-    executed_at          TEXT,
-    verified_at          TEXT
-);
-
-CREATE TABLE IF NOT EXISTS approvals (
-    operation_id TEXT PRIMARY KEY,
-    decision     TEXT NOT NULL,
-    decided_at   TEXT DEFAULT (datetime('now')),
-    note         TEXT DEFAULT ''
-);
 """
 
 
@@ -74,9 +34,18 @@ def mem_db(tmp_path):
     Buat SQLite file sementara di tmp_path, jalankan DDL.
     Return path file DB (pathlib.Path).
     """
+    import database as db_mod
+
     db_file = tmp_path / "test_synapse.db"
     conn = sqlite3.connect(str(db_file))
+    # Skema diambil dari database.SCHEMA, bukan dari salinan di sini. Salinan
+    # parsial pernah tertinggal dua kali: menambah operations.target_id ->
+    # "no such column", dan menambah tabel kontrak -> invariant
+    # db_schema_tables_exist menolak hasil test karena sandbox tidak punya
+    # github_connections/repo_refs/llm_providers/project_llm_configs.
     conn.executescript(DDL)
+    conn.executescript(db_mod.SCHEMA)
+    db_mod._add_missing_columns(conn)
     conn.commit()
     conn.close()
     return db_file

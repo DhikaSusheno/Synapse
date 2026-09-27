@@ -372,10 +372,23 @@ def ops_client(tmp_path, monkeypatch):
     conn.execute(
         "INSERT INTO operations (id, tool_name, status) VALUES ('o1', 'service.restart', 'pending')"
     )
+    # Kolom yang ditambahkan lewat ALTER TABLE (operations.target_id) ikut
+    # dipasang di sini juga: DDL di atas sengaja dibuat minimal, dan
+    # /operations memfilter kolom itu. Tanpa pemanggilan ini, test gagal
+    # dengan "no such column: target_id" - bukan karena filter-nya salah.
+    database._add_missing_columns(conn)
     conn.commit()
     conn.close()
 
     monkeypatch.setattr(main, "DB_PATH", str(db_file))
+    # /operations menyaring ke target aktif (BUG-44). Registry proyek user
+    # sungguhan TIDAK boleh ikut dibaca di sini: kalau ada target aktif di
+    # mesin developer, baris o1 (target_id='') lenyap dari hasil dan test
+    # gagal bukan karena filter status-nya salah. Dipaksa "tidak ada target"
+    # supaya test ini murni menguji validasi status.
+    import projects
+
+    monkeypatch.setattr(projects, "get_active", lambda: None)
     with TestClient(main.app) as c:
         yield c
 

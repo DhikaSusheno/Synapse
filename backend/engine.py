@@ -69,11 +69,25 @@ _LOG = logging.getLogger("synapse.engine")
 
 from storage import (
     DB_PATH,
+    active_db_path,
     get_conn,
     record_audit,
     upsert_entity,
     upsert_relation,
 )
+
+
+def invalidate_graph_cache() -> None:
+    """Paksa graph di-memory dibangun ulang dari DB.
+
+    WAJIB dipanggil setiap kali file DB yang aktif berpindah (ganti target).
+    Tanpa ini _get_graph() melihat _graph yang bukan None dan mengembalikan
+    graph milik target SEBELUMNYA - user sudah ganti repo tapi masih melihat
+    data repo lama.
+    """
+    global _graph
+    with _graph_lock:
+        _graph = None  # type: ignore[assignment]
 
 # #66: sumber kebenaran untuk "path mana yang boleh dibaca" ada di settings.py.
 # Sengaja alias yang sama seperti di main.py supaya tidak ada dua mekanisme
@@ -117,7 +131,10 @@ __all__ = [
 # penukaran _graph lama ke yang baru terjadi atomik di bawah lock.
 
 _graph_lock: threading.Lock = threading.Lock()
-_graph: nx.DiGraph = nx.DiGraph()
+# None = "belum dibangun untuk target saat ini". nx.DiGraph() kosong adalah
+# nilai yang valid (target aktif memang belum punya isi), jadi keduanya
+# harus bisa dibedakan - itulah kenapa invalidate_graph_cache() men-set None.
+_graph: nx.DiGraph | None = None
 
 # Root repo yang terakhir di-ingest. Symbol entity hanya menyimpan
 # source_path RELATIF (menjimka ruang di setiap baris), jadi pembaca snippet
@@ -171,7 +188,7 @@ def _build_graph_from_db() -> nx.DiGraph:
 
 def _get_graph() -> nx.DiGraph:
     """
-    Ambil graph aktif. Kalau masih kosong, rebuild sekali dari SQLite.
+    Ambil graph aktif. Kalau belum dibangun, build sekali dari SQLite.
 
     Ini yang membuat analyze_*.py tetap berguna setelah restart: proses baru
     mulai dengan _graph kosong, dan tidak ada yang memanggil ingest_repository()
@@ -183,12 +200,17 @@ def _get_graph() -> nx.DiGraph:
     menimpa, sementara thread lain memegang referensi graph yang sudah
     basi. Itu persis skenario "overwrite graph valid" yang dilapor issue #33.
 
-    Lock hanya dipegang saat graph masih kosong, jadi setelah rebuild pertama
-    semua panggilan berikutnya cuma lock + cek `len(_graph)` yang murah.
+    Lock hanya dipegang saat graph belum dibangun, jadi setelah build pertama
+    semua panggilan berikutnya cuma lock + cek `_graph is None` yang murah.
+
+    `is None` (bukan `len == 0`) yang jadi kondisi build. Karena
+    invalidate_graph_cache() men-set None setiap ganti target, sementara
+    graph target yang memang kosong (0 node) tidak boleh memicu build
+    berulang tiap request.
     """
     global _graph
     with _graph_lock:
-        if len(_graph) == 0:
+        if _graph is None:
             _graph = _build_graph_from_db()
         return _graph
 
@@ -873,6 +895,62 @@ def _link_imports() -> int:
     return added
 
 
+def _current_repo_ids(root: Path) -> set[str]:
+    """Id entitas yang HARUS ada setelah ingest root ini.
+
+    Berisi file, simbol, dan doc yang ada di disk sekarang. Dipakai
+    prune_stale() untuk membuang entitas dari file yang sudah dihapus
+    sejak ingest sebelumnya - tanpa ini, graph hanya menumpuk dan file
+    yang sudah tidak ada tetap muncul di health report.
+    """
+    keep: set[str] = set()
+    for path in _iter_repo_files(root):
+        try:
+            rel = str(path.relative_to(root))
+        except ValueError:
+            continue
+        ext = path.suffix.lower()
+        if ext in SUPPORTED_EXTENSIONS:
+            keep.add(f"file::{rel}")
+            for sym in parse_source(path, SUPPORTED_EXTENSIONS[ext]):
+                keep.add(f"symbol::{rel}::{sym['name']}")
+        else:
+            keep.add(f"doc::{rel}")
+    return keep
+
+
+def prune_stale(keep: set[str]) -> int:
+    """Hapus entitas file/symbol/doc yang tidak lagi ada di disk.
+
+    Hanya kind='file', 'symbol', dan 'doc' yang disentuh. Action, decision,
+    dan entitas lain milik workflow Guardian/audit TIDAK dihapus, karena
+    mereka bukan hasil pindai repository dan dihapus akan menghapus jejak
+    audit. Relasi yang salah satu ujungnya terhapus ikut terhapus.
+    """
+    conn = get_conn()
+    stale: list[str] = []
+    for row in conn.execute(
+        "SELECT id FROM entities WHERE kind IN ('file','symbol','doc')"
+    ):
+        if row["id"] not in keep:
+            stale.append(row["id"])
+    if not stale:
+        return 0
+    chunk = 400
+    removed = 0
+    for start in range(0, len(stale), chunk):
+        batch = stale[start:start + chunk]
+        placeholders = ",".join("?" * len(batch))
+        conn.execute(f"DELETE FROM relations WHERE from_id IN ({placeholders})", batch)
+        conn.execute(f"DELETE FROM relations WHERE to_id IN ({placeholders})", batch)
+        cur = conn.execute(
+            f"DELETE FROM entities WHERE id IN ({placeholders})", batch
+        )
+        removed += cur.rowcount or 0
+    conn.commit()
+    return removed
+
+
 def ingest_repository(repo_path: str) -> dict:
     """
     Walk repo, parse simbol, bangun knowledge graph di storage.py.
@@ -996,6 +1074,7 @@ def ingest_repository(repo_path: str) -> dict:
     documented_ids: set[str] = set()
     stats["edges"] += _link_docs_to_code(root, documented_ids)
     stats["edges"] += _link_imports()
+    stats["stale_removed"] = prune_stale(_current_repo_ids(root))
 
     conn = get_conn()
     total_files = conn.execute(
@@ -1044,19 +1123,90 @@ def _relevance(label: str, topic_lower: str) -> float:
     return 0.5
 
 
+# Cortex mengirim topik dalam bentuk KALIMAT, bukan nama entitas: tree file
+# mengisi "How does <nama> work?" dan quick action pun menulis
+# "Jelaskan <nama>". Pencocokan di bawah adalah `LIKE '%topic%'` terhadap
+# `entities.label`, jadi kalimat utuh itu tidak akan pernah match dan
+# explain_topic selalu balas 404 "Tidak ditemukan entitas yang cocok".
+#
+# Buang pembungkus kalimat tanya sebelum mencari. Menyelamatkannya: kalau
+# memang nama entitas (mis. "main.py"), pollanya tidak berubah dan tidak ada
+# yang dilepas. Kalau tidak ada yang cocok, topik asli tetap dikembalikan
+# ke pemanggil supaya pesan errornya menyebut apa yang diketik user.
+_TOPIC_WRAPPERS = (
+    re.compile(r"^\s*how\s+(?:does|do|is|are|can)\s+", re.I),
+    re.compile(r"^\s*what\s+(?:is|are|does|do)\s+", re.I),
+    re.compile(r"^\s*(?:please\s+)?explain\s+(?:how\s+|what\s+|why\s+)?", re.I),
+    re.compile(r"^\s*(?:jelaskan|gimana|bagaimana|kegu mana)\s+", re.I),
+    re.compile(r"^\s*(?:apa|siapa|mengapa|kenapa)\s+(?:itu\s+|adalah\s+)?", re.I),
+    re.compile(r"^\s*tolong\s+", re.I),
+)
+_TOPIC_TRAILERS = re.compile(
+    r"\s+(?:work|works|working|berfungsi|terjadi|do|does|berada|terjady)\s*[?.!]*\s*$",
+    re.I,
+)
+
+
+def normalize_topic(topic: str) -> str:
+    """Buang pembungkus kalimat tanya, sisakan nama entitas yang dicari."""
+    text = (topic or "").strip()
+    if not text:
+        return ""
+    for _ in range(3):  # "How does the guardian module work?" bisa berlapis
+        before = text
+        for pattern in _TOPIC_WRAPPERS:
+            new = pattern.sub("", text, count=1)
+            if new != text:
+                text = new.strip()
+                break
+        text = _TOPIC_TRAILERS.sub("", text).strip()
+        if text == before:
+            break
+    return text.strip(" ?.!\t") or (topic or "").strip()
+
+
+def _near_misses(conn, topic_lower: str, limit: int = 5) -> list[str]:
+    """Label yang paling mirip, untuk dicantumkan di pesan 404.
+
+    Tanpa ini, 404 hanya misinformation "tidak ditemukan" padahal graph-nya
+    penuh - user lalu menebak nama sendiri.
+    """
+    tokens = [t for t in re.split(r"[^a-z0-9_.]+", topic_lower) if len(t) > 2]
+    if not tokens:
+        return []
+    where = " OR ".join("LOWER(label) LIKE ?" for _ in tokens)
+    params = [f"%{t}%" for t in tokens]
+    try:
+        rows = conn.execute(
+            f"SELECT label FROM entities WHERE {where} LIMIT ?", (*params, limit * 4)
+        ).fetchall()
+    except Exception:
+        return []
+    seen: list[str] = []
+    for row in rows:
+        label = row["label"]
+        if label and label not in seen:
+            seen.append(label)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
 def ask_about(topic: str) -> dict:
     """
     Jawab pertanyaan tentang sebuah entitas di graph.
 
     relevance: exact 1.0 | prefix 0.8 | partial 0.5. Kalau tidak ada yang
-    cocok, return ok=False — bukan diam-diam mengembalikan entitas acak.
+    cocok, return ok=False - bukan diam-diam mengembalikan entitas acak.
     """
     g = _get_graph()
-    topic_lower = topic.strip().lower()
+    original_topic = topic
+    topic_lower = normalize_topic(topic).lower()
     if not topic_lower:
         return {"ok": False, "topic": topic, "message": "Topic kosong."}
 
     conn = get_conn()
+
     rows = conn.execute(
         """SELECT id, kind, label, attributes_json, complexity, symbol_kind,
                   source_path, line_start
@@ -1090,9 +1240,19 @@ def ask_about(topic: str) -> dict:
     matches.sort(key=lambda m: (m["relevance"], m["complexity"]), reverse=True)
 
     if not matches:
+        # Balas dengan kandidat yang mirip. Tanpa ini, kalimat 404 menyuruh
+        # user menebak nama entitas padahal graph-nya ada. Quick action
+        # action Explain yang gagal terlihat seperti graph-nya kosong.
+        suggestions = _near_misses(conn, topic_lower)
+        message = f"Tidak ditemukan entitas yang cocok dengan '{topic}' di graph."
+        if suggestions:
+            message += " Mungkin maksudmu: " + ", ".join(suggestions) + "."
         return {
-            "ok": False, "topic": topic,
-            "message": f"Tidak ditemukan entitas yang cocok dengan '{topic}' di graph.",
+            "ok": False,
+            "topic": original_topic,
+            "searched": topic,
+            "suggestions": suggestions,
+            "message": message,
         }
 
     primary = matches[0]
@@ -1122,7 +1282,7 @@ def ask_about(topic: str) -> dict:
             }
             related.append(entry)
             # Caller = simbol yang menunjuk ke simbol ini. File dan dokumen
-            # juga_edge ke simbol, tapi itu bukan "pemanggil".
+            # juga edge ke simbol, tapi itu bukan "pemanggil".
             if data.get("kind") == "symbol":
                 callers.append(entry)
 
@@ -1741,7 +1901,7 @@ def graph_stats() -> dict:
         "edge_count": g.number_of_edges(),
         "nodes_by_kind": by_kind,
         "edges_by_relationship": by_relation,
-        "db_path": str(DB_PATH),
+        "db_path": str(active_db_path()),
     }
 
 

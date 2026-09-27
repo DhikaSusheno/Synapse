@@ -47,8 +47,9 @@ from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from pydantic import BaseModel, Field, field_validator, model_validator
+from urllib.parse import urlsplit
 import sqlite3
 
 # Issue #74 fix: Pastikan stdout/stderr pakai UTF-8 agar emoji/unicode
@@ -68,6 +69,29 @@ import cortex
 import guardian
 import auth
 import settings as settings_store
+import projects
+
+
+def _restore_active_target() -> None:
+    """Terapkan target aktif dari registry ke storage + engine saat startup.
+
+    Dipisah dari lifespan supaya bisa diuji tanpa menjalankan app. Kalau
+    target aktif tidak valid (path hilang, di luar workspace), ini TIDAK
+    diam-diam membuka graph target lain - storage diset ke None supaya user
+    melihat "belum ada target", bukan data repository yang salah.
+    """
+    active = projects.ensure_active_applied()
+    # Graph in-memory masih milik DB default setelah ganti target.
+    engine.invalidate_graph_cache()
+    if active is None:
+        print("[Synapse] Tidak ada target aktif; pakai graph kosong.")
+    elif not active.get("available"):
+        print(
+            f"[Synapse] Target aktif {active['id']!r} tidak tersedia "
+            f"({active.get('path')!r}); graph dinonaktifkan."
+        )
+    else:
+        print(f"[Synapse] Target aktif: {active['label']} ({active['path']})")
 
 # ---------------------------------------------------------------------------
 # Batas ukuran ingest
@@ -98,6 +122,11 @@ async def lifespan(_app: FastAPI):
     # audit_log selalu ada; kalau tidak, pemakai pertama akan kena
     # "no such table: entities" saat runtime.
     storage.init_db()
+    # Target aktif (repository/folder yang dianalisis) disimpan di registry
+    # terpisah, tapi efeknya ada di storage: file DB graph untuk target itu.
+    # Dipanggil SEBELUM endpoint dilayani supaya /graph/* langsung membaca DB
+    # yang benar, dan supaya DB target aktif pasti punya skema.
+    _restore_active_target()
     # BUG-08 FIX: set event loop reference di cortex agar _emit() thread-safe
     # (Guardian endpoint adalah sync, dipanggil dari threadpool — perlu call_soon_threadsafe
     # BUG-E FIX: get_running_loop() adalah cara yang benar dalam async context (Python 3.7+)
@@ -282,6 +311,230 @@ class ApproveOperationRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # CORTEX endpoints — BE-2 Masrendra
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Targets: repository / folder yang dianalisis
+# ---------------------------------------------------------------------------
+
+class TargetCreateRequest(BaseModel):
+    kind: Literal["local", "github"] = "local"
+    label: str
+    path: str
+    source: str | None = None
+    branch: str | None = None
+    make_active: bool = True
+    ingest: bool = True
+
+class TargetUpdateRequest(BaseModel):
+    label: str | None = None
+    branch: str | None = None
+
+class IngestRequest(BaseModel):
+    """Opsi ingest. Default-nya `true` supaya satu klik langsung berguna."""
+    ingest: bool = True
+
+
+def _target_payload(target: dict | None) -> dict:
+    """Satu bentuk respons untuk semua endpoint target.
+
+    `db_path` sengaja TIDAK ikut: path absolut server tidak berguna di
+    browser dan hanya membocorkan struktur filesystem.
+    """
+    if target is None:
+        return {"ok": True, "active": None, "target": None,
+                "targets": [], "ingest": None}
+    return {
+        "ok": True,
+        "active": target.get("id"),
+        "target": target,
+        "targets": projects.list_targets(),
+        "ingest": None,
+    }
+
+
+def _active_target_id() -> str:
+    """Id target aktif, atau "" kalau belum ada target.
+
+    Dipakai untuk mengelompokkan history operasi & approval. Kalau tidak ada
+    target aktif, hasilnya "" - itu BUKAN "semua target", jadi instalasi yang
+    belum punya target melihat daftar kosong, bukan history repo lain yang
+    bocor lewat layar kosong.
+    """
+    active = projects.get_active()
+    if not isinstance(active, dict):
+        return ""
+    return active.get("id") or ""
+
+
+def _switch_target(target_id: str) -> dict:
+    """Aktifkan sebuah target dan jaga storage + engine tetap konsisten.
+
+    Dua hal HARUS terjadi bersama-sama:
+      - storage.set_active_target() : file DB yang dibaca berubah
+      - engine.invalidate_graph_cache() : graph in-memory dibangun ulang
+
+    Kalau hanya yang pertama, user berganti repo tapi /graph/*, /repo_health,
+    /complexity_report masih melaporkan graph repo sebelumnya.
+    """
+    target = projects.set_active(target_id)
+    storage.set_active_target(target_id)
+    engine.invalidate_graph_cache()
+    return target
+
+
+@app.get("/api/targets/browse", tags=["Targets"])
+def browse_target_dirs(path: str = ""):
+    """Daftar subfolder di `path` untuk dipilih sebagai target analisis.
+
+    BEDA dengan `/browse` (yang terkurung di dalam repo/workspace): endpoint ini
+    ada supaya "Folder lokal" bisa membuka folder PC mana pun, karena folder
+    yang mau dipilih belum tentu ada di allowed_roots(). Agar itu tetap aman,
+    yang dikembalikan HANYA nama direktori - tidak ada nama file, tidak ada
+    ukuran - dan folder kredential (.ssh, .aws, .gnupg, .kube, .config/gcloud)
+    ditolak.
+
+    Path kosong berarti folder home, titik awal yang wajar untuk memilih folder
+    proyek. Folder home sendiri tetap TIDAK bisa dijadikan target; itu dicek
+    terpisah di projects.create_target().
+    """
+    try:
+        return projects.browse_target_dirs(path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except NotADirectoryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/targets", tags=["Targets"])
+def list_targets():
+    """Daftar target yang terdaftar, plus target aktif.
+
+    `active` null berarti belum ada target, dan semua endpoint graph akan
+    mengembalikan graph kosong. Itu kondisi normal untuk instalasi baru.
+    """
+    return {
+        "ok": True,
+        "active": (projects.get_active() or {}).get("id"),
+        "target": projects.get_active(),
+        "targets": projects.list_targets(),
+    }
+
+
+@app.post("/api/targets", tags=["Targets"])
+def create_target(req: TargetCreateRequest):
+    """Daftarkan target baru (folder lokal atau repo GitHub ter-sync).
+
+    Path divalidasi di projects.create_target(): harus ada, berupa folder,
+    dan lolos settings_store.is_readable_path(). Kegagalan validasi
+    dikembalikan sebagai 400/403, bukan 500.
+    """
+    try:
+        target = projects.create_target(
+            kind=req.kind,
+            label=req.label,
+            path=req.path,
+            source=req.source,
+            branch=req.branch,
+            make_active=req.make_active,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if req.make_active:
+        _switch_target(target["id"])
+
+    ingest = None
+    if req.ingest and target.get("available"):
+        # Ingest gagal tidak membatalkan pendaftaran target: target-nya
+        # tetap valid, user bisa mencoba ulang tanpa daftar ulang.
+        ingest = engine.ingest_repository(target["path"])
+        if not ingest.get("ok"):
+            target = projects.get_active() or target
+    payload = _target_payload(target)
+    payload["ingest"] = ingest
+    return payload
+
+
+@app.patch("/api/targets/{target_id}", tags=["Targets"])
+def update_target(target_id: str, req: TargetUpdateRequest):
+    """Ubah label/branch. Path tidak bisa diubah lewat endpoint ini."""
+    if not projects.is_valid_id(target_id):
+        raise HTTPException(status_code=400, detail="Target id tidak valid")
+    try:
+        target = projects.update_target(
+            target_id, label=req.label, branch=req.branch
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Target not found")
+    return _target_payload(target)
+
+
+@app.post("/api/targets/{target_id}/activate", tags=["Targets"])
+def activate_target(target_id: str, req: IngestRequest | None = None):
+    """Pindahkan target aktif. Graph in-memory di-rebuild seketika.
+
+    `ingest=true` (default) langsung memindai folder target itu, jadi user
+    tidak perlu klik kedua untuk melihat data. Caller yang hanya ingin
+    berpindah bisa kirim ingest=false.
+    """
+    if not projects.is_valid_id(target_id):
+        raise HTTPException(status_code=400, detail="Target id tidak valid")
+    try:
+        target = _switch_target(target_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Target not found")
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    want_ingest = True if req is None else bool(getattr(req, "ingest", True))
+    ingest = None
+    if want_ingest and target.get("available"):
+        ingest = engine.ingest_repository(target["path"])
+    payload = _target_payload(target)
+    payload["ingest"] = ingest
+    return payload
+
+
+@app.delete("/api/targets/{target_id}", tags=["Targets"])
+def delete_target(
+    target_id: str,
+    remove_graph: bool = False,
+):
+    """Hapus target dari registry. `remove_graph=true` ikut menghapus graph.
+
+    Default remove_graph=false supaya user tidak kehilangan hasil pindai
+    hanya karena salah Target. Tidak ada kebocoran path di sini: file DB
+    dihapus lewat storage.db_path_for_target() yang menyaring id lebih dulu.
+    """
+    if not projects.is_valid_id(target_id):
+        raise HTTPException(status_code=400, detail="Target id tidak valid")
+    try:
+        removal = projects.delete_target(target_id, remove_graph=remove_graph)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Target not found")
+
+    # Kalau target yang dihapus sedang aktif, registry sudah menunjuk ke
+    # target lain (atau None). Terapkan supaya storage & engine ikut.
+    active = projects.ensure_active_applied()
+    engine.invalidate_graph_cache()
+    return {
+        "ok": True,
+        "deleted": target_id,
+        "active": (active or {}).get("id"),
+        "target": active,
+        "targets": projects.list_targets(),
+        # Diporto ke depan supaya user tidak mengira graph sudah hilang padahal
+        # file-nya masih terkunci. graph_path sengaja tidak ikut: path absolut
+        # server tidak ada gunanya di browser.
+        "graph_removed": removal.get("graph_removed"),
+    }
+
 
 @app.post("/understand_repo", tags=["Cortex"])
 def understand_repo(req: UnderstandRepoRequest):
@@ -562,8 +815,13 @@ def execute_operation(req: ExecuteOperationRequest):
 
 @app.get("/list_pending_approvals", tags=["Guardian"])
 def list_pending_approvals():
-    """🛡️ Daftar semua operasi yang menunggu approval manusia."""
-    return guardian.list_pending_approvals()
+    """🛡️ Daftar semua operasi yang menunggu approval manusia.
+
+    Disaring per target aktif: approval untuk repo lain tidak boleh muncul di
+    sini, karena menyetujuinya berarti menyetujui perubahan pada folder yang
+    tidak sedang dianalisis.
+    """
+    return guardian.list_pending_approvals(target_id=_active_target_id())
 
 
 @app.post("/approve_operation", tags=["Guardian"])
@@ -598,20 +856,33 @@ def list_operations(
 
     Dengan Literal, FastAPI mengembalikan 422 + daftar nilai yang diizinkan,
     dan enum-nya ikut muncul di OpenAPI docs.
+
+    FILTER PER TARGET: rows disaring ke `operations.target_id` milik target
+    aktif. Ini yang membuat halaman Operations, Agents, dan Security (ketiganya
+    membaca endpoint ini) tidak lagi menampilkan history repository atau
+    folder lain. `?all_targets=true` sengaja TIDAK ada: menampilkan history
+    target lain lewat parameter query hanya membuat UI Studien salah target
+    bisa terjadi tanpa sengaja.
+
+    Riwayat operasi yang target-nya sudah dihapus dari registry TIDAK ikut
+    terhapus - barisnya tetap di DB, cuma tidak terlihat karena tidak ada
+    target dengan id itu lagi. Jadi approval lama tidak hilang saat folder
+    dihapus dari daftar.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    where = ["COALESCE(target_id, '') = ?"]
+    params: list = [_active_target_id()]
     if status:
-        rows = conn.execute(
-            "SELECT * FROM operations WHERE status=? ORDER BY created_at DESC LIMIT ?",
-            (status, limit)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM operations ORDER BY created_at DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-    
+        where.append("status = ?")
+        params.append(status)
+    params.append(limit)
+    rows = conn.execute(
+        f"SELECT * FROM operations WHERE {' AND '.join(where)} "
+        f"ORDER BY created_at DESC LIMIT ?",
+        params,
+    ).fetchall()
+
     ops = [dict(r) for r in rows]
     
     # Tambahkan conflicts dari edges table (relationship = 'CONFLICTS_WITH')
@@ -798,43 +1069,75 @@ def _require_valid_redirect(raw: str) -> str:
     return raw
 
 
+def _github_oauth_redirect_uri(request: Request) -> str:
+    """
+    Redirect URI untuk tukar-kode jadi token, diturunkan dari host yang
+    benar-benar menghubungi backend.
+
+    Default lama menunjuk ke http://localhost:3000/auth/github/callback - route
+    Next.js yang tidak pernah ada. GitHub lalu mengirim `code` ke sana, tidak
+    ada yang menukar kode itu, dan user terkunci di halaman 404. Yang lebih
+    buruk, menukar kode di dalam browser justru membuka jalan token GitHub
+    lolos ke client, padahal kontrak repo ini: token tidak pernah ada di
+    browser.
+
+    Nilai turunan ini tetap harus lolos _require_valid_redirect: base_url ikut
+    Host header, jadi tanpa gerbang whitelist ia open redirect yang disamarkan
+    sebagai "derived from request".
+    """
+    return f"{str(request.base_url).rstrip('/')}/api/github/callback"
+
+
+def _resolve_oauth_redirect(request: Request, redirect_uri: str | None) -> str:
+    """Ambil redirect_uri dari query bila ada, else turunkan dari host request."""
+    return _require_valid_redirect(redirect_uri or _github_oauth_redirect_uri(request))
+
+
 @app.get("/api/github/auth/url", tags=["GitHub"])
-def github_oauth_url(redirect_uri: str = "http://localhost:3000/auth/github/callback"):
+def github_oauth_url(request: Request, redirect_uri: str | None = None):
     """Get GitHub OAuth authorization URL."""
-    import os
+    from urllib.parse import urlencode
     client_id = os.getenv("GITHUB_CLIENT_ID")
-    if not client_id:
-        raise HTTPException(status_code=500, detail="GITHUB_CLIENT_ID not configured")
-    # M7: validasi dulu, baru di-encode. quote(safe="") mengubah "&", "?" dan
-    # "=" di dalam redirect_uri jadi %26/%3F/%3D sehingga nilai itu tidak lagi
-    # bisa menambahkan query param sendiri ke URL authorize.
-    redirect_uri = _require_valid_redirect(redirect_uri)
+    client_secret = os.getenv("GITHUB_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="GitHub OAuth not configured (GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET)",
+        )
+    # M7: validasi dulu, baru di-encode, supaya nilai redirect_uri tidak bisa
+    # memotong dirinya sendiri lewat "?" / "&" / "=" lalu menambahkan query
+    # param lain ke URL authorize. Query dirakit lewat dict (urlencode) supaya
+    # redirect_uri tetap persis sama dengan yang dipakai saat tukar kode di
+    # /api/github/callback.
+    redirect_uri = _resolve_oauth_redirect(request, redirect_uri)
     scope = "repo read:org read:user"
-    url = (
-        "https://github.com/login/oauth/authorize"
-        f"?client_id={quote(client_id, safe='')}"
-        f"&redirect_uri={quote(redirect_uri, safe='')}"
-        f"&scope={quote(scope, safe='')}"
-        "&state=synapse"
+    query = urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": "synapse",
+        }
     )
-    return {"url": url, "state": "synapse"}
+    url = f"https://github.com/login/oauth/authorize?{query}"
+    return {"url": url, "state": "synapse", "redirect_uri": redirect_uri}
 
 @app.get("/api/github/callback", tags=["GitHub"])
-def github_callback(code: str, state: str = "", redirect_uri: str = "http://localhost:3000/auth/github/callback"):
+def github_callback(request: Request, code: str, state: str = "", redirect_uri: str | None = None):
     """Handle GitHub OAuth callback, exchange code for access token."""
-    import os
-    import requests
     client_id = os.getenv("GITHUB_CLIENT_ID")
     client_secret = os.getenv("GITHUB_CLIENT_SECRET")
     if not client_id or not client_secret:
         raise HTTPException(status_code=500, detail="GitHub OAuth not configured")
-    
-    # M7: redirect_uri yang sama harus valid di callback — nilai ini
-    # dikirim balik ke GitHub saat penukaran code, dan GitHub mencocokkannya
-    # dengan nilai di langkah authorize.
-    redirect_uri = _require_valid_redirect(redirect_uri)
+
+    # Harus identik dengan yang dikirim ke GitHub di /api/github/auth/url,
+    # kalau tidak GitHub menolak tukar kode dengan "redirect_uri mismatch".
+    # M7: nilai dari query tetap harus lolos whitelist yang sama seperti di
+    # langkah authorize - user boleh mengarahkan callback ke host lain.
+    redirect_uri = _resolve_oauth_redirect(request, redirect_uri)
 
     # Exchange code for token
+    import requests
     resp = requests.post(
         "https://github.com/login/oauth/access_token",
         data={
@@ -864,8 +1167,6 @@ def github_callback(code: str, state: str = "", redirect_uri: str = "http://loca
     user = user_resp.json()
     
     # Store connection
-    import sqlite3
-    from datetime import datetime
     from auth import encrypt_token
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -878,7 +1179,33 @@ def github_callback(code: str, state: str = "", redirect_uri: str = "http://loca
     conn.commit()
     conn.close()
     
-    return {"ok": True, "user": {"login": user["login"], "avatar": user.get("avatar_url", "")}, "redirect": "http://localhost:3000/settings?tab=github"}
+    # Browser mendarat di sini dari GitHub, jadi balas dengan redirect supaya
+    # user mendarat di aplikasi. Pesan status lewat query string karena
+    # respons JSON di address bar tidak ada tombol balik ke app.
+    #
+    # PENTING: aplikasi ini single-page shell di "/". Navigasi ke Settings
+    # berjalan client-side (activePage di app/page.tsx); tidak ada route
+    # /settings, jadi redirect ke sana berakhir di 404 Next. Karena itu
+    # page=settings ikut dikirim dan dibaca app/page.tsx untuk halaman awal.
+    from urllib.parse import urlencode
+    qs = urlencode({
+        "page": "settings",
+        "tab": "github",
+        "github": "connected",
+        "login": user["login"],
+    })
+    return RedirectResponse(url=f"http://localhost:3000/?{qs}", status_code=303)
+
+
+@app.delete("/api/github/connection", tags=["GitHub"])
+def github_disconnect():
+    """Disconnect GitHub: hapus semua token yang tersimpan."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute("DELETE FROM github_connections")
+    removed = cur.rowcount
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": max(removed, 0)}
 
 @app.post("/api/github/auth/pat", tags=["GitHub"])
 def github_pat(req: GitHubPATRequest):
@@ -936,34 +1263,52 @@ def github_user():
         return {"ok": False, "connected": False, "error": "Token expired or invalid"}
     return {"ok": True, "connected": True, "user": resp.json(), "type": row["type"]}
 
+def _github_token() -> str:
+    """
+    Token GitHub yang tersimpan, sudah di-decrypt.
+
+    Disatukan karena pola "buka DB -> SELECT github_connections -> decrypt
+    -> HTTPException 401" diulang di lima endpoint; menyalinnya berarti
+    satu endpoint bisa lupa decrypt atau lupa cek None.
+    """
+    import sqlite3
+    from auth import decrypt_stored_token
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=401, detail="No GitHub connection")
+    return decrypt_stored_token(row["access_token"])
+
+
+def _github_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
 @app.get("/api/github/repos", tags=["GitHub"])
 def github_repos(
+    # M6: kedua nilai dulu bebas. per_page raksasa / page negatif dikirim apa
+    # adanya ke api.github.com - GitHub membatasi per_page ke 100, jadi angka
+    # besar hanya membuang-buang waktu dan membingungkan log sisi mereka tanpa
+    # memberi apa pun kepada pemanggil.
     per_page: int = Query(100, ge=1, le=100),
     page: int = Query(1, ge=1, le=10000),
 ):
     """List repositories accessible by the authenticated user."""
-    # M6: kedua nilai dulu bebas. per_page raksasa / page negatif dikirim
-    # apa adanya ke api.github.com — GitHub membatasi per_page ke 100, jadi
-    # angka besar hanya membuang-buang waktu dan membingungkan log sisi
-    # mereka tanpa memberi apa pun kepada pemanggil.
-    import sqlite3
-    from auth import decrypt_stored_token
     import requests
-    
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(status_code=401, detail="No GitHub connection")
-    
-    token = decrypt_stored_token(row["access_token"])
-    import requests
+
     resp = requests.get(
         f"https://api.github.com/user/repos?per_page={per_page}&page={page}&sort=updated",
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        headers=_github_headers(_github_token()),
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch repos")
@@ -1013,30 +1358,20 @@ def _github_repo_path(value: str) -> str:
 @app.get("/api/github/repos/{owner}/{repo}/tree", tags=["GitHub"])
 def github_repo_tree(owner: str, repo: str, branch: str = "main", recursive: bool = True):
     """Get repository file tree."""
-    import sqlite3
-    from auth import decrypt_stored_token
     import requests
 
+    # M8: owner/repo/branch dibatasi ke charset GitHub lalu di-encode ulang,
+    # sehingga "?" / "#" / ".." yang lolos decode-nya tidak lagi bisa
+    # mengubah struktur URL tujuan.
     owner = _github_repo_segment(owner, "owner")
     repo = _github_repo_segment(repo, "repo")
     branch = _github_repo_segment(branch, "branch", allow_slash=True)
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(status_code=401, detail="No GitHub connection")
-    
-    token = decrypt_stored_token(row["access_token"])
-    import requests
-    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive={1 if recursive else 0}"
-    resp = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}"
+        f"?recursive={1 if recursive else 0}"
     )
+    resp = requests.get(url, headers=_github_headers(_github_token()))
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch tree: {resp.text}")
     return resp.json()
@@ -1044,34 +1379,110 @@ def github_repo_tree(owner: str, repo: str, branch: str = "main", recursive: boo
 @app.get("/api/github/repos/{owner}/{repo}/contents", tags=["GitHub"])
 def github_file_content(owner: str, repo: str, path: str, branch: str = "main"):
     """Get file content from repository."""
-    import sqlite3
-    from auth import decrypt_stored_token
     import requests
 
+    # M8: sama seperti /tree - semua segmen dibatasi charset GitHub dulu,
+    # baru di-encode. `path` boleh memuat "/" karena itu struktur direktori.
     owner = _github_repo_segment(owner, "owner")
     repo = _github_repo_segment(repo, "repo")
     branch = _github_repo_segment(branch, "branch", allow_slash=True)
-    path = _github_repo_path(path)
+    encoded = _github_repo_path(path)
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(status_code=401, detail="No GitHub connection")
-    
-    token = decrypt_stored_token(row["access_token"])
-    import requests
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={quote(branch, safe='')}"
-    resp = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+    token = _github_token()
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded}"
+        f"?ref={branch}"
     )
+    resp = requests.get(url, headers=_github_headers(token))
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch file: {resp.text}")
     return resp.json()
+
+
+class GitHubSyncRequest(BaseModel):
+    source: str
+    branch: str = "main"
+    label: str | None = None
+    ingest: bool = True
+    make_active: bool = True
+
+
+@app.post("/api/github/repos/sync", tags=["GitHub"])
+def github_sync_target(req: GitHubSyncRequest):
+    """
+    Unduh repo GitHub ke workspace lalu jadikan target yang dianalisis.
+
+    Ini yang membuat "ganti repository" benar-benar mengganti sumber data,
+    bukan cuma melihat file lewat browser. Urutannya penting:
+
+      1. unduh tarball + ekstrak aman  -> github_sync.py
+      2. daftarkan foldernya sebagai target (kind="github")
+      3. aktifkan target itu  -> storage + engine pindah DB graph
+      4. ingest             -> graph terisi dari isi repo SEKARANG
+
+    Sync memakai token yang sudah disimpan. Kalau token tidak ada, endpoint
+    menolak 401 - bukan mencoba akses anonim, karena repo private akan
+    gagal dengan 404 yang menyesatkan.
+    """
+    import github_sync
+
+    try:
+        github_sync.validate_source(req.source)
+        github_sync.validate_branch(req.branch)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    token = _github_token()
+    source = req.source.strip().strip("/")
+    try:
+        result = github_sync.sync_repo(source=source, branch=req.branch, token=token)
+    except github_sync.SyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    label = req.label or source
+    existing = None
+    for target in projects.list_targets():
+        if target.get("source") == source:
+            existing = target
+            break
+
+    try:
+        if existing:
+            target = projects.update_target(
+                existing["id"], label=label, branch=req.branch
+            )
+        else:
+            target = projects.create_target(
+                kind="github",
+                label=label,
+                path=result["path"],
+                source=source,
+                branch=req.branch,
+                make_active=False,
+            )
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+    if req.make_active:
+        try:
+            _switch_target(target["id"])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Target not found")
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    ingest = None
+    if req.ingest:
+        # Ingest gagal TIDAK membatalkan sync: file sudah ada di disk dan
+        # target sudah terdaftar, jadi user bisa retry tanpa unduh ulang.
+        ingest = engine.ingest_repository(result["path"])
+
+    payload = _target_payload(target)
+    payload["sync"] = result
+    payload["ingest"] = ingest
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1079,7 +1490,7 @@ def github_file_content(owner: str, repo: str, path: str, branch: str = "main"):
 # ---------------------------------------------------------------------------
 
 # M9 FIX: base_url provider adalah TUJUAN REQUEST KELUAR yang dikendalikan
-# pengguna — server lah yang menghubunginya, bukan browser. Nilai itu dulu
+# pengguna - server lah yang menghubunginya, bukan browser. Nilai itu dulu
 # diterima apa adanya, sehingga `base_url = "http://169.254.169.254/latest/meta-data/"`
 # membuat Synapse ikut menembak metadata cloud (IAM credential) atau layanan
 # internal yang tidak terekspos ke internet.
@@ -1167,11 +1578,137 @@ def _validate_upstream_base_url(raw: str | None, provider_type: str) -> str | No
     return value
 
 
+# Tipe provider yang dikenali. Sisanya tetap diterima: users menjalankan
+# LM Studio, vLLM, Together, Groq, atau proxy internal yang tidak ada di
+# daftar ini, dan semuanya speak OpenAI-compatible chat/completions.
+#
+# Kenapa `type` bukan Literal lagi: Literal membuat Pydantic menolak 422
+# untuk "groq" atau "lmstudio", padahal keduanya provider yang sah dan
+# bisa dikonfigurasi lewat base_url yang sama persis dengan openai-compatible.
+# Daftar ini dipakai untuk (a) memberi base_url default saat type dikenali,
+# (b) menentukan apakah boleh dihapus, bukan untuk menolak input.
+KNOWN_PROVIDER_TYPES = (
+    "openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama", "openai-compatible",
+)
+
+# Base URL default per tipe yang dikenali. Tipe di luar daftar tidak punya
+# default: pemanggil wajib menyebut base_url sendiri, karena mengarang URL
+# akan membuat request menembak endpoint yang salah tanpa melaporkan apa pun.
+PROVIDER_BASE_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com/v1",
+    "nvidia": "https://integrate.api.nvidia.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "ollama": "http://localhost:11434/v1",
+    "ibm": "https://us-south.ml.cloud.ibm.com/ml/v1",
+}
+
+# Tipe bawaan yang tidak boleh dihapus. openai-compatible TIDAK termasuk:
+# itu user-provided, dan memblokir penghapusan hanya akan bikin user
+# tidak bisa membersihkan provider yang tidak dipakai lagi.
+UNDELETABLE_PROVIDER_TYPES = ("openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama")
+
+
+def normalize_provider_type(raw: str) -> str:
+    """
+    Normalisasi nama tipe provider supaya yang sama tidak jadi dua provider.
+
+    Urutan kandidat PENTING. "Open AI" adalah cara orang mengetik nama yang
+    setiap hari, dan kalau spasinya diganti tanda hubung hasilnya "open-ai" -
+    nama yang tidak ada di daftar bawaan. Akibatnya provider ini kehilangan
+    base_url default dan user dipaksa mengetik URL yang sebenarnya sudah kami
+    tahu benar. Jadi kandidat yang sudah cocok dengan daftar bawaan dicoba
+    lebih dulu:
+
+        "  OpenAI "  -> "openai"   (cocok persis)
+        "Open AI"    -> "openai"   (spasi dihapus, cocok)
+        "open ai"    -> "openai"   (spasi dihapus, cocok)
+        "openai compatible" -> "openai-compatible" (cocok persis, dengan spasi)
+        "vllm"       -> "vllm"     (tidak dikenal, dipakai apa adanya)
+
+    Batasnya yang perlu diketahui: "open ai compatible" TIDAK menjadi
+    "openai-compatible". squashed-nya "openaicompatible" dan dashed-nya
+    "open-ai-compatible", keduanya tidak ada di daftar bawaan, jadi hasilnya
+    "open-ai-compatible" dan diperlakukan sebagai tipe custom. Tidak apa-apa
+    karena tipe itu memang tidak punya base_url default, tapi jangan menulis
+    kode-nya sebaliknya - frontend/lib/llmProviders.ts harus meniru urutan di
+    sini persis, bukan yang tertulis di docstring.
+
+    Regex hanya menyaring karakter yang tidak mungkin jadi nama file/URL.
+    """
+    text = (raw or "").strip().lower()
+    if not text:
+        return "openai-compatible"
+    squashed = re.sub(r"\s+", "", text)
+    dashed = "-".join(text.split())
+    for candidate in (text, squashed, dashed, dashed.replace("-", "_")):
+        if candidate in PROVIDER_BASE_URLS or candidate in KNOWN_PROVIDER_TYPES:
+            return candidate
+    # Tipe custom: buang karakter yang akan merusak id dan base_url.
+    cleaned = re.sub(r"[^a-z0-9._-]+", "-", dashed).strip("-")
+    return cleaned or "openai-compatible"
+
+
+def _as_provider_dict(provider) -> dict:
+    """Terjemahkan baris provider apa pun jadi dict biasa.
+
+    BUG-41: pemanggil mengambil provider lewat
+    `conn.execute(...).fetchone()` dengan `row_factory = sqlite3.Row`. Row
+    mendukung `row["base_url"]` tapi TIDAK punya `.get()`, jadi helper yang
+    memanggil `.get()` melempar AttributeError dan /api/llm/chat membalas 500
+    untuk semua provider - termasuk yang konfigurasinya benar.
+
+    `dict(row)` berhasil karena Row mengimplementasikan keys() dan __getitem__.
+    Ditaruh di sini, bukan di tiap pemanggil, supaya endpoint LLM baru tidak
+    harus ingat hal ini.
+    """
+    return provider if isinstance(provider, dict) else dict(provider)
+
+
+def _is_local_provider(provider) -> bool:
+    """True kalau provider kemungkinan besar jalan di localhost, jadi API key opsional.
+
+    Base URL dengan host loopback (localhost, 127.0.0.1, ::1) atau memakai
+    skema file:// dianggap lokal. Ini membiarkan ollama dan LM Studio/vLLM
+    lokal dikonfigurasi tanpa key, tanpa membuat daftar yang harus
+    ditambahkan setiap kali ada server lokal baru.
+
+    Terima dict atau sqlite3.Row; lihat _as_provider_dict.
+    """
+    provider = _as_provider_dict(provider)
+    base_url = (provider.get("base_url") or "").strip().lower()
+    if not base_url:
+        return provider.get("type") == "ollama"
+    if base_url.startswith("file://"):
+        return True
+    try:
+        host = urlsplit(base_url).hostname or ""
+    except ValueError:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or host.endswith(".local")
+
+
+def resolve_provider_base_url(provider) -> str | None:
+    """Base URL final untuk sebuah provider, atau None kalau tidak bisa ditebak.
+
+    Urutannya: base_url eksplisit > default dari tipe yang dikenali > None.
+    None berarti pemanggil harus menolak dengan pesan jelas, bukan menembak
+    API default OpenAI karena tipe provider-nya "groq".
+
+    Terima dict atau sqlite3.Row; lihat _as_provider_dict.
+    """
+    provider = _as_provider_dict(provider)
+    explicit = (provider.get("base_url") or "").strip()
+    if explicit:
+        return explicit
+    return PROVIDER_BASE_URLS.get(provider.get("type") or "")
+
+
 class LLMProviderCreate(BaseModel):
     # name ikut membentuk primary key (`f"{type}:{name}"`), jadi panjangnya
     # dibatasi supaya satu request tidak bisa menggelembungkan id provider (M6).
     name: str = Field(max_length=256)
-    type: Literal["openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama", "openai-compatible"]
+    type: str = "openai-compatible"
     base_url: str | None = None
     api_key: str | None = None
     models: list[str] = []
@@ -1181,9 +1718,27 @@ class LLMProviderCreate(BaseModel):
     supports_vision: bool = False
     enabled: bool = True
 
+    @field_validator("type")
+    @classmethod
+    def _check_type(cls, v: str) -> str:
+        return normalize_provider_type(v)
+
+    @model_validator(mode="after")
+    def _require_base_url_for_unknown_type(self) -> "LLMProviderCreate":
+        # Tipe di luar daftar tidak punya base_url default. Tanpa base_url
+        # request akan jatuh ke default OpenAI dan gagal dengan 401 yang
+        # menyesatkan, atau worse, succeeding di akun yang salah.
+        if self.base_url is None and self.type not in PROVIDER_BASE_URLS:
+            raise ValueError(
+                f"base_url wajib diisi untuk tipe {self.type!r}: tipe ini bukan "
+                "provider bawaan, jadi Synapse tidak menebak endpoint-nya"
+            )
+        return self
+
+
 class LLMProviderUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=256)
-    type: Literal["openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama", "openai-compatible"] | None = None
+    type: str | None = None
     base_url: str | None = None
     api_key: str | None = None
     models: list[str] | None = None
@@ -1192,6 +1747,11 @@ class LLMProviderUpdate(BaseModel):
     supports_tools: bool | None = None
     supports_vision: bool | None = None
     enabled: bool | None = None
+
+    @field_validator("type")
+    @classmethod
+    def _check_type(cls, v: str | None) -> str | None:
+        return None if v is None else normalize_provider_type(v)
 
 @app.get("/api/llm/providers", tags=["LLM"])
 def list_llm_providers():
@@ -1245,7 +1805,10 @@ def create_llm_provider(req: LLMProviderCreate):
             (
                 provider_id, req.name, req.type, req.base_url,
                 encrypt_token(req.api_key) if req.api_key else None,
-                json.dumps(req.models), req.default_model or req.models[0] if req.models else "",
+                # `a or b[0] if c else d` di-parse sebagai `(a or b[0]) if c else d`,
+                # jadi default_model yang diisi user hilang begitu models kosong.
+                json.dumps(req.models),
+                req.default_model or (req.models[0] if req.models else ""),
                 req.max_tokens, int(req.supports_tools), int(req.supports_vision),
                 int(req.enabled), guardian._utcnow_iso(), guardian._utcnow_iso()
             )
@@ -1331,7 +1894,7 @@ def delete_llm_provider(provider_id: str):
         conn.close()
         raise HTTPException(status_code=404, detail="Provider not found")
     # Allow deletion of custom providers only
-    if existing["type"] in ["openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama"]:
+    if existing["type"] in UNDELETABLE_PROVIDER_TYPES:
         conn.close()
         raise HTTPException(status_code=403, detail="Cannot delete built-in provider")
     conn.execute("DELETE FROM llm_providers WHERE id = ?", (provider_id,))
@@ -1364,9 +1927,126 @@ class ChatMessage(BaseModel):
     tool_calls: list | None = None
     tool_call_id: str | None = None
 
+
+# BUG-45: streaming chat mati dengan "NetworkError when attempting to fetch
+# resource" di browser.
+#
+# Bentuk yang salah (dan yang dipakai sebelum fix ini):
+#
+#     async with httpx.AsyncClient() as client:
+#         async def stream_response():
+#             async with client.stream(...) as resp:
+#                 yield ...
+#         return StreamingResponse(stream_response(), ...)
+#
+# `stream_response()` dipanggil untuk membuat OBJECK generator, bukan
+# dijalankan. Prosecutnya selesai - `async with` menutup client - baru
+# FastAPI mulai meng-iterate generator. Generator-nya lalu memakai client
+# yang sudah ditutup: request ke provider mati di tengah jalan, koneksi
+# HTTP terputus sebelum response selesai, dan fetch() di browser DITOLAK
+# (bukan 500, bukan 502 - fetch-nya sendiri yang gagal). Gejalanya persis
+# "Error: NetworkError when attempting to fetch resource." sementara
+# /api/llm/explain - yang stream=False - tetap jalan. Provider di Settings
+# juga tetap jalan karena tidak lewat jalur ini sama sekali.
+#
+# Dua perbaikan sekaligus:
+#   1. Client dibuat DI DALAM generator, jadi umurnya mengikuti stream.
+#   2. Status response provider Dicek SEBELUM StreamingResponse dikembalikan.
+#      401/429/500 dari provider jadi HTTP error yang bisa ditampilkan
+#      ("Provider menolak: ..."), bukan koneksi yang diputus diam-diam.
+#
+# `open_stream` menerima client yang sudah hidup dan mengembalikan context
+# manager response streaming-nya; pemanggil deciding URL dan payload-nya.
+SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    # Nginx/proxy mana pun yang menahan response sampai penuh akan membatalkan
+    # seluruh tujuan SSE.
+    "X-Accel-Buffering": "no",
+}
+
+# Body error dari provider dipotong; message-nya bisa jadi halaman HTML
+# panjang atau echoed payload user, dan ini masuk ke response ke browser.
+_MAX_PROVIDER_ERROR_BYTES = 600
+
+
+def _provider_error_detail(status: int, body: bytes, provider_type: str) -> str:
+    text = body.decode("utf-8", errors="replace").strip()
+    if not text:
+        text = "(body kosong)"
+    return f"Provider {provider_type!r} membalas HTTP {status}: {text[:_MAX_PROVIDER_ERROR_BYTES]}"
+
+
+async def _sse_proxy(open_stream, provider_type: str = "provider"):
+    """Bungkus satu request streaming provider jadi StreamingResponse SSE.
+
+    open_stream: callable(client) -> async context manager yang mengembalikan
+    response streaming dari provider.
+
+    async, bukan sync, karena status response provider harus diperiksa SEBELUM
+    StreamingResponse dikembalikan. Kalau pemeriksaannya duduk di dalam
+    generator, response sudah "terkirim" begitu generator pertama kali
+    dijalankan dan HTTPException di dalamnya tidak lagi bisa jadi status -
+    hasilnya koneksi mati di tengah, yaitu NetworkError yang asli.
+    """
+    import httpx
+
+    client = httpx.AsyncClient(timeout=60.0)
+    try:
+        resp_cm = open_stream(client)
+        resp = await resp_cm.__aenter__()
+    except Exception as exc:
+        await client.aclose()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gagal menghubungi provider {provider_type!r}: {exc}",
+        )
+
+    if resp.status_code >= 400:
+        try:
+            body = await resp.aread()
+        except Exception:
+            body = b""
+        try:
+            await resp_cm.__aexit__(None, None, None)
+        finally:
+            await client.aclose()
+        raise HTTPException(
+            status_code=502 if resp.status_code != 400 else 400,
+            detail=_provider_error_detail(resp.status_code, body, provider_type),
+        )
+
+    async def body():
+        try:
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                line_str = line.strip() if isinstance(line, str) else line.decode("utf-8", errors="replace").strip()
+                if not line_str:
+                    continue
+                if line_str.startswith("data: ") or line_str.startswith("event: ") or line_str.startswith("id: ") or line_str.startswith("retry: "):
+                    yield f"{line_str}\n\n"
+                else:
+                    yield f"data: {line_str}\n\n"
+        finally:
+            # Generator bisa ditutup di tengah (user tekan Clear, atau browser
+            # menutup tab). Tanpa finally, socket ke provider menggantung
+            # sampai timeout.
+            try:
+                await resp_cm.__aexit__(None, None, None)
+            finally:
+                await client.aclose()
+
+    return StreamingResponse(body(), media_type="text/event-stream", headers=SSE_HEADERS)
+
 class ChatCompletionRequest(BaseModel):
     provider_id: str
-    model: str
+    # String kosong berarti "pakai default_model provider". Sengaja tidak
+    # required: kalau required, Pydantic membalas 422 "field required" yang
+    # tidak menjelaskan bahwa provider-nya memang belum punya model, dan
+    # user tidak tahu harus ke tab LLM mana. llm_chat() yang menolak dengan
+    # 400 plus pesan yang bisa langsung ditindaklanjuti.
+    model: str = ""
     messages: list[ChatMessage]
     temperature: float = 0.2
     max_tokens: int = 4096
@@ -1389,45 +2069,74 @@ async def llm_chat(req: ChatCompletionRequest):
     conn.close()
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found or disabled")
-    
+    # BUG-41: ini sqlite3.Row, bukan dict. _is_local_provider() dan
+    # resolve_provider_base_url() sekarang menerima keduanya (lihat
+    # _as_provider_dict), jadi tidak perlu diubah di sini - tapi jangan
+    # panggil .get() langsung pada variabel ini.
+    provider = _as_provider_dict(provider)
+
     api_key = decrypt_stored_token(provider["api_key"]) if provider["api_key"] else None
-    if not api_key and provider["type"] != "ollama":
+    # Tanpa api key, hanya server lokal yang masuk akal (ollama, atau
+    # openai-compatible tanpa auth seperti LM Studio). Provider hosting
+    # /public tetap butuh key, dan lebih baik ditolak di sini daripada
+    # mendapat 401 yang tidak jelas dari pihak ketiga.
+    if not api_key and not _is_local_provider(provider):
         raise HTTPException(status_code=400, detail="Provider not configured with API key")
-    
+
     model = req.model or provider["default_model"]
-    
+    if not model:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Provider tidak punya model. Pilih model di tab LLM "
+                "(Settings) atau kirim 'model' secara eksplisit."
+            ),
+        )
+
     if provider["type"] == "ollama":
         # Ollama local
         base_url = provider["base_url"] or "http://localhost:11434"
+        payload = {
+            "model": model,
+            "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+            "stream": req.stream,
+            "options": {"temperature": req.temperature, "num_predict": req.max_tokens},
+        }
+        if req.stream:
+            return await _sse_proxy(
+                lambda client: client.stream(
+                    "POST", f"{base_url}/api/chat", json=payload, timeout=60.0
+                ),
+                provider["type"],
+            )
         async with httpx.AsyncClient(timeout=60.0) as client:
-            payload = {
-                "model": model,
-                "messages": [{"role": m.role, "content": m.content} for m in req.messages],
-                "stream": req.stream,
-                "options": {"temperature": req.temperature, "num_predict": req.max_tokens},
-            }
-            if req.stream:
-                async def stream_response():
-                    async with client.stream("POST", f"{base_url}/api/chat", json=payload, timeout=60.0) as resp:
-                        async for line in resp.aiter_lines():
-                            if line:
-                                yield f"data: {line}\n\n"
-                return StreamingResponse(stream_response(), media_type="text/event-stream")
-            else:
-                resp = await client.post(f"{base_url}/api/chat", json=payload, timeout=60.0)
-                return resp.json()
+            resp = await client.post(f"{base_url}/api/chat", json=payload, timeout=60.0)
+            return resp.json()
     else:
-        # OpenAI-compatible (OpenAI, Anthropic, etc.)
-        base_url = provider["base_url"] or ("https://api.openai.com/v1" if provider["type"] == "openai" else 
-                      "https://api.anthropic.com/v1" if provider["type"] == "anthropic" else
-                      "https://integrate.api.nvidia.com/v1" if provider["type"] == "nvidia" else
-                      "https://api.deepseek.com/v1" if provider["type"] == "deepseek" else
-                      "https://api.openai.com/v1")
-        
+        # OpenAI-compatible. Ini juga jalur untuk SEMUA tipe di luar daftar
+        # (groq, together, lmstudio, vllm, proxy internal): semuanya speak
+        # chat/completions yang sama, hanya endpoint-nya yang berbeda.
+        base_url = resolve_provider_base_url(provider)
+        if not base_url:
+            # Provider type ini tidak punya default yang aman. Menebak URL
+            # OpenAI di sini akan mengirim prompt user - dan isi repo - ke
+            # akun yang tidak diminta, jadi tolak dengan pesan yang bisa
+            # ditindaklanjuti.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Provider tipe {provider['type']!r} tidak punya base_url. "
+                    "Isi base_url di tab LLM (Settings) supaya Synapse tahu "
+                    "endpoint yang benar."
+                ),
+            )
+        base_url = base_url.rstrip("/")
+
         headers = {
-            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         if provider["type"] == "anthropic":
             headers["anthropic-version"] = "2023-06-01"
         
@@ -1441,18 +2150,23 @@ async def llm_chat(req: ChatCompletionRequest):
         if req.tools:
             payload["tools"] = req.tools
             payload["tool_choice"] = req.tool_choice or "auto"
-        
+
+        if req.stream:
+            return await _sse_proxy(
+                lambda client: client.stream(
+                    "POST",
+                    f"{base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                    timeout=60.0,
+                ),
+                provider["type"],
+            )
         async with httpx.AsyncClient(timeout=60.0) as client:
-            if req.stream:
-                async def stream_response():
-                    async with client.stream("POST", f"{base_url}/chat/completions", json=payload, headers=headers, timeout=60.0) as resp:
-                        async for line in resp.aiter_lines():
-                            if line:
-                                yield f"data: {line}\n\n"
-                return StreamingResponse(stream_response(), media_type="text/event-stream")
-            else:
-                resp = await client.post(f"{base_url}/chat/completions", json=payload, headers=headers, timeout=60.0)
-                return resp.json()
+            resp = await client.post(
+                f"{base_url}/chat/completions", json=payload, headers=headers, timeout=60.0
+            )
+            return resp.json()
 
 
 class ExplainRequest(BaseModel):

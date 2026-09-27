@@ -65,6 +65,58 @@ export interface Bucket {
   count: number;
 }
 
+/**
+ * Jendela activity, dari yang paling rapat ke yang paling lebar.
+ *
+ * 5 jam adalah default, tapi jendela tetap 5 jam bikin grafik terlihat MATI:
+ * instalasi yang tidak aktif 3 jam lalu punya 10 batang rata-rata 2px, dan
+ * user menyimpulkan "grafiknya tidak jalan". Jadi jendela dipilih dari data:
+ * yang paling sempit yang masih memuat minimal satu operasi.
+ */
+export const ACTIVITY_SPANS: readonly number[] = [
+  5 * 60 * 60 * 1000,          // 5 jam
+  24 * 60 * 60 * 1000,         // 24 jam
+  7 * 24 * 60 * 60 * 1000,     // 7 hari
+  30 * 24 * 60 * 60 * 1000,    // 30 hari
+];
+
+export interface ActivitySpan {
+  spanMs: number;
+  /** Label jendela untuk ditampilkan, mis. "5 jam terakhir". */
+  label: string;
+}
+
+function spanLabel(spanMs: number): string {
+  const hours = spanMs / 3_600_000;
+  if (hours <= 24) return `${hours} jam terakhir`;
+  const days = hours / 24;
+  return `${days} hari terakhir`;
+}
+
+/**
+ * Jendela activity yang dipakai grafik: yang paling sempit dari
+ * ACTIVITY_SPANS yang memuat minimal satu operasi, atau yang paling lebar
+ * kalau tidak ada satu pun yang cocok.
+ *
+ * Tidak ada pemilih rentang dari kalender: user yang comeback setelah beberapa
+ * hari tetap melihat grafiknya berisi sesuatu, bukan 10 batang kosong.
+ */
+export function pickActivitySpan(
+  ops: readonly LiveOp[],
+  now: number = Date.now()
+): ActivitySpan {
+  const times = ops
+    .map((op) => parseTs(op.created_at))
+    .filter((t) => !Number.isNaN(t));
+  for (const spanMs of ACTIVITY_SPANS) {
+    if (times.some((t) => t >= now - spanMs && t <= now + 60_000)) {
+      return { spanMs, label: spanLabel(spanMs) };
+    }
+  }
+  const widest = ACTIVITY_SPANS[ACTIVITY_SPANS.length - 1];
+  return { spanMs: widest, label: spanLabel(widest) };
+}
+
 // Jumlah operasi per bucket waktu, bucket terbaru di akhir.
 // ponytail: window relatif (spanMs ke belakang), bucket absolut butuh endpoint time-series backend.
 export function bucketActivity(
@@ -74,8 +126,11 @@ export function bucketActivity(
 ): Bucket[] {
   const now = Date.now();
   const size = spanMs / buckets;
+  const label = spanMs > 24 * 3_600_000
+    ? { day: "2-digit", month: "short" } as const
+    : { hour: "2-digit", minute: "2-digit" } as const;
   const out: Bucket[] = Array.from({ length: buckets }, (_, i) => ({
-    label: new Date(now - spanMs + i * size).toLocaleTimeString("id", { hour: "2-digit", minute: "2-digit" }),
+    label: new Date(now - spanMs + i * size).toLocaleString("id", label),
     count: 0,
   }));
   for (const op of ops) {

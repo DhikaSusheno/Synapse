@@ -1,7 +1,7 @@
 // lib/operations.test.ts — BUG-39: approve error tidak boleh disamarkan jadi sukses
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decideOperation } from "./operations.ts";
+import { decideOperation, opsEmptyMessage } from "./operations.ts";
 
 type Reply = { status: number; body: unknown };
 
@@ -101,4 +101,36 @@ test("execute HTTP error -> status failed, bukan verified", async () => {
     assert.equal(r.status, "failed");
     assert.equal(r.error, "boom");
   } finally { s.restore(); }
+});
+
+
+// --- BUG-44: daftar operasi kosong bisa berarti beberapa hal -------------
+
+test("opsEmptyMessage: loading menang dari yang lain", () => {
+  assert.equal(
+    opsEmptyMessage({ loading: true, liveEnabled: false, offline: true, activeTargetId: null }),
+    "Loading operations...",
+  );
+});
+
+test("opsEmptyMessage: live off dan offline ditolak sebelum urusan target", () => {
+  assert.match(
+    opsEmptyMessage({ loading: false, liveEnabled: false, offline: false, activeTargetId: "a" }),
+    /NEXT_PUBLIC_USE_LIVE_SSE/,
+  );
+  assert.match(
+    opsEmptyMessage({ loading: false, liveEnabled: true, offline: true, activeTargetId: "a" }),
+    /offline/i,
+  );
+});
+
+test("opsEmptyMessage: tanpa target aktif -> minta pilih target", () => {
+  const msg = opsEmptyMessage({ loading: false, liveEnabled: true, offline: false, activeTargetId: null });
+  assert.match(msg, /target aktif/i);
+});
+
+test("opsEmptyMessage: target aktif tapi kosong -> bilang ini milik target ini", () => {
+  const msg = opsEmptyMessage({ loading: false, liveEnabled: true, offline: false, activeTargetId: "repo-a" });
+  assert.match(msg, /target ini/i);
+  assert.match(msg, /repository lain tidak ditampilkan/i);
 });

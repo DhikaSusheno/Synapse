@@ -62,7 +62,7 @@ export function subscribeStream(handler: Handler): () => void {
   };
 }
 
-/** Jumlah koneksi /stream yang sedang terbuka â€” 1 per app, bukan 1 per halaman. */
+/** Jumlah koneksi /stream yang sedang terbuka — 1 per app, bukan 1 per halaman. */
 export function openStreamCount(): number {
   return es ? 1 : 0;
 }

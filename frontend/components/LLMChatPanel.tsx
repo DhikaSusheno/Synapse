@@ -68,12 +68,21 @@ export function useLLMChat(providerId: string, model: string): UseLLMChatReturn 
       });
       
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
+        let errDetail = `HTTP ${res.status}`;
+        try {
+          const errJson = await res.json();
+          if (errJson.detail) errDetail = errJson.detail;
+          else if (errJson.message) errDetail = errJson.message;
+        } catch {
+          // ignore
+        }
+        throw new Error(errDetail);
       }
       
       const reader = res.body?.getReader();
       const decoder = new TextDecoder();
       let assistantMessage = "";
+      let buffer = "";
       
       // Add empty assistant message for streaming
       setMessages(prev => [...prev, { role: "assistant", content: "" }]);
@@ -83,17 +92,24 @@ export function useLLMChat(providerId: string, model: string): UseLLMChatReturn 
           const { done, value } = await reader.read();
           if (done) break;
           
-          const chunk = new TextDecoder().decode(value);
-          const lines = chunk.split("\n");
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
           
           for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              const data = line.slice(6);
+            const trimmed = line.trim();
+            if (trimmed.startsWith("data: ")) {
+              const data = trimmed.slice(6).trim();
               if (data === "[DONE]") continue;
               
               try {
                 const parsed = JSON.parse(data);
-                const content = parsed.choices?.[0]?.delta?.content || "";
+                const content =
+                  parsed.choices?.[0]?.delta?.content ||
+                  parsed.message?.content ||
+                  parsed.response ||
+                  parsed.content ||
+                  "";
                 if (content) {
                   assistantMessage += content;
                   setMessages(prev => {
@@ -107,6 +123,29 @@ export function useLLMChat(providerId: string, model: string): UseLLMChatReturn 
                 }
               } catch {
                 // Ignore parse errors
+              }
+            }
+          }
+        }
+        
+        if (buffer.trim()) {
+          const trimmed = buffer.trim();
+          if (trimmed.startsWith("data: ")) {
+            const data = trimmed.slice(6).trim();
+            if (data !== "[DONE]") {
+              try {
+                const parsed = JSON.parse(data);
+                const content =
+                  parsed.choices?.[0]?.delta?.content ||
+                  parsed.message?.content ||
+                  parsed.response ||
+                  parsed.content ||
+                  "";
+                if (content) {
+                  assistantMessage += content;
+                }
+              } catch {
+                // ignore
               }
             }
           }
@@ -240,17 +279,12 @@ export function LLMChatPanel({
       {/* Input */}
       <div className="p-4 border-t border-slate-800/60">
         <div className="flex gap-2">
-          <select
-            className="bg-slate-800/60 border border-slate-700/60 rounded-lg px-2 py-1 text-xs text-slate-300 outline-none"
-            value={model}
-            onChange={(e) => {}}
-          >
-            <option value="gpt-4o">GPT-4o</option>
-            <option value="gpt-4o-mini">GPT-4o Mini</option>
-            <option value="claude-3-5-sonnet">Claude 3.5 Sonnet</option>
-            <option value="claude-3-haiku">Claude 3 Haiku</option>
-          </select>
-          
+          {/* Select provider + model milik ProviderSelect, di atas. Select lama
+              dengan model hardcode (gpt-4o, claude-3-5-sonnet) DIHAPUS: ia tidak
+              punya onChange, jadi selalu menampilkan "GPT-4o" sementara chat
+              sebenarnya mengirim model milik provider yang dipilih user
+              (mis. deepseek-chat). Kontradiksi itu yang bikin user mengira
+              setting provider-nya tidak dipakai. */}
           <div className="flex-1 flex gap-2">
             <input
               type="text"
@@ -263,7 +297,17 @@ export function LLMChatPanel({
             />
             <button
               onClick={sendMessage}
-              disabled={loading || !input.trim()}
+              // providerId ikut diperiksa: tanpa itu, Enter/klik Kirim dengan
+              // provider yang belum tersinkron (state parent masih "")
+              // mengirim provider_id="" dan backend membalas 404
+              // "Provider not found or disabled" - error yang tidak
+              // memberi tahu user apa yang salah.
+              disabled={loading || !input.trim() || !providerId}
+              title={
+                providerId
+                  ? undefined
+                  : "Pilih provider LLM di Settings -> LLM dulu. Tanpa provider, chat akan 404."
+              }
               className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {loading ? "..." : "Kirim"}
