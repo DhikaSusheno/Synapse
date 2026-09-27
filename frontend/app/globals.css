@@ -4,11 +4,13 @@
 
 :root {
   --bg: #080d14;
+  --font-inter: "Inter Variable", "Inter", ui-sans-serif, system-ui, sans-serif;
 }
 
 html, body, #__next {
   height: 100%;
   background-color: #080d14;
+  font-family: var(--font-inter);
 }
 
 /* Scrollbar halus */

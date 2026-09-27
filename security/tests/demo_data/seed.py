@@ -122,7 +122,7 @@ def create_demo_db(db_path) -> Path:
 
     # Seed 1 baseline operation dengan status 'verified' (dibutuhkan test E8 + DR)
     # E8 test cari: tool_name='service.restart' AND status='verified'
-    from datetime import datetime
+    from datetime import datetime, UTC
     op_id = "baseline-op-seed-001"
     conn.execute(
         """INSERT OR IGNORE INTO operations
@@ -132,7 +132,7 @@ def create_demo_db(db_path) -> Path:
         (op_id, "service.restart",
          '{"service": "baseline-service"}',
          "file::app/services.py", "medium", "needs_snapshot", "verified",
-         0, datetime.utcnow().isoformat(), datetime.utcnow().isoformat())
+         0, datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat())
     )
 
     conn.commit()

@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
+import BackendStatusBanner from "@/components/shared/BackendStatusBanner";
 
-const inter = Inter({ subsets: ["latin"] });
+const inter = localFont({ src: "../public/fonts/InterVariable.woff2", variable: "--font-inter" });
 
 export const metadata: Metadata = {
   title: "Synapse — Live Graph",
@@ -16,7 +17,8 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className="dark">
-      <body className={`${inter.className} bg-slate-950 text-slate-100 antialiased`}>
+      <body className={`${inter.variable} bg-slate-950 text-slate-100 antialiased`}>
+        <BackendStatusBanner />
         {children}
       </body>
     </html>

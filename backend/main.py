@@ -54,22 +54,11 @@ import guardian
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(
-    title="Synapse Backend",
-    description="Reversible, conflict-aware understanding layer for AI coding agents",
-    version="0.2.0",
-)
+from contextlib import asynccontextmanager
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     init_db()
     # Skema v2 (storage.py) -> file TERPISA synapse_v2.db, bukan synapse.db.
     # Tetap di-init di startup supaya tabel entities/relations/actions/decisions/
@@ -83,6 +72,23 @@ async def on_startup():
     import asyncio
     cortex.set_event_loop(asyncio.get_running_loop())
     print("[Synapse] Server ready. Visit http://localhost:8000/docs")
+    yield
+    # Shutdown (if needed)
+
+
+app = FastAPI(
+    title="Synapse Backend",
+    description="Reversible, conflict-aware understanding layer for AI coding agents",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------------------

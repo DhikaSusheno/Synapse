@@ -25,7 +25,7 @@ Bug fixes (dari security/TEST_SCENARIOS.md Bug Findings Log):
 
   BUG-A [HIGH] _do_rollback() gagal pada Windows path dengan drive letter (colon)
          FIX: rollback_command sekarang JSON {"bak": "...", "target": "..."},
-              tidak ada ambiguitas split pada C:\path.
+              tidak ada ambiguitas split pada C:\\path.
 
   BUG-B [HIGH] _exec_migration() pakai executescript() yang auto-commit
          FIX: explicit transaction BEGIN/COMMIT/ROLLBACK per statement.
@@ -73,7 +73,7 @@ import json
 import uuid
 import sqlite3
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
 import yaml
@@ -477,7 +477,7 @@ def _check_conflict(conn: sqlite3.Connection, target_node_id: str) -> list[dict]
     Hanya status aktif yang dihitung (sesuai SYNAPSE.md 4.5).
     """
     window_start = (
-        datetime.utcnow() - timedelta(minutes=CONFLICT_WINDOW_MINUTES)
+        datetime.now(UTC) - timedelta(minutes=CONFLICT_WINDOW_MINUTES)
     ).isoformat()
 
     rows = conn.execute(
@@ -547,7 +547,7 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
     if tool_name.startswith("db.run_migration"):
         # BUG-02 + BUG-03 FIX: gunakan db_path dari params, bukan DB_PATH global
         db_target = params.get("db_path", _db_path())
-        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
         bak = f"{db_target}.bak.{ts}"
         try:
             src = sqlite3.connect(db_target)
@@ -568,7 +568,7 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
     if tool_name.startswith("config.write"):
         file_path = params.get("file_path", "")
         if file_path and Path(file_path).exists():
-            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
             bak = f"{file_path}.bak.{ts}"
             try:
                 shutil.copy2(file_path, bak)
@@ -580,7 +580,7 @@ def _take_snapshot(tool_name: str, params: dict) -> tuple[str | None, str | None
     if tool_name.startswith("file.delete"):
         file_path = params.get("file_path", "")
         if file_path and Path(file_path).exists():
-            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
             bak = f"{file_path}.bak.{ts}"
             try:
                 shutil.copy2(file_path, bak)
@@ -695,7 +695,7 @@ def _rollback_and_finalize(conn: sqlite3.Connection, operation_id: str,
         if mark_verified_at:
             conn2.execute(
                 "UPDATE operations SET status=?, verified_at=? WHERE id=?",
-                (new_status, datetime.utcnow().isoformat(), operation_id),
+                (new_status, datetime.now(UTC).isoformat(), operation_id),
             )
         else:
             conn2.execute(
@@ -799,7 +799,7 @@ def propose_operation(tool_name: str, params: dict, target: str) -> dict:
             operation_id, tool_name, json.dumps(params), target_node_id,
             blast_radius, reversibility_class,
             1 if requires_approval else 0,
-            datetime.utcnow().isoformat(),
+            datetime.now(UTC).isoformat(),
         ),
     )
 
@@ -926,7 +926,7 @@ def execute_operation(operation_id: str) -> dict:
         """UPDATE operations
            SET status='executing', executed_at=?
            WHERE id=? AND status IN ('pending', 'approved')""",
-        (datetime.utcnow().isoformat(), operation_id),
+        (datetime.now(UTC).isoformat(), operation_id),
     )
     conn.commit()
 
@@ -1009,7 +1009,7 @@ def execute_operation(operation_id: str) -> dict:
 
     conn.execute(
         "UPDATE operations SET status='verified', verified_at=? WHERE id=?",
-        (datetime.utcnow().isoformat(), operation_id),
+        (datetime.now(UTC).isoformat(), operation_id),
     )
     conn.commit()
 
@@ -1315,7 +1315,7 @@ def approve_operation(operation_id: str, decision: str, note: str = "") -> dict:
                  SET decision=excluded.decision,
                      decided_at=excluded.decided_at,
                      note=excluded.note""",
-            (operation_id, decision, datetime.utcnow().isoformat(), note),
+            (operation_id, decision, datetime.now(UTC).isoformat(), note),
         )
         conn.execute("COMMIT")
     except Exception:
