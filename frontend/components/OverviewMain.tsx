@@ -7,7 +7,7 @@
 import dynamic from "next/dynamic";
 import { useCallback, useState } from "react";
 import type { GraphNode, Operation } from "@/lib/types";
-import { stamp } from "@/lib/derive";
+import { stamp, isOpen } from "@/lib/derive";
 
 const SynapseGraph = dynamic(() => import("@/components/SynapseGraph"), {
   ssr: false,
@@ -68,14 +68,40 @@ const MOCK_TIMELINE_EVENTS: TimelineEvent[] = [
 ];
 
 function OperationTimeline({ ops }: { ops: Operation[] }) {
+  const [filter, setFilter] = useState<"all" | "pending" | "executed">("all");
+
+  // Map operation status to timeline event type
+  const statusToType = (status: string): TimelineEvent["type"] => {
+    if (status === "pending") return "PROPOSE";
+    if (status === "approved") return "PROPOSE";
+    if (status === "executing") return "EXECUTE";
+    if (status === "verified") return "EXECUTE";
+    if (status === "rolled_back") return "ROLLBACK";
+    if (status === "failed") return "ANALYZE";
+    if (status === "denied") return "REVIEW";
+    return "PROPOSE";
+  };
+
+  const riskFromStatus = (op: Operation): "High Risk" | "Medium Risk" | "Success" | "Info" => {
+    if (!isOpen(op.status)) return "Info";
+    return op.blast_radius === "high" ? "High Risk" : op.blast_radius === "medium" ? "Medium Risk" : "Success";
+  };
+
+  const filteredOps = ops.filter((op) => {
+    if (filter === "all") return true;
+    if (filter === "pending") return isOpen(op.status);
+    if (filter === "executed") return !isOpen(op.status);
+    return true;
+  });
+
   // Use live ops if available, else mock
-  const events: TimelineEvent[] = ops.length > 0
-    ? ops.slice(0, 5).map((op) => ({
+  const events: TimelineEvent[] = filteredOps.length > 0
+    ? filteredOps.slice(0, 5).map((op) => ({
         time: stamp(op.created_at),
-        type: "PROPOSE" as const,
+        type: statusToType(op.status),
         agent: "Agent",
         description: op.tool_name,
-        risk: op.blast_radius === "high" ? "High Risk" : op.blast_radius === "medium" ? "Medium Risk" : "Info",
+        risk: riskFromStatus(op),
       }))
     : MOCK_TIMELINE_EVENTS;
 
@@ -90,10 +116,14 @@ function OperationTimeline({ ops }: { ops: Operation[] }) {
           </div>
           <div className="text-xs text-slate-500 mt-0.5">Real-time operation flow and history</div>
         </div>
-        <select className="text-xs bg-slate-800 border border-slate-700/60 rounded-lg px-2.5 py-1.5 text-slate-300 outline-none">
-          <option>All Operations</option>
-          <option>Pending</option>
-          <option>Executed</option>
+        <select
+          value={filter}
+          onChange={(e) => setFilter(e.target.value as "all" | "pending" | "executed")}
+          className="text-xs bg-slate-800 border border-slate-700/60 rounded-lg px-2.5 py-1.5 text-slate-300 outline-none"
+        >
+          <option value="all">All Operations</option>
+          <option value="pending">Pending</option>
+          <option value="executed">Executed</option>
         </select>
       </div>
 
