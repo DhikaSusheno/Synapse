@@ -52,6 +52,7 @@ from __future__ import annotations
 import ast as pyast
 import asyncio
 import json
+import logging
 import re
 import threading
 import uuid
@@ -60,6 +61,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import networkx as nx
+
+# ISSUE-47: kegagalan tree-sitter sebelumnya senyap (except: pass / return None
+# tanpa jejak), jadi query yang rusak cuma terlihat sebagai "nol simbol" tanpa
+# petunjuk kenapa. Logger ini membuat kegagalan itu terlihat di startup log.
+_LOG = logging.getLogger("synapse.engine")
 
 from storage import (
     DB_PATH,
@@ -164,15 +170,21 @@ def _get_graph() -> nx.DiGraph:
     Ini yang membuat analyze_*.py tetap berguna setelah restart: proses baru
     mulai dengan _graph kosong, dan tidak ada yang memanggil ingest_repository()
     kalau user cuma langsung nanya /repo_health.
+
+    ISSUE-33 FIX: rebuild DIBAWAH lock. Versi sebelumnya melepas lock dulu
+    lalu rebuild di luar, jadi N thread yang datang bersamaan semuanya
+    melihat graph kosong dan semuanya membangun graph sendiri — yang terakhir
+    menimpa, sementara thread lain memegang referensi graph yang sudah
+    basi. Itu persis skenario "overwrite graph valid" yang dilapor issue #33.
+
+    Lock hanya dipegang saat graph masih kosong, jadi setelah rebuild pertama
+    semua panggilan berikutnya cuma lock + cek `len(_graph)` yang murah.
     """
+    global _graph
     with _graph_lock:
         if len(_graph) == 0:
-            needs_rebuild = True
-        else:
-            return _graph
-    if needs_rebuild:
-        return _rebuild_and_swap()
-    return _graph
+            _graph = _build_graph_from_db()
+        return _graph
 
 
 # ===========================================================================
@@ -195,37 +207,54 @@ def set_event_loop(loop: asyncio.AbstractEventLoop) -> None:
     _event_loop = loop
 
 
+def _deliver(q: asyncio.Queue, payload: str) -> None:
+    """
+    ISSUE-32 (residual): dipanggil DI DALAM event loop.
+
+    try/except di _emit() tidak akan menangkap QueueFull di sini, karena
+    call_soon_threadsafe() menjadwalkan callback — exception-nya muncul
+    belakangan di thread loop, bukan di thread pemanggil. Akibatnya
+    "Task exception was never retrieved" di log dan queue yang sudah penuh
+    tidak pernah dibuang, sehingga client lambat itu tetap berlangganan
+    selamanya dan setiap emit terus gagal.
+
+    Solusi: tandai queue-nya di tempat (flag per-queue, tanpa state bersama
+    yang perlu lock), lalu _emit() yang memangkas di thread pemanggil.
+    """
+    try:
+        q.put_nowait(payload)
+    except Exception:
+        q.synapse_dead = True  # type: ignore[attr-defined]
+
+
 def _emit(event_type: str, data: dict) -> None:
     """Kirim event ke semua subscriber. Aman dipanggil dari thread mana pun."""
     payload = json.dumps({"event": event_type, "data": data}, default=str)
     with _sse_lock:
+        # pangkas subscriber yang sudah ditandai mati (queue penuh / error)
+        for q in [q for q in _sse_subscribers
+                  if getattr(q, "synapse_dead", False)]:
+            _sse_subscribers.remove(q)
         targets = list(_sse_subscribers)
 
-    dead: list[asyncio.Queue] = []
+    loop = _event_loop
+    use_loop = loop is not None and loop.is_running()
     for q in targets:
-        try:
-            loop = _event_loop
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(q.put_nowait, payload)
-            else:
-                # Tidak ada loop hidup (mis. dipanggil dari script/pytest).
-                # q.put_nowait() masih aman karena Queue tanpa waiter tidak
-                # butuh loop; yang tidak bisa dilakukan hanya await get().
+        if use_loop:
+            loop.call_soon_threadsafe(_deliver, q, payload)
+        else:
+            # Tidak ada loop hidup (mis. dipanggil dari script/pytest).
+            # q.put_nowait() masih aman karena Queue tanpa waiter tidak
+            # butuh loop; yang tidak bisa dilakukan hanya await get().
+            try:
                 q.put_nowait(payload)
-        except asyncio.QueueFull:
-            dead.append(q)
-        except Exception:
-            dead.append(q)
-
-    if dead:
-        with _sse_lock:
-            for q in dead:
-                if q in _sse_subscribers:
-                    _sse_subscribers.remove(q)
+            except Exception:
+                q.synapse_dead = True  # type: ignore[attr-defined]
 
 
 def subscribe_sse() -> asyncio.Queue:
     q: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
+    q.synapse_dead = False  # type: ignore[attr-defined]
     with _sse_lock:
         _sse_subscribers.append(q)
     return q
@@ -291,6 +320,22 @@ _TS_QUERIES: dict[str, str] = {
         (import_from_statement module_name: (dotted_name) @mod)
         (import_from_statement module_name: (relative_import) @mod)
     """,
+    # ISSUE-47 FIX — dua bug di query ini, keduanya membuat seluruh file
+    # .js/.jsx/.mjs nol simbol:
+    #
+    # 1. Dua kurung penutup hilang di dua baris import_statement terakhir
+    #    ('(' = 11, ')' = 9). tree_sitter.Query() menolak query unbalanced.
+    #
+    # 2. Pola `(import_statement source: (template_string) @mod)` IMPOSSIBLE:
+    #    field "source" pada import_statement hanya bisa berisi `string`.
+    #    Template literal (backtick) bukan import specifier yang valid di JS.
+    #    tree-sitter melaporkan "Impossible pattern", tapi posisi kolom yang
+    #    dicetak menunjuk ke baris alternasi variable_declarator — menyesatkan,
+    #    dan pola itu sebenarnya sah. Sudah diuji satu per satu.
+    #
+    # Kegagalannya senyap: _load_ts_uncached() balik None, bahasa masuk
+    # _ts_unavailable (blacklist permanen), dan karena tidak ada regex fallback
+    # untuk "javascript", hasilnya nol simbol tanpa jejak di log. Related: #47.
     "javascript": """
         (function_declaration) @func
         (generator_function_declaration) @func
@@ -298,8 +343,7 @@ _TS_QUERIES: dict[str, str] = {
         (method_definition) @func
         (variable_declarator
           value: [(arrow_function) (function_expression)]) @func
-        (import_statement source: (string) @mod
-        (import_statement source: (template_string) @mod
+        (import_statement source: (string) @mod)
     """,
 }
 
@@ -449,6 +493,7 @@ def _load_ts_uncached(lang: str):
         return None
 
     # --- Generation baru (tree-sitter >= 0.25) ---
+    new_api_err: Exception | None = None
     try:
         import importlib
 
@@ -466,8 +511,8 @@ def _load_ts_uncached(lang: str):
                 cursor_factory(query).captures(root)
             ),
         }
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        new_api_err = e
 
     # --- Generation lama (tree-sitter < 0.25, mis. 0.21.3) ---
     try:
@@ -481,7 +526,18 @@ def _load_ts_uncached(lang: str):
             "parse": lambda src: parser.parse(src),
             "captures": lambda root: _normalize_captures(query.captures(root)),
         }
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        # ISSUE-47: ini tadinya `pass` / `return None` tanpa jejak apa pun.
+        # Query unbalanced tidak crash, cuma balik None, lalu bahasa di
+        # blacklist permanen di _ts_unavailable — hasilnya seluruh file .js
+        # nol simbol tanpa ada satu pun tanda di log. Related: #47.
+        _LOG.warning(
+            "tree-sitter gagal dimuat untuk %r (paket %r, api baru: %s). "
+            "Seluruh file bahasa ini akan di-parse dengan fallback. "
+            "Kalau ini tidak disengaja, periksa _TS_QUERIES[%r] — kurung "
+            "yang tidak seimbang membuat tree_sitter.Query() menolak query.",
+            lang, package, new_api_err, lang,
+        )
         return None
 
 
@@ -1652,7 +1708,7 @@ def graph_stats() -> dict:
 
 def get_graph_snapshot(kind: str | None = None) -> list[dict]:
     """
-    Node graph dalam bentuk yang소비 frontend: name/type/meta.
+    Node graph dalam bentuk yang dikonsumsi frontend: name/type/meta.
 
     entities/relations memakai label/kind/attributes_json, sedangkan
     GraphNode di frontend/lib/types.ts mengharapkan name/type/meta.
