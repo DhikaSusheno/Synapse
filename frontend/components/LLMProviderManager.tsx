@@ -15,12 +15,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { useLLMProviders } from "@/hooks/useLLMProviders";
 import {
-  MODEL_SUGGESTIONS,
+  PROVIDER_BASE_URLS,
   PROVIDER_TYPES,
   addModel,
+  hasDefaultBaseUrl,
   isDeletable,
+  modelSuggestions,
+  normalizeProviderType,
   reconcileDefault,
   removeModel,
+  validateDraft,
   type LLMProvider,
   type ProviderDraft,
   type ProviderType,
@@ -67,7 +71,7 @@ function ModelEditor({
     setDefaultModel(provider.default_model);
   }, [provider.id, provider.models, provider.default_model]);
 
-  const suggestions = MODEL_SUGGESTIONS[provider.type];
+  const suggestions = modelSuggestions(provider.type);
   const missing = useMemo(
     () => suggestions.filter((s) => !models.includes(s)),
     [suggestions, models],
@@ -221,14 +225,24 @@ function AddProviderForm({
   const [draft, setDraft] = useState(emptyDraft);
   const [open, setOpen] = useState(false);
 
-  const suggestions = MODEL_SUGGESTIONS[draft.type];
+  const suggestions = modelSuggestions(draft.type);
   const set = <K extends keyof typeof draft>(key: K, value: (typeof draft)[K]) =>
     setDraft((prev) => ({ ...prev, [key]: value }));
 
+  // Normalisasi saat submit, bukan saat mengetik: user harus boleh menulis
+  // "Open AI" dan melihatnya apa adanya sampai menekan tombol.
+  const normalizedType = normalizeProviderType(draft.type);
+  const problems = validateDraft({
+    ...draft,
+    type: normalizedType,
+    base_url: draft.base_url.trim() || null,
+  });
+
   const submit = async () => {
-    if (!draft.name.trim()) return;
+    if (problems.length) return;
     await onSubmit({
       ...draft,
+      type: normalizedType,
       base_url: draft.base_url.trim() || null,
       api_key: draft.api_key.trim() || null,
       default_model: reconcileDefault(draft.models, draft.default_model),
@@ -259,32 +273,51 @@ function AddProviderForm({
         </label>
         <label className="space-y-1">
           <Label>Tipe</Label>
-          <select
+          {/* Input teks + datalist, bukan <select>. Backend menerima tipe apa
+              pun (normalize_provider_type), jadi "groq", "lmstudio", atau
+              "vllm" harus bisa diketik - <select> hanya bisa menampilkan
+              daftar yang sudah hardcode, dan user yang provider-nya tidak
+              ada di daftar itu tidak punya jalan lain. */}
+          <input
+            list="synapse-provider-types"
             value={draft.type}
-            onChange={(e) => set("type", e.target.value as ProviderType)}
-            className={`${inputCls} w-full`}
-          >
+            onChange={(e) => set("type", e.target.value)}
+            placeholder="openai-compatible"
+            className={`${inputCls} w-full font-mono`}
+          />
+          <datalist id="synapse-provider-types">
             {PROVIDER_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
+              <option key={t} value={t} />
             ))}
-          </select>
+          </datalist>
         </label>
       </div>
 
       <label className="block space-y-1">
-        <Label>Base URL (opsional)</Label>
+        <Label>
+          Base URL{" "}
+          {hasDefaultBaseUrl(normalizeProviderType(draft.type)) ? "(opsional)" : "(wajib)"}
+        </Label>
         <input
           value={draft.base_url}
           onChange={(e) => set("base_url", e.target.value)}
-          placeholder="https://api.openai.com/v1"
+          placeholder={
+            hasDefaultBaseUrl(normalizeProviderType(draft.type))
+              ? PROVIDER_BASE_URLS[normalizeProviderType(draft.type)] ?? "https://api.example.com/v1"
+              : "https://api.example.com/v1"
+          }
           className={`${inputCls} w-full font-mono`}
         />
+        {!hasDefaultBaseUrl(normalizeProviderType(draft.type)) && (
+          <p className="text-[10px] text-amber-400">
+            Tipe <span className="font-mono">{draft.type || "?"}</span> bukan provider bawaan,
+            jadi Synapse tidak menebak endpoint-nya. Tanpa base_url, request akan ditolak.
+          </p>
+        )}
       </label>
 
       <label className="block space-y-1">
-        <Label>API Key (opsional, tidak untuk Ollama)</Label>
+        <Label>API Key (opsional untuk server lokal)</Label>
         <input
           type="password"
           value={draft.api_key}
@@ -353,11 +386,19 @@ function AddProviderForm({
         </div>
       </div>
 
+      {problems.length > 0 && (
+        <ul className="rounded-lg border border-amber-500/30 bg-amber-900/15 px-3 py-2 text-[10px] text-amber-300 space-y-0.5">
+          {problems.map((p) => (
+            <li key={p}>{p}</li>
+          ))}
+        </ul>
+      )}
+
       <div className="flex gap-2 pt-1">
         <button
           type="button"
           className={btnPrimary}
-          disabled={busy || !draft.name.trim()}
+          disabled={busy || problems.length > 0}
           onClick={() => void submit()}
         >
           {busy ? "Menyimpan..." : "Simpan Provider"}

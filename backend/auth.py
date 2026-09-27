@@ -21,6 +21,10 @@ import os
 import secrets
 from typing import List, Optional
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from cryptography.fernet import Fernet
 from fastapi import HTTPException, Request
 from fastapi.security import APIKeyHeader

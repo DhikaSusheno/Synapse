@@ -8,6 +8,9 @@ import { buildFileTree, type TreeNode } from "@/lib/derive";
 import { num, arr, str } from "@/lib/coerce";
 import { LLMChatPanel } from "@/components/LLMChatPanel";
 import ProviderSelect from "@/components/ProviderSelect";
+import TargetPicker from "@/components/TargetPicker";
+import { useTargetGeneration } from "@/hooks/useTargets";
+import { getActiveTarget, subscribeActiveTarget } from "@/lib/targets";
 import {
   clearArtifact,
   getArtifact,
@@ -130,7 +133,12 @@ async function errorDetail(r: Response, fallback: string): Promise<string> {
 }
 
 // Tree repo dari node graph backend (/graph/nodes) — bukan mock.
-function useFileTree(enabled: boolean): { tree: TreeNode[]; loading: boolean; error: string | null } {
+// reloadKey datang dari useTargetGeneration: ganti target = ganti DB graph,
+// jadi tree lama harus dibuang, bukan ditimpa kalau yang baru tidak kosong.
+function useFileTree(
+  enabled: boolean,
+  reloadKey: number
+): { tree: TreeNode[]; loading: boolean; error: string | null } {
   const [tree, setTree] = useState<TreeNode[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -138,6 +146,7 @@ function useFileTree(enabled: boolean): { tree: TreeNode[]; loading: boolean; er
   useEffect(() => {
     if (!enabled) { setLoading(false); return; }
     let cancelled = false;
+    setLoading(true);
     Promise.all([
       fetch(`${BACKEND_URL}/graph/nodes?type=file`, { cache: "no-store" }).then((r) => (r.ok ? r.json() : [])),
       fetch(`${BACKEND_URL}/graph/nodes?type=doc`, { cache: "no-store" }).then((r) => (r.ok ? r.json() : [])),
@@ -154,7 +163,7 @@ function useFileTree(enabled: boolean): { tree: TreeNode[]; loading: boolean; er
       .catch(() => { if (!cancelled) setError("Backend tidak dapat dijangkau"); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [enabled]);
+  }, [enabled, reloadKey]);
 
   return { tree, loading, error };
 }
@@ -176,8 +185,20 @@ const MOCK_REVIEW: ReviewScores = {
 };
 
 export default function CortexPage() {
-  const { tree, loading: treeLoading, error: treeError } = useFileTree(USE_LIVE);
+  // Target analisis yang aktif. Kalau berubah, tree di bawah ini dibaca ulang
+  // dari DB graph yang baru - dan selectedFile harus dibuang, karena path
+  // yang ada di repo lama belum tentu ada di repo yang baru.
+  const targetGeneration = useTargetGeneration();
+  const activeTarget = useSyncExternalStore(subscribeActiveTarget, getActiveTarget, getActiveTarget);
+  const { tree, loading: treeLoading, error: treeError } = useFileTree(USE_LIVE, targetGeneration);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+
+  // Path yang valid di repo lama belum tentu ada di repo baru. Kalau tidak
+  // dibuang, panel review akan mengirim path yang sudah tidak ada dan user
+  // melihat error dari file yang tidak pernah dipilih.
+  useEffect(() => {
+    setSelectedFile(null);
+  }, [targetGeneration]);
   const [explainTopic, setExplainTopic] = useState("How does the guardian module work?");
   const [explainResult, setExplainResult] = useState<ExplainResult | null>(USE_LIVE ? null : MOCK_EXPLAIN);
   const [explainLoading, setExplainLoading] = useState(false);
@@ -389,6 +410,19 @@ export default function CortexPage() {
           <h1 className="text-lg font-bold text-white">Cortex</h1>
           <span className="text-[10px] px-2.5 py-1 rounded-full bg-purple-500/20 text-purple-400 border border-purple-500/30 font-bold">REVIEW MODE</span>
         </div>
+
+        {/* Target analisis. Cortex menjawab dari graph target yang aktif, jadi
+            ganti target di sini mengganti konteks semua jawaban. */}
+        <details className="rounded-xl border border-slate-800 bg-slate-900/30 px-3 py-2">
+          <summary className="cursor-pointer text-[11px] text-slate-400 select-none">
+            {activeTarget
+              ? `Target: ${activeTarget.label}`
+              : "Belum ada target analisis"}
+          </summary>
+          <div className="mt-3">
+            <TargetPicker compact />
+          </div>
+        </details>
 
         {/* Provider + model. Dulu ditulis mati sebagai openai:gpt-4o, padahal
             llm_providers tidak punya baris itu, jadi chat selalu 404. */}

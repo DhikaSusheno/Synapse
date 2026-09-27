@@ -8,6 +8,7 @@
 // itu mulai kosong, jadi setiap chat berakhir "Provider not found or disabled".
 // Sekarang id dan model datang dari registry yang benar-benar diisi user.
 
+import { useEffect, useRef } from "react";
 import { useLLMProviders } from "@/hooks/useLLMProviders";
 import { reconcileDefault } from "@/lib/llmProviders";
 
@@ -30,6 +31,42 @@ export default function ProviderSelect({
   // `AND enabled = 1`, jadi memilih yang nonaktif akan 404.
   const usable = providers.filter((p) => p.enabled);
 
+  // Kalau id yang tersimpan sudah tidak ada (provider dihapus, atau dimatikan),
+  // jatuhkan ke provider pertama yang aktif - bukan kirim id mati ke backend.
+  const active = usable.find((p) => p.id === providerId) ?? usable[0];
+  const activeId = active?.id ?? null;
+  const effectiveModel =
+    active && activeId !== providerId
+      ? reconcileDefault(active.models, model)
+      : model;
+
+  // BUG-42: `active` di atas hanya dipakai untuk ME-RENDER select. Kalau kita
+  // tidak menyinkronkannya ke parent, select terlihat menunjukkan "Deepseek v4"
+  // sementara state parent masih providerId="" (nilai awal CortexPage). Chat lalu
+  // mengirim provider_id="" dan backend membalas 404 "Provider not found or
+  // disabled" - user melihat provider yang benar tapi chat selalu gagal.
+  //
+  // Dua hal yang WAJIB berlaku di effect ini:
+  // 1. Hook HARUS di atas semua `return` awal. Kalau tidak, render pertama
+  //    (loading=true) sama sekali tidak memanggil hook ini, sementara render kedua
+  //    memanggilnya -> React melempar "Rendered more hooks than during the
+  //    previous render" dan seluruh halaman Cortex blank.
+  // 2. Syaratnya perbandingan nilai, bukan "selalu panggil onChange", supaya
+  //    tidak memicu render berulang.
+  //
+  // onChange dibaca lewat ref: parent sering mengirim arrow inline (CortexPage),
+  // jadi identitasnya berubah tiap render. Kalau onChange ikut jadi dependensi,
+  // effect jalan setiap render - dan kalau parent membalas dengan nilai yang
+  // sedikit berbeda (mis. model dinormalkan), itu jadi render loop.
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+
+  useEffect(() => {
+    if (activeId && (activeId !== providerId || effectiveModel !== model)) {
+      onChangeRef.current(activeId, effectiveModel);
+    }
+  }, [activeId, effectiveModel, providerId, model]);
+
   if (loading) {
     return (
       <p className={`text-[10px] text-slate-500 animate-pulse ${className}`}>
@@ -38,7 +75,7 @@ export default function ProviderSelect({
     );
   }
 
-  if (usable.length === 0) {
+  if (!active) {
     return (
       <p className={`text-[10px] text-amber-400 ${className}`}>
         Belum ada provider LLM aktif. Tambah dulu di{" "}
@@ -47,11 +84,6 @@ export default function ProviderSelect({
       </p>
     );
   }
-
-  const active = usable.find((p) => p.id === providerId) ?? usable[0];
-  // Kalau id yang tersimpan sudah tidak ada (provider dihapus, atau dimatikan),
-  // jatuhkan ke provider pertama yang aktif - bukan kirim id mati ke backend.
-  const effectiveModel = active.id === providerId ? model : reconcileDefault(active.models, model);
 
   return (
     <div className={`flex flex-wrap items-center gap-2 ${className}`}>

@@ -9,9 +9,11 @@
 import { useEffect, useState } from "react";
 import { useLiveOps } from "@/hooks/useLiveOps";
 import { useSSEStream } from "@/hooks/useSSEStream";
+import { opsEmptyMessage } from "@/lib/operations";
+import { getTargetSnapshot } from "@/lib/targets";
 import {
-  bucketActivity, clock, conflictCandidates, isOpen, opSummary, pct, relativeTime,
-  type ConflictCandidate, type LiveOp,
+  bucketActivity, clock, conflictCandidates, isOpen, opSummary, pct, pickActivitySpan,
+  relativeTime, type ConflictCandidate, type LiveOp,
 } from "@/lib/derive";
 import type { SSELogEntry } from "@/lib/types";
 
@@ -69,14 +71,41 @@ function useLiveSSELog(): SSELogEntry[] {
   return log;
 }
 
+/**
+ * Histogram operasi Guardian.
+ *
+ * Jendelanya DATUM-ADAPTIF (pickActivitySpan), bukan selalu "5 jam":
+ * dengan jendela tetap, instalasi yang idle sejak kemarin pagi menghasilkan
+ * 10 batang rata-rata 2px - terlihat persis seperti grafik yang mati,
+ * padahal datanya ada. Label jendela ditampilkan supaya user tahu sedang
+ * melihat rentang mana, dan saat memang tidak ada data sama sekali,-empty
+ * state-nya menjelaskan kenapa (bukan cuma batang kosong).
+ */
 function ActivityChart({ ops }: { ops: readonly LiveOp[] }) {
-  const buckets = bucketActivity(ops);
+  const span = pickActivitySpan(ops);
+  const buckets = bucketActivity(ops, 10, span.spanMs);
   const max = Math.max(1, ...buckets.map((b) => b.count));
+  const total = buckets.reduce((sum, b) => sum + b.count, 0);
+  if (ops.length === 0) {
+    return (
+      <p className="py-8 text-center text-[10px] text-slate-600">
+        Belum ada operasi pada target ini, jadi belum ada grafik.
+      </p>
+    );
+  }
+  if (total === 0) {
+    return (
+      <p className="py-8 text-center text-[10px] text-slate-600">
+        {ops.length} operasi tercatat, tapi semuanya di luar {span.label}. Grafik akan
+        terisi saat ada operasi baru.
+      </p>
+    );
+  }
   return (
     <div className="space-y-1">
       <div className="flex items-end gap-1 h-20">
-        {buckets.map((b) => (
-          <div key={b.label} className="flex-1 flex flex-col items-center justify-end gap-1 group">
+        {buckets.map((b, i) => (
+          <div key={`${b.label}-${i}`} className="flex-1 flex flex-col items-center justify-end gap-1 group">
             <span className="text-[9px] text-slate-500 opacity-0 group-hover:opacity-100">{b.count}</span>
             <div
               className="w-full rounded-t bg-purple-500/70 min-h-[2px]"
@@ -87,8 +116,8 @@ function ActivityChart({ ops }: { ops: readonly LiveOp[] }) {
         ))}
       </div>
       <div className="flex gap-1">
-        {buckets.map((b) => (
-          <span key={b.label} className="flex-1 text-center text-[9px] text-slate-600 truncate">{b.label}</span>
+        {buckets.map((b, i) => (
+          <span key={`${b.label}-${i}`} className="flex-1 text-center text-[9px] text-slate-600 truncate">{b.label}</span>
         ))}
       </div>
     </div>
@@ -99,6 +128,10 @@ export default function AgentsPage() {
   const { ops, loading, offline, refresh } = useLiveOps();
   const summary = useGraphSummary(USE_LIVE);
   const sseLog = useLiveSSELog();
+
+  // /operations di-scope ke target aktif, jadi daftar kosong bisa berarti
+  // "target ini belum punya operasi" - bukan backend mati.
+  const activeTargetId = getTargetSnapshot().active?.id ?? null;
 
   const openOps = ops.filter((op) => isOpen(op.status));
   const conflicts: ConflictCandidate[] = conflictCandidates(ops);
@@ -179,7 +212,9 @@ export default function AgentsPage() {
           </div>
           {openOps.length === 0 ? (
             <div className="text-[10px] text-slate-600 py-4 text-center">
-              {loading ? "Loading operations..." : !USE_LIVE ? "Live data OFF — set NEXT_PUBLIC_USE_LIVE_SSE=true." : offline ? "Backend offline — no data." : "Tidak ada operasi terbuka."}
+              {opsEmptyMessage({
+                loading, liveEnabled: USE_LIVE, offline, activeTargetId,
+              })}
             </div>
           ) : (
             <div className="space-y-2">
@@ -241,7 +276,8 @@ export default function AgentsPage() {
           <div className="flex items-center justify-between">
             <span className="text-sm font-semibold text-white">Agent Activity</span>
             <span className="text-[10px] text-slate-500">
-              {ops.length} operasi &middot; peak {Math.max(0, ...bucketActivity(ops).map((b) => b.count))}
+              {ops.length} operasi &middot; {pickActivitySpan(ops).label} &middot; peak{" "}
+              {Math.max(0, ...bucketActivity(ops, 10, pickActivitySpan(ops).spanMs).map((b) => b.count))}
             </span>
           </div>
           <ActivityChart ops={ops} />

@@ -135,12 +135,39 @@ def reset() -> Dict[str, Any]:
 
 
 def allowed_roots() -> List[str]:
+    """
+    Root yang boleh dibaca endpoint Synapse: repo + workspace_path.
+
+    Target yang terdaftar (projects.py) juga diikutkan, karena target ARE
+    repo/folder yang dianalisis - tanpa ini, `/understand_repo` pada target
+    tersebut akan ditolak padahal target-nya sah. Operator yang tidak
+    ingincabut trust ini bisa set SYNAPSE_ALLOW_TARGET_ROOTS=0.
+
+    Import projects dilakukan di dalam fungsi supaya settings.py tetap bisa
+    diimpor tanpa projects.py, dan supaya failure di registry tidak
+    menjatuhkan seluruh endpoint.
+    """
     roots = [REPO_ROOT]
     workspace = load()["workspace_path"]
     candidate = workspace if os.path.isabs(workspace) else os.path.join(REPO_ROOT, workspace)
     resolved = os.path.realpath(candidate)
     if os.path.isdir(resolved):
         roots.append(resolved)
+
+    if os.environ.get("SYNAPSE_ALLOW_TARGET_ROOTS", "1").strip() in ("0", "false", "no"):
+        return roots
+    try:
+        import projects
+    except Exception:
+        return roots
+    try:
+        for target in projects.registered_paths():
+            real = os.path.realpath(target)
+            if os.path.isdir(real) and real not in roots:
+                roots.append(real)
+    except Exception:
+        # Registry rusak tidak boleh menjatuhkan semua pembacaan file.
+        pass
     return roots
 
 

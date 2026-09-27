@@ -220,6 +220,11 @@ def _mk_db(path: Path) -> None:
         CREATE TABLE approvals (operation_id TEXT PRIMARY KEY, decision TEXT,
                                decided_at TEXT, note TEXT DEFAULT '');
     """)
+    # Kolom yang ditambahkan lewat ALTER TABLE (operations.target_id) ikut,
+    # supaya DDL minimal di atas tidak perlu ikut setiap kali skema bertambah.
+    import database
+
+    database._add_missing_columns(conn)
     conn.commit()
     conn.close()
 

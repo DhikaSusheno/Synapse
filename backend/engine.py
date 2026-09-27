@@ -69,11 +69,25 @@ _LOG = logging.getLogger("synapse.engine")
 
 from storage import (
     DB_PATH,
+    active_db_path,
     get_conn,
     record_audit,
     upsert_entity,
     upsert_relation,
 )
+
+
+def invalidate_graph_cache() -> None:
+    """Paksa graph di-memory dibangun ulang dari DB.
+
+    WAJIB dipanggil setiap kali file DB yang aktif berpindah (ganti target).
+    Tanpa ini _get_graph() melihat _graph yang bukan None dan mengembalikan
+    graph milik target SEBELUMNYA - user sudah ganti repo tapi masih melihat
+    data repo lama.
+    """
+    global _graph
+    with _graph_lock:
+        _graph = None  # type: ignore[assignment]
 
 # #66: sumber kebenaran untuk "path mana yang boleh dibaca" ada di settings.py.
 # Sengaja alias yang sama seperti di main.py supaya tidak ada dua mekanisme
@@ -117,7 +131,10 @@ __all__ = [
 # penukaran _graph lama ke yang baru terjadi atomik di bawah lock.
 
 _graph_lock: threading.Lock = threading.Lock()
-_graph: nx.DiGraph = nx.DiGraph()
+# None = "belum dibangun untuk target saat ini". nx.DiGraph() kosong adalah
+# nilai yang valid (target aktif memang belum punya isi), jadi keduanya
+# harus bisa dibedakan - itulah kenapa invalidate_graph_cache() men-set None.
+_graph: nx.DiGraph | None = None
 
 # Root repo yang terakhir di-ingest. Symbol entity hanya menyimpan
 # source_path RELATIF (menjimka ruang di setiap baris), jadi pembaca snippet
@@ -171,7 +188,7 @@ def _build_graph_from_db() -> nx.DiGraph:
 
 def _get_graph() -> nx.DiGraph:
     """
-    Ambil graph aktif. Kalau masih kosong, rebuild sekali dari SQLite.
+    Ambil graph aktif. Kalau belum dibangun, build sekali dari SQLite.
 
     Ini yang membuat analyze_*.py tetap berguna setelah restart: proses baru
     mulai dengan _graph kosong, dan tidak ada yang memanggil ingest_repository()
@@ -183,12 +200,17 @@ def _get_graph() -> nx.DiGraph:
     menimpa, sementara thread lain memegang referensi graph yang sudah
     basi. Itu persis skenario "overwrite graph valid" yang dilapor issue #33.
 
-    Lock hanya dipegang saat graph masih kosong, jadi setelah rebuild pertama
-    semua panggilan berikutnya cuma lock + cek `len(_graph)` yang murah.
+    Lock hanya dipegang saat graph belum dibangun, jadi setelah build pertama
+    semua panggilan berikutnya cuma lock + cek `_graph is None` yang murah.
+
+    `is None` (bukan `len == 0`) yang jadi kondisi build. Karena
+    invalidate_graph_cache() men-set None setiap ganti target, sementara
+    graph target yang memang kosong (0 node) tidak boleh memicu build
+    berulang tiap request.
     """
     global _graph
     with _graph_lock:
-        if len(_graph) == 0:
+        if _graph is None:
             _graph = _build_graph_from_db()
         return _graph
 
@@ -873,6 +895,62 @@ def _link_imports() -> int:
     return added
 
 
+def _current_repo_ids(root: Path) -> set[str]:
+    """Id entitas yang HARUS ada setelah ingest root ini.
+
+    Berisi file, simbol, dan doc yang ada di disk sekarang. Dipakai
+    prune_stale() untuk membuang entitas dari file yang sudah dihapus
+    sejak ingest sebelumnya - tanpa ini, graph hanya menumpuk dan file
+    yang sudah tidak ada tetap muncul di health report.
+    """
+    keep: set[str] = set()
+    for path in _iter_repo_files(root):
+        try:
+            rel = str(path.relative_to(root))
+        except ValueError:
+            continue
+        ext = path.suffix.lower()
+        if ext in SUPPORTED_EXTENSIONS:
+            keep.add(f"file::{rel}")
+            for sym in parse_source(path, SUPPORTED_EXTENSIONS[ext]):
+                keep.add(f"symbol::{rel}::{sym['name']}")
+        else:
+            keep.add(f"doc::{rel}")
+    return keep
+
+
+def prune_stale(keep: set[str]) -> int:
+    """Hapus entitas file/symbol/doc yang tidak lagi ada di disk.
+
+    Hanya kind='file', 'symbol', dan 'doc' yang disentuh. Action, decision,
+    dan entitas lain milik workflow Guardian/audit TIDAK dihapus, karena
+    mereka bukan hasil pindai repository dan dihapus akan menghapus jejak
+    audit. Relasi yang salah satu ujungnya terhapus ikut terhapus.
+    """
+    conn = get_conn()
+    stale: list[str] = []
+    for row in conn.execute(
+        "SELECT id FROM entities WHERE kind IN ('file','symbol','doc')"
+    ):
+        if row["id"] not in keep:
+            stale.append(row["id"])
+    if not stale:
+        return 0
+    chunk = 400
+    removed = 0
+    for start in range(0, len(stale), chunk):
+        batch = stale[start:start + chunk]
+        placeholders = ",".join("?" * len(batch))
+        conn.execute(f"DELETE FROM relations WHERE from_id IN ({placeholders})", batch)
+        conn.execute(f"DELETE FROM relations WHERE to_id IN ({placeholders})", batch)
+        cur = conn.execute(
+            f"DELETE FROM entities WHERE id IN ({placeholders})", batch
+        )
+        removed += cur.rowcount or 0
+    conn.commit()
+    return removed
+
+
 def ingest_repository(repo_path: str) -> dict:
     """
     Walk repo, parse simbol, bangun knowledge graph di storage.py.
@@ -996,6 +1074,7 @@ def ingest_repository(repo_path: str) -> dict:
     documented_ids: set[str] = set()
     stats["edges"] += _link_docs_to_code(root, documented_ids)
     stats["edges"] += _link_imports()
+    stats["stale_removed"] = prune_stale(_current_repo_ids(root))
 
     conn = get_conn()
     total_files = conn.execute(
@@ -1741,7 +1820,7 @@ def graph_stats() -> dict:
         "edge_count": g.number_of_edges(),
         "nodes_by_kind": by_kind,
         "edges_by_relationship": by_relation,
-        "db_path": str(DB_PATH),
+        "db_path": str(active_db_path()),
     }
 
 

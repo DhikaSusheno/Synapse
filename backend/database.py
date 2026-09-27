@@ -70,6 +70,14 @@ def init_db() -> None:
         tool_name            TEXT NOT NULL,
         params_json          TEXT DEFAULT '{}',
         target_node_id       TEXT,
+        -- Id target (repository/folder) yang aktif ketika operasi ini
+        -- dibuat. Operations TIDAK per-target: memindah target akan mengganti
+        -- SELURUH isi graph, dan mencampur history approval repo A ke repo B
+        -- berbahaya (kebetulan nama file-nya sama). Nilai ini ditulis saat
+        -- propose, bukan saat dibaca, jadi history tetap menempel ke repo aslinya
+        -- walau target-nya sudah diganti atau dihapus dari registry.
+        -- '' = dibuat sebelum fitur ini ada, atau tanpa target aktif.
+        target_id            TEXT DEFAULT '',
         blast_radius         TEXT DEFAULT 'unknown',
         reversibility_class  TEXT DEFAULT 'irreversible_suspected',
         status               TEXT DEFAULT 'pending',  -- pending|approved|executing|executed_unverified|verified|failed|rolled_back
@@ -143,6 +151,29 @@ def init_db() -> None:
     );
     """)
 
+    _add_missing_columns(conn)
     conn.commit()
     conn.close()
     print("[DB] Schema initialised at", DB_PATH)
+
+
+# Kolom yang ditambahkan SETELAH schema v1 pertama kali rilis. CREATE TABLE IF
+# NOT EXISTS tidak pernah menyentuh tabel yang sudah ada, jadi DB lama butuh
+# ALTER TABLE terpisah. Dipisah dari skema awal supaya tidak ada yang salah
+# baca sebagai "kolom ini selalu ada sejak awal".
+_ADDED_COLUMNS = (
+    ("operations", "target_id", "TEXT DEFAULT ''"),
+)
+
+
+def _add_missing_columns(conn) -> None:
+    """Tambahkan kolom yang belum ada, untuk DB yang dibuat versi lama.
+
+    Dibaca dari PRAGMA table_info, bukan dari metadata, jadi jalan juga untuk
+    DB yang tabelnya belum pernah disentuh sama sekali.
+    """
+    for table, column, decl in _ADDED_COLUMNS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing or column in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")

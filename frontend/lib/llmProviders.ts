@@ -9,9 +9,13 @@
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "/backend";
 
-// Harus sama persis dengan Literal di LLMProviderCreate / LLMProviderUpdate
-// (backend/main.py). Kirim nilai di luar daftar ini dan FastAPI 422.
-export const PROVIDER_TYPES = [
+// Tipe yang dikenali Synapse. BUKAN daftar tertutup: backend menerima tipe
+// apa pun (lihat normalize_provider_type di main.py), jadi "groq",
+// "lmstudio", "vllm", atau "internal-proxy" semuanya sah. Daftar ini hanya
+// untuk (a) memberi base_url default di backend dan (b) mengisi dropdown.
+//
+// Konsekuensi: form harus bisa menerima teks bebas, bukan cuma <select>.
+export const KNOWN_PROVIDER_TYPES = [
   "openai",
   "anthropic",
   "ibm",
@@ -21,13 +25,18 @@ export const PROVIDER_TYPES = [
   "openai-compatible",
 ] as const;
 
-export type ProviderType = (typeof PROVIDER_TYPES)[number];
+/** Nama tipe provider. Bebas, bukan salah satu dari KNOWN_PROVIDER_TYPES. */
+export type ProviderType = string;
+
+// Alias lama. Dipakai LLMProviderManager untuk iterasi dropdown; nama baru
+// lebih jujur karena daftar ini tidak lagi lengkap.
+export const PROVIDER_TYPES = KNOWN_PROVIDER_TYPES;
 
 // Backend menolak DELETE untuk type di bawah dengan 403 (delete_llm_provider,
 // "Cannot delete built-in provider"). UI harus menonaktifkan tombol hapus
 // berdasarkan daftar yang sama supaya user tidak menunggu error yang sudah
-// bisa diprediksi di client.
-export const UNDELETABLE_TYPES: ReadonlySet<ProviderType> = new Set<ProviderType>([
+// bisa diprediksi di client. Tipe custom SELALU boleh dihapus.
+export const UNDELETABLE_TYPES: ReadonlySet<string> = new Set<string>([
   "openai",
   "anthropic",
   "ibm",
@@ -40,11 +49,29 @@ export function isDeletable(type: ProviderType): boolean {
   return !UNDELETABLE_TYPES.has(type);
 }
 
+// Base URL default per tipe yang dikenali. Harus sama dengan
+// PROVIDER_BASE_URLS di backend/main.py. Tipe di luar daftar TIDAK punya
+// default: backend akan menolak dengan 400 kalau base_url kosong, karena
+// menebak URL OpenAI akan mengirim isi repo ke akun yang tidak diminta.
+export const PROVIDER_BASE_URLS: Record<string, string> = {
+  openai: "https://api.openai.com/v1",
+  anthropic: "https://api.anthropic.com/v1",
+  nvidia: "https://integrate.api.nvidia.com/v1",
+  deepseek: "https://api.deepseek.com/v1",
+  ollama: "http://localhost:11434/v1",
+  ibm: "https://us-south.ml.cloud.ibm.com/ml/v1",
+};
+
+/** True kalau tipe punya base_url default, jadi field boleh dikosongkan. */
+export function hasDefaultBaseUrl(type: ProviderType): boolean {
+  return Object.prototype.hasOwnProperty.call(PROVIDER_BASE_URLS, type);
+}
+
 // Saran model per tipe. Backend tidak menolak nama model di luar daftar ini -
 // namespaced model lokal (mis. "llama3.1:8b", "qwen2.5-coder:14b") sah untuk
-// Ollama, dan vendor barurels cepat. Daftar ini hanya untuk autocomplete, jadi
-// input tetap harus bisa menerima teks bebas.
-export const MODEL_SUGGESTIONS: Record<ProviderType, readonly string[]> = {
+// Ollama, dan vendor baru sering punya nama sendiri. Daftar ini hanya untuk
+// autocomplete, jadi input tetap harus bisa menerima teks bebas.
+export const MODEL_SUGGESTIONS: Record<string, readonly string[]> = {
   openai: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o3-mini"],
   anthropic: ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-5-haiku-latest"],
   ibm: ["ibm/granite-3-8b-instruct", "meta-llama/llama-3-3-70b-instruct"],
@@ -53,6 +80,11 @@ export const MODEL_SUGGESTIONS: Record<ProviderType, readonly string[]> = {
   ollama: ["llama3.1", "qwen2.5-coder", "deepseek-r1", "gemma3"],
   "openai-compatible": ["gpt-4o-mini", "llama3.1", "qwen2.5-coder"],
 };
+
+/** Saran model untuk satu tipe. Selalu array, walau tipenya tidak dikenal. */
+export function modelSuggestions(type: ProviderType): readonly string[] {
+  return MODEL_SUGGESTIONS[type] ?? [];
+}
 
 export interface LLMProvider {
   id: string;
@@ -212,4 +244,68 @@ export function reconcileDefault(
  */
 export function makeProviderId(type: ProviderType, name: string): string {
   return `${type}:${name.trim()}`;
+}
+
+/** Tipe fallback kalau user mengosongkan field tipe. Satu-satunya tipe
+ *  yang boleh tanpa base_url dan tanpa model bawaan, jadi form tetap bisa
+ *  disimpan. */ 
+const DEFAULT_PROVIDER_TYPE = "openai-compatible";
+
+/**
+ * Normalisasi tipe: lowercase, lalu coba beberapa bentuk sampai satu cocok
+ * dengan daftar bawaan. WAJIB sama dengan normalize_provider_type() di
+ * backend/main.py, karena makeProviderType di bawah menghitung id client-side
+ * dan id itu harus sama persis dengan "{type}:{name}" yang dibuat server.
+ *
+ * Urutan kandidat penting. "Open AI" adalah cara orang mengetik nama itu
+ * setiap hari, dan kalau spasinya diganti tanda hubung hasilnya "open-ai",
+ * nama yang tidak ada di daftar bawaan. Akibatnya provider kehilangan
+ * base_url default dan user dipaksa mengetik URL yang sebenarnya sudah kami
+ * tahu benar, DAN id yang dibuat client beda dengan id dari server.
+ *
+ *     "  OpenAI "            -> "openai"           (cocok persis)
+ *     "Open AI" / "open ai"  -> "openai"           (spasi dihapus, cocok)
+ *     "open ai compatible"   -> "openai-compatible" (spasi -> dash)
+ *     "vllm"                 -> "vllm"             (tidak dikenal, dipakai apa adanya)
+ */
+export function normalizeProviderType(raw: string): string {
+  const text = (raw ?? "").trim().toLowerCase();
+  if (!text) return DEFAULT_PROVIDER_TYPE;
+  const squashed = text.replace(/\s+/g, "");
+  const dashed = text.split(/\s+/).join("-");
+  for (const candidate of [text, squashed, dashed, dashed.replace(/-/g, "_")]) {
+    if (hasDefaultBaseUrl(candidate) || KNOWN_PROVIDER_TYPES.includes(candidate as never)) {
+      return candidate;
+    }
+  }
+  // Tipe custom: buang karakter yang akan merusak id dan base_url.
+  const cleaned = dashed.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return cleaned || DEFAULT_PROVIDER_TYPE;
+}
+
+/**
+ * Validasi draft sebelum dikirim. Backend sudah menolak tipe tanpa base_url
+ * dengan 422, tapi errornya berupa jargon Pydantic; di sini pesannya
+ * langsung dan bisa ditindaklanjuti user.
+ *
+ * Mengembalikan string[] yang kosong kalau draftnya sah.
+ */
+export function validateDraft(draft: ProviderDraft): string[] {
+  const problems: string[] = [];
+  if (!draft.name.trim()) {
+    problems.push("Nama provider wajib diisi.");
+  }
+  const type = normalizeProviderType(draft.type);
+  if (!type) {
+    problems.push("Tipe provider wajib diisi.");
+  } else if (!hasDefaultBaseUrl(type) && !(draft.base_url ?? "").trim()) {
+    problems.push(
+      `Tipe "${type}" bukan provider bawaan, jadi base_url wajib diisi. ` +
+        `Synapse tidak menebak endpoint untuk tipe di luar daftar.`,
+    );
+  }
+  if (draft.models.length === 0 && !(draft.default_model ?? "").trim()) {
+    problems.push("Isi minimal satu model, atau set default model.");
+  }
+  return problems;
 }

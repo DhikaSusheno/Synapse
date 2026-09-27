@@ -35,3 +35,8 @@ backend/test_debug2.py
 
 .DS_Store
 Thumbs.db
+
+workspace/
+
+projects_registry.json
+backend/projects_registry.json
