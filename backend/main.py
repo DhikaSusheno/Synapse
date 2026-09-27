@@ -43,7 +43,7 @@ from typing import AsyncGenerator, Dict, List, Literal, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 import sqlite3
 
 from database import init_db, DB_PATH
@@ -1520,19 +1520,55 @@ def upsert_project_llm_config(project_id: str, req: ProjectLLMConfigRequest):
 # RAG Endpoints
 # ---------------------------------------------------------------------------
 
+# Batas untuk /api/rag/ingest.
+#
+# Setiap chunk menghasilkan SATU request HTTP keluar ke endpoint embedding.
+# Sebelum batas ini ada, chunk_size=0 atau 1 membuat setiap baris file jadi
+# satu chunk, jadi satu request masuk bisa menghasilkan ratusan of outbound
+# requests: file 200 baris dengan chunk_size=1 sudah menghasilkan 201 request
+# keluar. Kalau files dibiarkan 5.000 entri dan isinya inline tanpa batas
+# panjang, satu POST bisa menahan backend dan menghabiskan kuota API.
+#
+# Default aplikasi (1000/200) dan file berukuran normal jauh di
+# bawah batas ini, jadi ini tidak mengubah perilaku yang sudah bekerja.
+MAX_INGEST_FILES = 200
+MAX_CHUNK_SIZE = 100_000
+MAX_INGEST_ENTRY_CHARS = 2_000_000
+# Pengaman kedua: meski semua batas di atas lolos, jumlah request keluar
+# dibatasi supaya loop tidak bisa berjalan tanpa akhir.
+MAX_INGEST_CHUNKS = 5_000
+
+
 class RAGIngestRequest(BaseModel):
     provider_id: str
     model: str | None = None
     api_key: str | None = None   # BUG-NEW-4 FIX: field hilang, dipakai di baris 1288
-    files: list[str]  # file paths or contents
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
+    files: list[str] = Field(..., max_length=MAX_INGEST_FILES)
+    chunk_size: int = Field(default=1000, ge=1, le=MAX_CHUNK_SIZE)
+    chunk_overlap: int = Field(default=200, ge=0, le=MAX_CHUNK_SIZE)
+
+    @model_validator(mode="after")
+    def _check_overlap_and_size(self):
+        # chunk_overlap >= chunk_size tidak berguna dan bikin batas chunk
+        # tidak masuk akal. Ditolak di lapisan validasi, bukan diam-diam.
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({self.chunk_overlap}) harus lebih kecil dari "
+                f"chunk_size ({self.chunk_size})"
+            )
+        longest = max((len(f) for f in self.files), default=0)
+        if longest > MAX_INGEST_ENTRY_CHARS:
+            raise ValueError(
+                f"satu entri files maksimal {MAX_INGEST_ENTRY_CHARS} karakter, "
+                f"yang diberikan {longest}"
+            )
+        return self
 
 class RAGSearchRequest(BaseModel):
     provider_id: str
     model: str | None = None
     query: str
-    top_k: int = 5
+    top_k: int = Field(default=5, ge=1, le=100)
 
 def _looks_like_path(value: str) -> bool:
     r"""
@@ -1701,6 +1737,19 @@ async def rag_ingest(req: RAGIngestRequest):
 
     # Chunking murni CPU + join string, blocking -> to_thread.
     chunks = await asyncio.to_thread(_chunk_texts, resolved, req.chunk_size, req.chunk_overlap)
+
+    # Pengaman kedua untuk jumlah request keluar. Validasi di atas sudah
+    # membatasi chunk_size dan files, tapi isi file bisa jauh lebih besar dari
+    # yang disyaratkan, jadi jumlah chunknya sendiri ikut dibatasi.
+    if len(chunks) > MAX_INGEST_CHUNKS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"hasil pemotongan menghasilkan {len(chunks)} chunk, "
+                f"melebihi batas {MAX_INGEST_CHUNKS}. Kisip file lebih kecil, "
+                "atau naikkan chunk_size."
+            ),
+        )
 
     # Generate embeddings
     embeddings = []
