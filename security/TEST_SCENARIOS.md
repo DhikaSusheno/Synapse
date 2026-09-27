@@ -81,7 +81,9 @@ Sumber kebenaran: [`SYNAPSE.md`](../SYNAPSE.md) section 2.5, 4.4, 4.5.
 | A6 | `target=""` (kosong) | tidak crash | `test_adversarial.py::TestEmptyTarget` |
 | A7 | Execute UUID palsu | `ok=False`, pesan error informatif | `test_adversarial.py::TestNonexistentOperation` |
 | A8 | Approve dua kali (approved→denied) | decision terupdate, tidak duplikat | `test_adversarial.py::TestDoubleApprove` |
-| A9 | Concurrent double-execute (2 thread bersamaan) | hanya 1 yang `ok=True`, yang lain ditolak | `test_adversarial.py::TestConcurrentDoubleExecute` _(pending fix BUG-07)_ |
+| A9a | Concurrent double-execute (8 thread bersamaan) | hanya 1 yang `ok=True`, yang lain ditolak | `test_adversarial.py::TestConcurrentDoubleExecute` |
+| A9b | Idem, tapi diukur dari SISI EFEK | `_exec_migration()` dipanggil **tepat 1 kali** | `test_adversarial.py::TestConcurrentDoubleExecute` |
+| A9c | Idem, cek status akhir | status tidak menggantung di `executing`, harus terminal | `test_adversarial.py::TestConcurrentDoubleExecute` |
 
 ---
 

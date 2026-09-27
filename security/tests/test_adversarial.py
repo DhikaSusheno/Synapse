@@ -12,8 +12,12 @@ Skenario:
   A6  Propose op dengan target kosong → tetap berjalan, tidak crash
   A7  Execute operation_id yang tidak ada → error bersih, tidak crash
   A8  Approve dua kali: ubah approved→denied → harus update, tidak duplikat
+  A9  Concurrent double-execute: N thread execute_operation() bersamaan untuk
+      satu operation_id → hanya SATU yang boleh ok=True (regression test BUG-07)
 """
 import sqlite3
+import threading
+
 import pytest
 
 
@@ -242,4 +246,211 @@ class TestDoubleApprove:
         conn.close()
         assert count == 1, (
             f"A8 FAIL: Harus ada tepat 1 record approval, dapat {count}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# A9: concurrent double-execute (regression test BUG-07)
+# ---------------------------------------------------------------------------
+
+# Jumlah thread yang dilepas bersamaan. 8 dipilih supaya ada antrean writer di
+# SQLite yang saling berebut lock -- justru kondisi yang harus ditahan CAS guard.
+RACE_THREADS = 8
+
+# SQLite membalas "database is locked" kalau writer lain memegang lock lebih
+# lama dari busy timeout. Itu artefak kontensi SQLite, BUKAN bug yang diuji
+# di sini -- jadi dicatat terpisah, bukan dianggap PASS diam-diam.
+_LOCKED = "database is locked"
+
+
+def _race_execute(guardian_module, op_id: str, threads: int = RACE_THREADS):
+    """
+    Jalankan execute_operation(op_id) dari `threads` thread yang dilepas
+    bersamaan oleh Barrier, lalu kumpulkan hasil tiap thread.
+
+    Barrier dipakai supaya semua thread sudah "bersiap" sebelum ada yang masuk
+    ke execute_operation. Tanpa ini, thread kedua bisa baru mulai setelah
+    thread pertama selesai dan race-nya tidak pernah terjadi.
+
+    Return (results, locked_count, other_errors).
+    """
+    barrier = threading.Barrier(threads)
+    results: list = [None] * threads
+    errors: list = [None] * threads
+
+    def worker(idx: int) -> None:
+        try:
+            barrier.wait(timeout=15)
+        except threading.BrokenBarrierError:
+            errors[idx] = RuntimeError("barrier pecah sebelum semua thread siap")
+            return
+        try:
+            results[idx] = guardian_module.execute_operation(op_id)
+        except sqlite3.OperationalError as e:
+            errors[idx] = e
+        except Exception as e:  # noqa: BLE001 - sengaja tangkap semua exception
+            errors[idx] = e
+
+    workers = [threading.Thread(target=worker, args=(i,)) for i in range(threads)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join(timeout=30)
+
+    still_running = [t for t in workers if t.is_alive()]
+    assert not still_running, (
+        f"A9 FAIL: {len(still_running)} thread masih jalan setelah 30 detik "
+        "-- execute_operation kemungkinan deadlock di CAS guard"
+    )
+
+    locked = [
+        e
+        for e in errors
+        if isinstance(e, sqlite3.OperationalError) and _LOCKED in str(e).lower()
+    ]
+    others = [e for e in errors if e is not None and e not in locked]
+    return results, locked, others
+
+
+def _assert_single_winner(results, op_id: str) -> None:
+    """Assertion bersama: tepat satu thread boleh menulis status terminal."""
+    done = [r for r in results if isinstance(r, dict)]
+    assert done, "A9 FAIL: tidak ada thread yang mengembalikan result dict"
+
+    winners = [r for r in done if r.get("ok") is True]
+    losers = [r for r in done if r.get("ok") is not True]
+
+    assert len(winners) == 1, (
+        f"A9 FAIL: harus tepat 1 thread ok=True, dapat {len(winners)}\n"
+        f"  operation_id : {op_id}\n"
+        f"  winners      : {winners}\n"
+        f"  losers       : {losers}\n"
+        f"  -- CAS guard di guardian.execute_operation() (UPDATE ... WHERE\n"
+        f"    status IN ('pending','approved') + rowcount check) REGRESSED ke\n"
+        f"    read-then-write, sehingga operasi dieksekusi lebih dari sekali."
+    )
+
+    # Setiap yang kalah harus dapat error yang informatif, bukan diam-diam sukses.
+    for r in losers:
+        assert r.get("error"), (
+            f"A9 FAIL: thread yang kalah dapat result tanpa 'error': {r}"
+        )
+
+
+class TestConcurrentDoubleExecute:
+    def test_concurrent_execute_only_one_wins(self, guardian_module, mem_db):
+        """
+        A9a: N thread execute_operation() bersamaan untuk satu operasi
+        service.restart (no-approval, executor stub) -- hanya 1 yang ok=True.
+
+        Ini yang diuji guard CAS BUG-07. Kalau guardnya hilang, semua thread
+        lolos dan operasi dieksekusi N kali.
+        """
+        proposed = guardian_module.propose_operation(
+            "service.restart", {"service": "api"}, "api-node"
+        )
+        op_id = proposed["operation_id"]
+
+        results, locked, others = _race_execute(guardian_module, op_id)
+
+        assert not others, (
+            f"A9a FAIL: ada thread yang melempar exception tak terduga: "
+            f"{[repr(e) for e in others]}"
+        )
+        if locked:
+            print(
+                f"\n[A9a] catatan: {len(locked)} thread kena "
+                f"'{_LOCKED}' (kontensi SQLite, bukan bug)"
+            )
+        _assert_single_winner(results, op_id)
+
+    def test_concurrent_execute_runs_migration_once(self, guardian_module, mem_db):
+        """
+        A9b: Verifikasi SISI EFEK, bukan cuma nilai balik.
+
+        db.run_migration di-approve dulu, lalu N thread mengeksekusi bersamaan
+        dengan SQL `CREATE TABLE IF NOT EXISTS`. Kalau CAS guard bekerja,
+        _exec_migration() dipanggil tepat 1 kali. Kalau guardnya diregresikan,
+        migration dijalankan N kali -- dan itu terdeteksi lewat hitungan pemanggilan.
+        """
+        proposed = guardian_module.propose_operation(
+            "db.run_migration",
+            {
+                "sql": "CREATE TABLE IF NOT EXISTS a9_race_probe (id INTEGER)",
+                "db_path": str(mem_db),
+            },
+            "synapse.db",
+        )
+        op_id = proposed["operation_id"]
+        approved = guardian_module.approve_operation(op_id, "approved")
+        assert approved["ok"] is True, (
+            f"A9b FAIL: approve gagal, test tidak mungkin menguji execute: {approved}"
+        )
+
+        # Hitung berapa kali executor benar-benar dipanggil, tanpa mengubah
+        # perilakunya -- bungkus fungsi asli.
+        real_exec = guardian_module._exec_migration
+        calls: list = []
+        lock = threading.Lock()
+
+        def counting_exec(params):
+            with lock:
+                calls.append(dict(params))
+            return real_exec(params)
+
+        guardian_module._exec_migration = counting_exec
+        try:
+            results, locked, others = _race_execute(guardian_module, op_id)
+        finally:
+            guardian_module._exec_migration = real_exec
+
+        assert not others, (
+            f"A9b FAIL: ada thread yang melempar exception tak terduga: "
+            f"{[repr(e) for e in others]}"
+        )
+        if locked:
+            print(
+                f"\n[A9b] catatan: {len(locked)} thread kena "
+                f"'{_LOCKED}' (kontensi SQLite, bukan bug)"
+            )
+
+        _assert_single_winner(results, op_id)
+
+        assert len(calls) == 1, (
+            f"A9b FAIL: _exec_migration() dipanggil {len(calls)} kali, harus 1.\n"
+            f"  operation_id : {op_id}\n"
+            f"  -- migration dieksekusi lebih dari sekali. Guard CAS BUG-07\n"
+            f"    tidak bekerja, sehingga dua operasi bisa menulis ke DB\n"
+            f"    yang sama tanpa serialization."
+        )
+
+    def test_status_not_left_executing(self, guardian_module, mem_db):
+        """
+        A9c: Setelah race selesai, status operasi harus terminal
+        (verified / rolled_back / failed) -- tidak boleh tersangkut 'executing'.
+
+        Kalau CAS update membunuh winner di tengah jalan, baris akan menggantung
+        di status 'executing' dan operasi itu tidak bisa di-rollback lagi.
+        """
+        proposed = guardian_module.propose_operation(
+            "service.restart", {"service": "api"}, "api-node"
+        )
+        op_id = proposed["operation_id"]
+
+        _race_execute(guardian_module, op_id)
+
+        conn = sqlite3.connect(str(mem_db))
+        row = conn.execute(
+            "SELECT status FROM operations WHERE id=?", (op_id,)
+        ).fetchone()
+        conn.close()
+
+        assert row is not None, f"A9c FAIL: baris operasi {op_id} hilang"
+        status = row[0]
+        assert status != "executing", (
+            f"A9c FAIL: status operasi masih 'executing' setelah race selesai -- "
+            f"operasi menggantung dan tidak bisa di-rollback"
+        )
+        assert status in ("verified", "rolled_back", "failed", "denied"), (
+            f"A9c FAIL: status '{status}' bukan status terminal yang valid"
         )
