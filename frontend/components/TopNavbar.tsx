@@ -5,6 +5,7 @@
 // FE-1 @nabilfauzandafa
 
 import { useBackendStatus, type BackendMode } from "@/hooks/useBackendStatus";
+import { usePlatformSettings } from "@/lib/usePlatformSettings";
 
 interface Props {
   nodeCount: number;
@@ -21,6 +22,8 @@ const CONNECTION: Record<BackendMode, { dot: string; title: string; sub: string 
 
 export default function TopNavbar({ nodeCount, edgeCount, onOpenSettings }: Props) {
   const { mode } = useBackendStatus();
+  const { settings } = usePlatformSettings();
+  const branch = settings?.default_branch || "main";
   const conn = CONNECTION[mode];
 
   return (
@@ -34,13 +37,13 @@ export default function TopNavbar({ nodeCount, edgeCount, onOpenSettings }: Prop
         <span className="text-xs px-1.5 py-0.5 rounded border border-slate-700 text-slate-500">public</span>
       </div>
 
-      {/* Branch — label statis. Sebelumnya ada chevron dropdown yang tidak
-          terhubung ke endpoint mana pun, jadi hanya affordance yang tidak jalan. */}
+      {/* Branch — sekarang mengikuti default_branch dari Settings. Sebelumnya
+          label statis "main" yang tidak pernah bisa diubah dari mana pun. */}
       <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-slate-800/60 border border-slate-700/60 text-xs text-slate-300 shrink-0">
         <svg aria-hidden="true" className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
         </svg>
-        main
+        <span className="font-mono">{branch}</span>
       </div>
 
       <div className="w-px h-4 bg-slate-700 mx-1 shrink-0" />
