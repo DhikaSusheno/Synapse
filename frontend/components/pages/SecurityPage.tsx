@@ -10,6 +10,8 @@
 
 import { useState } from "react";
 import { useLiveOps } from "@/hooks/useLiveOps";
+import { getTargetSnapshot } from "@/lib/targets";
+import { opsEmptyMessage } from "@/lib/operations";
 import { useSSEStream } from "@/hooks/useSSEStream";
 import {
   clock, conflictCandidates, pct, rollbackStats, securityOverview,
@@ -87,6 +89,14 @@ const EMPTY_ROLLBACK: RollbackStats = { total: 0, successful: 0, recent: [] };
 export default function SecurityPage() {
   const { ops, loading, offline, refresh } = useLiveOps();
   const liveEvents = useSecurityEvents(USE_LIVE);
+
+  // /operations sudah di-scope ke target aktif, jadi "kosong" bisa berarti
+  // "target ini memang belum punya operasi" - bukan "backend tidak jalan".
+  // Pesannya bergantung pada target, supaya dua keadaan itu tidak tercampur.
+  const activeTargetId = getTargetSnapshot().active?.id ?? null;
+  const emptyMessage = opsEmptyMessage({
+    loading, liveEnabled: USE_LIVE, offline, activeTargetId,
+  });
 
   const overview  = ops.length > 0 ? securityOverview(ops) : EMPTY_OVERVIEW;
   const rollbacks = ops.length > 0 ? rollbackStats(ops) : EMPTY_ROLLBACK;
@@ -175,7 +185,7 @@ export default function SecurityPage() {
           </div>
           {ops.length === 0 ? (
             <div className="text-[10px] text-slate-600 py-6 text-center">
-              {loading ? "Loading operations..." : !USE_LIVE ? "Live data OFF — set NEXT_PUBLIC_USE_LIVE_SSE=true." : offline ? "Backend offline — no data." : "Belum ada operasi."}
+              {emptyMessage}
             </div>
           ) : (
             <div className="space-y-1.5">
@@ -223,7 +233,11 @@ export default function SecurityPage() {
               </span>
             </div>
             {rollbacks.recent.length === 0 ? (
-              <div className="text-[10px] text-slate-600">Belum ada operasi dieksekusi.</div>
+              <div className="text-[10px] text-slate-600">
+                {activeTargetId
+                  ? "Belum ada operasi dieksekusi pada target ini."
+                  : "Belum ada target aktif."}
+              </div>
             ) : (
               rollbacks.recent.map((r) => (
                 <div key={r.opId} className="flex items-center gap-2 text-[10px]">

@@ -35,31 +35,124 @@ DB_PATH = Path(os.environ.get("SYNAPSE_DB_PATH", "synapse_v2.db"))
 # koneksinya sendiri; _local.conn dibuat lazily pada pemakaian pertama.
 _local = threading.local()
 
+# Id target aktif (lihat projects.py). None = memakai file DB default.
+#
+# Kenapa satu file DB per target, bukan kolom `project_id` di entities:
+# id entity di engine.py adalah "file::<path relatif>" - TIDAK ada namespace.
+# Dua target yang punya backend/main.py sama akan menabrakkan PRIMARY KEY,
+# dan menambah kolom berarti menyentuh 22 titik query di engine.py.
+# Memisahkan per file membuat tiap graph terisolasi secara fisik, jadi
+# seluruh query yang sudah ada tetap benar tanpa perubahan.
+_active_target: str | None = None
+
+# Path DB yang sedang dibuka tiap thread, supaya set_active_target() bisa
+# menutup koneksi usang di thread yang sama. Tanpa ini, threadpool FastAPI
+# akan tetap memegang koneksi ke DB target lama setelah user berganti.
+_thread_db: dict[int, Path] = {}
+_thread_db_lock = threading.Lock()
+
+# Registry koneksi hidup, untuk close_all_connections(). Dipakai saat target
+# dihapus beserta graph-nya: di Windows file SQLite yang masih dibuka thread
+# lain tidak bisa di-unlink, jadi "hapus target + graph" akan diam-diam
+# gagal tanpa ini. Connections dibuat dengan check_same_thread=False, jadi
+# menutupnya dari thread lain aman.
+_all_conns: dict[int, sqlite3.Connection] = {}
+
+
+def db_path_for_target(target_id: str | None) -> Path:
+    """Path file DB untuk sebuah target. None/"" berarti DB default."""
+    if not target_id:
+        return DB_PATH
+    # Slug sudah divalidasi di projects.py; ini belt-and-suspenders supaya
+    # path yang salah tidak pernah jadi path filesystem di luar DB_PATH.
+    slug = "".join(ch for ch in target_id if ch.isalnum() or ch in "-_")
+    if not slug or slug != target_id:
+        slug = "default"
+    return DB_PATH.with_name(f"{DB_PATH.stem}_{slug}{DB_PATH.suffix}")
+
+
+def set_active_target(target_id: str | None) -> None:
+    """Ganti target aktif. Memaksa graph di-memory di-rebuild oleh pemanggil."""
+    global _active_target
+    _active_target = target_id or None
+    reset_conn()
+
+
+def get_active_target() -> str | None:
+    return _active_target
+
 
 def get_conn() -> sqlite3.Connection:
     """
     Ambil koneksi SQLite milik thread pemanggil, buat bila belum ada.
 
-    PERHATIAN: koneksi di-cache per thread dan TIDAK pernah di-close(), jadi:
-      - DB_PATH dibaca hanya saat koneksi pertama dibuat. Kalau DB_PATH diganti
-        setelah itu, thread tersebut masih memakai path lama.
+    PERHATIAN: koneksi di-cache per thread dan TIDAK pernah di-close() pada
+    pemakaian normal, jadi:
+      - Path DB dibaca hanya saat koneksi pertama dibuat. Kalau target aktif
+        berubah setelah itu, thread tersebut harus me-reset; set_active_target()
+        melakukan itu untuk thread pemanggil, dan test bisa memanggil
+        reset_conn() sendiri.
       - override di test harus dilakukan SEBELUM get_conn() dipanggil, atau
         panggil reset_conn() lebih dulu.
     Untuk pemakaian yang butuh path dinamis, buka koneksi sendiri via
     sqlite3.connect(path) seperti guardian.py lakukan.
     """
+    wanted = db_path_for_target(_active_target)
+    # Kalau target berubah di thread lain, koneksi thread ini sudah basi.
+    with _thread_db_lock:
+        cached = _thread_db.get(threading.get_ident())
+    if cached is not None and cached != wanted:
+        reset_conn()
     conn = getattr(_local, "conn", None)
     if conn is None:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn = sqlite3.connect(wanted, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         _local.conn = conn
+        with _thread_db_lock:
+            _thread_db[threading.get_ident()] = wanted
+            _all_conns[threading.get_ident()] = conn
+        # Skema dibuat saat koneksi pertama, bukan hanya di init_db(). File DB
+        # target baru belum pernah disentuh saat startup, jadi tanpa baris
+        # ini query pertama ke target itu gagal dengan "no such table".
+        _ensure_schema(conn)
     return conn
 
 
+def close_all_connections() -> int:
+    """
+    Tutup semua koneksi graph yang hidup, di thread mana pun. Kembalikan jumlah.
+
+    Dipakai sebelum menghapus file DB sebuah target. Tanpa ini, di Windows
+    file yang masih dipegang connection thread lain (FastAPI memakai
+    threadpool, dan koneksi di-cache per thread) gagal di-unlink - dan
+    projects.delete_target() menelan error-nya, jadi user melihat "target
+    dihapus" padahal file graph-nya masih utuh.
+
+    Thread yang sedang memakai koneksi akan membukanya lagi di get_conn()
+    berikutnya, jadi pemanggil wajib menutup file SETELAH memanggil ini.
+    """
+    with _thread_db_lock:
+        conns = list(_all_conns.items())
+        _all_conns.clear()
+        _thread_db.clear()
+    closed = 0
+    for ident, conn in conns:
+        try:
+            conn.close()
+            closed += 1
+        except sqlite3.Error:
+            pass
+        # _local milik thread itu tidak bisa disentuh dari sini; yang penting
+        # thread tersebut akan membangun koneksi baru karena _thread_db sudah
+        # dikosongkan.
+        del ident
+    return closed
+
+
 def reset_conn() -> None:
-    """Tutup & lepas koneksi thread ini (dipakai test / ganti DB_PATH)."""
+    """Tutup & lepas koneksi thread ini (dipakai test / ganti target / DB_PATH)."""
     conn = getattr(_local, "conn", None)
     if conn is not None:
         try:
@@ -67,6 +160,9 @@ def reset_conn() -> None:
         except sqlite3.Error:
             pass
     _local.conn = None
+    with _thread_db_lock:
+        _thread_db.pop(threading.get_ident(), None)
+        _all_conns.pop(threading.get_ident(), None)
 
 
 SCHEMA = """
@@ -146,13 +242,30 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts             ON audit_log(ts);
 """
 
 
-def init_db() -> None:
-    """Buat semua tabel & index di atas jika belum ada (idempoten)."""
-    conn = get_conn()
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """
+    Pastikan file DB yang sedang dibuka punya skema v2 lengkap (idempoten).
+
+    Dipisah dari init_db() karena setiap target punya file DB sendiri, dan
+    file itu dibuat LAZILY saat get_conn() pertama dipanggil untuk target itu.
+    Kalau skema hanya dibuat di init_db() (yang jalan saat startup, ketika
+    target aktif baru satu), maka setiap target baru akan membuka file kosong
+    dan query pertama gagal dengan "no such table: entities".
+    """
     conn.executescript(SCHEMA)
     conn.commit()
     _migrate_engine_columns(conn)
-    print("[storage] Schema v2 siap di", DB_PATH)
+
+
+def init_db() -> None:
+    """Buat semua tabel & index di atas jika belum ada (idempoten)."""
+    _ensure_schema(get_conn())
+    print("[storage] Schema v2 siap di", active_db_path())
+
+
+def active_db_path() -> Path:
+    """Path file DB graph untuk target aktif. Sama dengan get_conn() yang dipakai."""
+    return db_path_for_target(_active_target)
 
 
 # ---------------------------------------------------------------------------

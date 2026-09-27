@@ -9,11 +9,13 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTargetGeneration } from "@/hooks/useTargets";
 import { MOCK_NODES, MOCK_LINKS } from "@/lib/mockData";
 import { getNodeColor, getNodeSize, getNodeLabel, getLinkColor, hexToRgba } from "@/lib/nodeVisuals";
 import { useMockSimulation } from "@/hooks/useMockSimulation";
 import { useSSE, type IngestProgress } from "@/hooks/useSSE";
 import { filterGraph, type NodeTypeFilter } from "@/lib/graphFilter";
+import { normalEdges } from "@/lib/graphEdges";
 import type { GraphNode, GraphLink } from "@/lib/types";
 
 // react-force-graph-2d tidak support SSR
@@ -31,12 +33,6 @@ const USE_LIVE = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
 interface RawNode extends GraphNode {
   x?: number;
   y?: number;
-}
-
-interface BackendEdge {
-  source_id: string;
-  target_id: string;
-  relationship: GraphLink["relationship"];
 }
 
 interface Props {
@@ -150,16 +146,23 @@ function useAnimationTimeRef(): React.MutableRefObject<number> {
 function useInitialGraph(
   setNodes: React.Dispatch<React.SetStateAction<GraphNode[]>>,
   setLinks: React.Dispatch<React.SetStateAction<GraphLink[]>>,
-  enabled: boolean
+  enabled: boolean,
+  reloadKey: number
 ) {
   useEffect(() => {
     if (!enabled) return;
+    let cancelled = false;
     async function load() {
       try {
         const res = await fetch("/api/graph");
         if (!res.ok) return;
         const data = await res.json();
-        if (Array.isArray(data.nodes) && data.nodes.length > 0) {
+        if (cancelled) return;
+        // WAJIB menimpa, termasuk dengan array kosong. Versi lama hanya
+        // menimpa kalau `length > 0`, jadi begitu target diganti ke repo yang
+        // graph-nya kosong, nodes lama milik repo SEBELUMNYA tetap tampil dan
+        // user mengira Synapse salah baca.
+        if (Array.isArray(data.nodes)) {
           setNodes(
             data.nodes.map((n: { id: string; type: GraphNode["type"]; name: string }) => ({
               id: n.id,
@@ -169,26 +172,21 @@ function useInitialGraph(
             }))
           );
         }
-        if (Array.isArray(data.edges) && data.edges.length > 0) {
-          // Buang edge tanpa kedua ujung sebelum kena force-graph. Edge yatim
-          // akan ditulis ulang jadi undefined oleh react-force-graph-2d dan
-          // jadi bom waktu di filterGraph.
-          setLinks(
-            data.edges
-              .filter((e: BackendEdge) => e?.source_id && e?.target_id)
-              .map((e: BackendEdge) => ({
-                source: e.source_id,
-                target: e.target_id,
-                relationship: e.relationship,
-              }))
-          );
-        }
+        // WAJIB tetapkan juga saat edges kosong. Kalau hanya di-set kalau
+        // panjangnya > 0, edge target sebelumnya tetap tertinggal setelah
+        // ganti target dan graph menampilkan sisi yang tidak ada di repo baru.
+        setLinks(normalEdges(data.edges));
       } catch {
         // backend offline - tetap pakai mock
       }
     }
     load();
-  }, [enabled, setNodes, setLinks]);
+    return () => {
+      // Target diganti saat fetch lama masih jalan: hasil request lama akan
+      // menimpa data target baru kalau tidak dibatalkan.
+      cancelled = true;
+    };
+  }, [enabled, reloadKey, setNodes, setLinks]);
 }
 
 // Legend entries: [color, label]
@@ -235,7 +233,7 @@ export default function SynapseGraph({ onNodeClick, onNodeCount, filterType = "A
     return () => ro.disconnect();
   }, []);
 
-  useInitialGraph(setNodes, setLinks, USE_LIVE);
+  useInitialGraph(setNodes, setLinks, USE_LIVE, useTargetGeneration());
 
   const handleNodeStatusUpdate = useCallback(
     (nodeId: string, status: GraphNode["status"]) => {

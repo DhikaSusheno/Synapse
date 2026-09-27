@@ -8,6 +8,7 @@ import dynamic from "next/dynamic";
 import { useCallback, useState } from "react";
 import type { GraphNode, Operation } from "@/lib/types";
 import { stamp, isOpen } from "@/lib/derive";
+import TargetPicker from "@/components/TargetPicker";
 
 const SynapseGraph = dynamic(() => import("@/components/SynapseGraph"), {
   ssr: false,
@@ -407,6 +408,12 @@ export default function OverviewMain({ onNodeClick, onNodeCount, nodeCount, edge
           Live code <span className="text-white underline">understanding</span>, risk protection, and AI-driven review for safer development.
         </p>
       </div>
+
+      {/* Target analisis: menentukan folder/repository mana yang diindeks
+          di bawah ini. Ganti target = ganti seluruh isi halaman. */}
+      <section className="rounded-xl border border-slate-800 bg-slate-900/30 p-4">
+        <TargetPicker />
+      </section>
 
       {/* Code Graph */}
       <CodeGraphPanel

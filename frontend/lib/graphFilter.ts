@@ -22,8 +22,9 @@ const TYPE_MAP: Record<Exclude<NodeTypeFilter, "All">, GraphNode["type"]> = {
 // ponytail: TIDAK percaya tipe di sini. react-force-graph-2d menulis ulang
 // link.source / link.target di tempat (string -> objek node) dan mengisinya
 // `undefined` kalau node-nya tidak ada di graph. Edge dari backend juga bisa
-// datang tanpa source_id/target_id. Kalau end tidak bisa jadi id, kembalikan
-// "" supaya edge-nya dibuang, bukan melempar TypeError.
+// datang tanpa ujung yang bisa jadi id (lihat normalEdge di graphEdges.ts).
+// Kalau end tidak bisa jadi id, kembalikan "" supaya edge-nya dibuang, bukan
+// melempar TypeError.
 function endId(end: string | GraphNode | null | undefined): string {
   if (typeof end === "string") return end;
   return typeof end?.id === "string" ? end.id : "";

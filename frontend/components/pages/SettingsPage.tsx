@@ -15,8 +15,34 @@ import {
   type PlatformSettings,
   type StorageOverview,
 } from "@/lib/platformSettings";
+import GitHubAuthPanel from "@/components/GitHubAuthPanel";
+import LLMProviderManager from "@/components/LLMProviderManager";
+import LocalFolderPanel from "@/components/LocalFolderPanel";
 
-type Tab = "General" | "MCP / Server" | "Storage" | "Repository" | "Approval";
+type Tab =
+  | "General"
+  | "MCP / Server"
+  | "Storage"
+  | "Repository"
+  | "GitHub"
+  | "LLM"
+  | "Folder Lokal"
+  | "Approval";
+
+const TABS: Tab[] = [
+  "General",
+  "MCP / Server",
+  "Storage",
+  "Repository",
+  "GitHub",
+  "LLM",
+  "Folder Lokal",
+  "Approval",
+];
+
+function isTab(value: string | null): value is Tab {
+  return value !== null && (TABS as string[]).includes(value);
+}
 
 const EDITABLE_KEYS = [
   "platform_name",
@@ -205,7 +231,14 @@ function BrowseDialog({
 }
 
 export default function SettingsPage() {
-  const [activeTab, setActiveTab] = useState<Tab>("General");
+  // GitHub OAuth mendarat di /settings?tab=github, jadi tab awal dibaca dari
+  // URL. Nilai tak dikenal diabaikan, bukan dipaksa jadi tab pertama - user
+  // yang salah ketik ?tab=blabla harus tetap melihat General.
+  const [activeTab, setActiveTab] = useState<Tab>(() => {
+    if (typeof window === "undefined") return "General";
+    const fromQuery = new URLSearchParams(window.location.search).get("tab");
+    return isTab(fromQuery) ? fromQuery : "General";
+  });
   const [draft, setDraft] = useState<PlatformSettings | null>(getSettings());
   const [saved, setSaved] = useState<PlatformSettings | null>(getSettings());
   const [storage, setStorage] = useState<StorageOverview | null>(getStorage());
@@ -302,7 +335,6 @@ export default function SettingsPage() {
     }
   }, []);
 
-  const TABS: Tab[] = ["General", "MCP / Server", "Storage", "Repository", "Approval"];
   const online = serverHealth?.status === "ok";
   const tableList = Object.entries(storage?.tables ?? {});
   const totalTables = tableList.reduce((sum, [, names]) => sum + names.length, 0);
@@ -357,13 +389,13 @@ export default function SettingsPage() {
         <p className="mt-0.5 text-sm text-slate-400">Configure Synapse platform</p>
       </div>
 
-      <div className="flex gap-1 rounded-xl border border-slate-800/60 bg-[#0d1117] p-1">
+      <div className="flex flex-wrap gap-1 rounded-xl border border-slate-800/60 bg-[#0d1117] p-1">
         {TABS.map((tab) => (
           <button
             key={tab}
             type="button"
             onClick={() => setActiveTab(tab)}
-            className={`flex-1 rounded-lg py-1.5 text-xs transition-colors ${
+            className={`min-w-[92px] flex-1 rounded-lg py-1.5 text-xs transition-colors ${
               activeTab === tab
                 ? "bg-slate-700 font-medium text-white"
                 : "text-slate-500 hover:text-slate-300"
@@ -519,6 +551,36 @@ export default function SettingsPage() {
             <Field label="Enable SSE Events">
               <Toggle value={draft.sse_enabled} onChange={(v) => set("sse_enabled", v)} />
             </Field>
+          </div>
+        )}
+
+        {activeTab === "GitHub" && (
+          <div>
+            <p className="mb-3 text-[11px] text-slate-500">
+              Hubungkan akun GitHub, pilih repository, lalu telusuri file-nya. Token
+              disimpan terenkripsi di backend dan tidak pernah masuk browser.
+            </p>
+            <GitHubAuthPanel />
+          </div>
+        )}
+
+        {activeTab === "LLM" && (
+          <div>
+            <p className="mb-3 text-[11px] text-slate-500">
+              Provider dan model yang dipakai panel chat di Cortex. API key disimpan
+              terenkripsi di backend dan tidak pernah dikembalikan ke browser.
+            </p>
+            <LLMProviderManager />
+          </div>
+        )}
+
+        {activeTab === "Folder Lokal" && (
+          <div>
+            <p className="mb-3 text-[11px] text-slate-500">
+              Baca folder di mesin ini langsung lewat browser, tanpa lewat backend. Cocok
+              untuk repo yang belum di-push.
+            </p>
+            <LocalFolderPanel />
           </div>
         )}
 

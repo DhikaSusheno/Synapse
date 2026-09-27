@@ -87,6 +87,28 @@ def _db_path() -> str:
     return str(_database_module.DB_PATH)
 
 
+def active_target_id() -> str:
+    """Id target aktif, atau "" kalau belum ada / registry tidak terbaca.
+
+    Import dilakukan di dalam fungsi supaya guardian.py tetap bisa diimpor
+    tanpa projects.py (test lama, dan skrip yang memakainya sebagai library),
+    dan supaya kegagalan registry tidak menjatuhkan operasi: tanpa target
+    yang terbaca, operasi tetap dicatat - hanya tidak dikelompokkan.
+    """
+    try:
+        import projects
+    except ImportError:
+        return ""
+    try:
+        active = projects.get_active()
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(active, dict):
+        return ""
+    target_id = active.get("id")
+    return target_id if isinstance(target_id, str) else ""
+
+
 def _utcnow_iso() -> str:
     """
     Timestamp UTC dalam format ISO - pengganti API naive-UTC yang dihapus di
@@ -850,14 +872,20 @@ def propose_operation(tool_name: str, params: dict, target: str) -> dict:
     snapshot_strategy, rollback_strategy = _make_snapshot_plan(tool_name, params)
 
     operation_id = str(uuid.uuid4())
+    # Target dicap saat propose, bukan saat dibaca. Kalau dicap di saat baca,
+    # history approval ikut pindah ke target berikutnya - dan karena nama file
+    # antar repo sering sama, user bisa menyetujui perubahan yang salah repo.
+    target_id = active_target_id()
     conn.execute(
         """INSERT INTO operations
-           (id, tool_name, params_json, target_node_id, blast_radius,
+           (id, tool_name, params_json, target_node_id, target_id,
+            blast_radius,
             reversibility_class, status, snapshot_ref, rollback_command,
             requires_approval, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)""",
         (
             operation_id, tool_name, json.dumps(params), target_node_id,
+            target_id,
             blast_radius, reversibility_class,
             1 if requires_approval else 0,
             _utcnow_iso(),
@@ -896,6 +924,7 @@ def propose_operation(tool_name: str, params: dict, target: str) -> dict:
         "operation_id": operation_id,
         "tool_name": tool_name,
         "target": target,
+        "target_id": target_id,
         "blast_radius": blast_radius,
         "requires_approval": requires_approval,
         "conflicts_count": len(conflicts),
@@ -907,6 +936,7 @@ def propose_operation(tool_name: str, params: dict, target: str) -> dict:
         "operation_id": operation_id,
         "tool_name": tool_name,
         "target": target,
+        "target_id": target_id,
         "blast_radius": blast_radius,
         "reversibility_class": reversibility_class,
         "requires_approval": requires_approval,
@@ -1285,7 +1315,7 @@ def _exec_file_delete(params: dict, snapshot_ref: str | None) -> tuple[bool, str
 # 3. list_pending_approvals
 # ---------------------------------------------------------------------------
 
-def list_pending_approvals() -> dict:
+def list_pending_approvals(target_id: "str | None" = None) -> dict:
     """
     BUG-D FIX: hanya kembalikan operasi dengan status 'pending' (belum diputuskan).
     Sebelumnya WHERE status IN ('pending','approved') menyebabkan operasi yang
@@ -1298,16 +1328,22 @@ def list_pending_approvals() -> dict:
     jadi ia bisa basi kalau aturannya berubah. Kalau tidak disamakan di sini,
     operasi bisa requiring-approval saat execute tapi tidak pernah muncul di
     daftar ini — dead-end yang mustahil di-approve.
+
+    `target_id` (default None = semua target) menyaring operasi per repository
+    atau folder. Tanpa itu, approval repo A muncul di daftar repo B dan user
+    bisa menyetujui operasi yang salah target hanya karena namanya mirip.
     """
     conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """SELECT o.*, a.decision as approval_decision
-           FROM operations o
-           LEFT JOIN approvals a ON a.operation_id = o.id
-           WHERE o.status = 'pending'
-           ORDER BY o.created_at DESC"""
-    ).fetchall()
+    sql = """SELECT o.*, a.decision as approval_decision
+             FROM operations o
+             LEFT JOIN approvals a ON a.operation_id = o.id
+             WHERE o.status = 'pending'"""
+    params: tuple = ()
+    if target_id is not None:
+        sql += " AND COALESCE(o.target_id, '') = ?"
+        params = (target_id,)
+    rows = conn.execute(sql + " ORDER BY o.created_at DESC", params).fetchall()
     conn.close()
 
     pending = [dict(r) for r in rows if _effective_requires_approval(r)]

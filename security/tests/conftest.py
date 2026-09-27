@@ -74,9 +74,18 @@ def mem_db(tmp_path):
     Buat SQLite file sementara di tmp_path, jalankan DDL.
     Return path file DB (pathlib.Path).
     """
+    import database as db_mod
+
     db_file = tmp_path / "test_synapse.db"
     conn = sqlite3.connect(str(db_file))
     conn.executescript(DDL)
+    # DDL di atas adalah SALINAN parsial dari database.py, dan salinan itu
+    # pasti akan tertinggal begitu ada kolom baru. Dulu tidak ada yang
+    # menghubungkan keduanya, jadi menambah operations.target_id (-> 75 test
+    # gagal dengan "no column named target_id"). _add_missing_columns() adalah
+    # migrasi yang sama dengan yang dijalankan init_db(), jadi mengedit DDL
+    # saja tidak cukup - dan tidak perlu lagi.
+    db_mod._add_missing_columns(conn)
     conn.commit()
     conn.close()
     return db_file

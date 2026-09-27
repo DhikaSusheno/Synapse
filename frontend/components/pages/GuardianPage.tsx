@@ -1,6 +1,6 @@
 "use client";
 // components/pages/GuardianPage.tsx
-// Halaman Guardian â€” sesuai design section 2
+// Halaman Guardian — sesuai design section 2
 // FE-1 @nabilfauzandafa
 
 import { useEffect, useState } from "react";
@@ -152,11 +152,11 @@ function PendingOpDetail({ op, onDecided }: PendingOpDetailProps) {
           <div className="flex gap-2">
             <button onClick={() => decide("approved")} disabled={loading}
               className="flex-1 py-2.5 rounded-lg bg-green-600 hover:bg-green-500 text-white text-sm font-bold disabled:opacity-50 transition-colors">
-              {loading ? "â€¦" : "Approve"}
+              {loading ? "…" : "Approve"}
             </button>
             <button onClick={() => decide("denied")} disabled={loading}
               className="flex-1 py-2.5 rounded-lg bg-red-700/80 hover:bg-red-600 text-white text-sm font-bold disabled:opacity-50 transition-colors">
-              {loading ? "â€¦" : "Deny"}
+              {loading ? "…" : "Deny"}
             </button>
           </div>
         ) : (

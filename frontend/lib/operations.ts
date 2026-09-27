@@ -71,3 +71,34 @@ export async function decideOperation(
 
   return { ok: true, status: (executed?.status as NodeStatus | undefined) ?? "verified", error: null };
 }
+
+export interface OpsEmptyContext {
+  loading: boolean;
+  liveEnabled: boolean;
+  offline: boolean;
+  /** Id target aktif, atau null kalau belum ada target yang dipilih. */
+  activeTargetId: string | null;
+}
+
+/**
+ * Pesan untuk daftar operasi yang kosong.
+ *
+ * PENTING: sejak operasi di-scope per target (backend cuma mengembalikan
+ * operations milik target aktif), "kosong" punya beberapa sebab yang berbeda
+ * dan user perlu tahu yang mana. Dulu semuanya dijawab "Belum ada operasi",
+ * sehingga target yang salah aktif terlihat seperti riwayat approval hilang -
+ * persis kekhawatiran user soal approval tercampur antar repository.
+ *
+ * `activeTargetId === null` berarti memang belum ada target; kalau tidak,
+ * kosong berarti target ini belum punya operasi (History repository lain
+ * sengaja tidak ditampilkan, dan tidak hilang dari database).
+ */
+export function opsEmptyMessage(ctx: OpsEmptyContext): string {
+  if (ctx.loading) return "Loading operations...";
+  if (!ctx.liveEnabled) return "Live data OFF - set NEXT_PUBLIC_USE_LIVE_SSE=true.";
+  if (ctx.offline) return "Backend offline - no data.";
+  if (!ctx.activeTargetId) {
+    return "Belum ada target aktif, jadi tidak ada operasi yang bisa ditampilkan. Pilih target di Settings.";
+  }
+  return "Belum ada operasi untuk target ini. Riwayat repository lain tidak ditampilkan.";
+}

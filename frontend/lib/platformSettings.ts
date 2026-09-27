@@ -118,4 +118,46 @@ export async function browsePath(path: string): Promise<BrowseResult> {
   return (await res.json()) as BrowseResult;
 }
 
+/**
+ * Subfolder di `path` untuk dipilih sebagai target analisis.
+ *
+ * BEDA dengan browsePath() di atas: browsePath dipakai Cortex untuk membaca
+ * ISI file dan terkurung di dalam repo/workspace. Yang ini untuk memilih
+ * folder target, yang belum tentu berada di zona itu - memakai browsePath()
+ * membuat "Telusuri folder..." hanya bisa membuka root repo, itu bug yang
+ * dilaporkan user.
+ *
+ * Path kosong = folder home. Balikannya hanya berisi direktori, jadi
+ * `entries.filter(e => e.type === "dir")` di frontend tetap benar (dan aman
+ * kalau nanti backend menambah file).
+ */
+export async function browseTargetDirs(path = ""): Promise<BrowseResult> {
+  const url = `${BACKEND_URL}/api/targets/browse?path=${encodeURIComponent(path)}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail ?? `HTTP ${res.status}`);
+  }
+  return (await res.json()) as BrowseResult;
+}
+
+/**
+ * Path absolut anak dari `base` + `name`.
+ *
+ * compose browse yang sebelumnya menyambung `result.path` (path RELATIF ke
+ * REPO_ROOT untuk /browse) dengan nama anak. Untuk /api/targets/browse,
+ * `result.path` sudah absolut, dan menyambungnya relatif menghasilkan
+ * "C:/Users/dhika/synapse-repoC:/Users/dhika/proyek" - path yang tidak pernah
+ * ada. Karena kedua endpoint mengembalikan `absolute_path`, men composing dari
+ * situ benar untuk keduanya.
+ *
+ * Separator memakai backslash di Windows dan slash di mana saja, jadi path
+ * yang diketik user tetap bisa di-browse ulang.
+ */
+export function joinBrowsePath(base: string, name: string): string {
+  const trimmed = base.replace(/[\\/]+$/, "");
+  if (!trimmed) return name;
+  return /^[A-Za-z]:[\\/]/.test(trimmed) ? `${trimmed}\\${name}` : `${trimmed}/${name}`;
+}
+
 export { BACKEND_URL, USE_LIVE };

@@ -6,7 +6,14 @@ untuk dipakai oleh test_demo_reliability.py.
 Fungsi create_demo_db() dipakai sebagai fixture di test_demo_reliability.py.
 """
 import sqlite3
+import sys
 from pathlib import Path
+
+BACKEND_DIR = Path(__file__).resolve().parents[3] / "backend"
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from database import _add_missing_columns  # noqa: E402
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -70,6 +77,9 @@ def create_demo_db(db_path) -> Path:
     db_path = Path(db_path)
     conn = sqlite3.connect(str(db_path))
     conn.executescript(DDL)
+    # Sama seperti security/tests/conftest.py: DDL di atas salinan parsial
+    # dari database.py, jadi kolom yang ditambahkan belakangan harus ikut.
+    _add_missing_columns(conn)
 
     # Seed nodes — 12 nodes mencakup semua tipe yang dibutuhkan E8 + E8b
     seed_nodes = [
