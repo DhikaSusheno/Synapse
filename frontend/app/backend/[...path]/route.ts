@@ -30,11 +30,12 @@ const HOP_BY_HOP = new Set([
   "content-length",
 ]);
 
-async function proxy(
-  request: NextRequest,
-  context: { params: { path?: string[] } },
-): Promise<Response> {
-  const segments = context.params?.path ?? [];
+type RouteContext = { params: Promise<{ path?: string[] }> };
+
+async function proxy(request: NextRequest, context: RouteContext): Promise<Response> {
+  // Next 15 membuat params berupa Promise. Menunggu di sini wajib; kalau
+  // diakses sinkron, segments selalu kosong dan semua request jatuh ke root.
+  const segments = (await context.params)?.path ?? [];
   const target = `${BACKEND}/${segments.join("/")}${request.nextUrl.search}`;
 
   const headers: Record<string, string> = {};

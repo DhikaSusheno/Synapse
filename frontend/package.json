@@ -12,24 +12,26 @@
     "test": "node --test \"lib/*.test.ts\""
   },
   "dependencies": {
-    "next": "14.2.35",
-    "react": "^18",
-    "react-dom": "^18",
+    "next": "15.5.24",
+    "react": "^19",
+    "react-dom": "^19",
     "react-force-graph-2d": "^1.25.5"
   },
   "devDependencies": {
     "@types/node": "^20",
-    "@types/react": "^18",
-    "@types/react-dom": "^18",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
     "autoprefixer": "^10",
-    "eslint": "^8",
-    "eslint-config-next": "14.2.35",
+    "eslint": "^9",
+    "eslint-config-next": "15.5.24",
     "postcss": "^8.5.28",
     "tailwindcss": "^3.4.1",
     "typescript": "^5"
   },
   "comments": {
-    "overrides": "Dipakai karena rantai transitive (postcss ikut terpasang next, glob ikut @next/eslint-plugin-next) menahan versi rentan. Kunci override sengaja berbentuk RANGE, bukan nama paket polos: glob@7.2.3 juga ada di tree dan tidak boleh dipaksa naik ke 10.x karena itu major."
+    "next": "15.5.24 adalah versi pertama yang menutup CVE-2026-75604 (unauth RCE di server Windows, CVSS 9.0, CWE-22). Advisory menyatakan tidak ada workaround; 14.2.35 masih berada di rentang rentan >=13.4.0 <15.5.24.",
+    "react19": "Next 15 App Router memakai React 19.",
+    "overrides": "Dipakai karena rantai transitive (postcss ikut terpasang next, glob/minimatch ikut chain eslint) menahan versi rentan. Kunci override sengaja berbentuk RANGE, bukan nama paket polos: glob@7.2.3 juga ada di tree dan tidak boleh dipaksa naik ke 10.x karena itu major."
   },
   "overrides": {
     "postcss": "$postcss",
