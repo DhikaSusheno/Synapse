@@ -36,7 +36,7 @@ Docs    : http://localhost:8000/docs
 """
 import asyncio
 import json
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -333,13 +333,24 @@ def approve_operation(req: ApproveOperationRequest):
 
 @app.get("/operations", tags=["Guardian"])
 def list_operations(
-    status: str = None,
+    status: Optional[Literal[
+        "pending", "approved", "executing", "executed_unverified",
+        "verified", "failed", "rolled_back", "denied",
+    ]] = None,
     limit: int = Query(default=20, ge=1, le=100)
 ):
     """
     📋 Riwayat semua operasi. Filter by status opsional.
     Status: pending | approved | executing | executed_unverified |
             verified | failed | rolled_back | denied
+
+    ISSUE-35 FIX: `status` sekarang Literal, bukan `str` bebas. Sebelumnya
+    `?status=pendng` (typo) atau `?status=anything` dijawab `200 []` tanpa
+    feedback apa pun, sehingga developer tidak tahu filter-nya tidak
+    berlaku dan tidak bisa bedakan "filter tidak cocok" dari "salah ketik".
+
+    Dengan Literal, FastAPI mengembalikan 422 + daftar nilai yang diizinkan,
+    dan enum-nya ikut muncul di OpenAPI docs.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
