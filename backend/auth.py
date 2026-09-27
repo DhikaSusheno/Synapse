@@ -15,11 +15,13 @@ Desain:
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import secrets
 from typing import List, Optional
 
+from cryptography.fernet import Fernet
 from fastapi import HTTPException, Request
 from fastapi.security import APIKeyHeader
 
@@ -33,6 +35,24 @@ PUBLIC_PATHS = {
     "/redoc",
     "/openapi.json",
     "/docs/oauth2-redirect",
+    # GitHub Integration (public for OAuth flow)
+    "/api/github/auth/url",
+    "/api/github/callback",
+    "/api/github/auth/pat",
+    "/api/github/user",
+    "/api/github/repos",
+    "/api/github/repos/",
+    "/api/github/repos/{owner}/{repo}/tree",
+    "/api/github/repos/{owner}/{repo}/contents",
+    # LLM Provider Registry (read-only public)
+    "/api/llm/providers",
+    "/api/llm/providers/",
+    "/api/llm/providers/{provider_id}",
+    "/api/llm/providers/{provider_id}/models",
+    # Graph (read-only)
+    "/graph/nodes",
+    "/graph/edges",
+    "/graph/summary",
 }
 
 _ENV_TOKEN = os.environ.get("SYNAPSE_API_TOKEN", "").strip()
@@ -50,6 +70,38 @@ else:
             "SYNAPSE_API_TOKEN terlalu pendek (<16 karakter) - disarankan pakai "
             "token acak yang panjang."
         )
+
+if not _ENV_TOKEN:
+    _LOG.warning(
+        "SYNAPSE_API_TOKEN tidak disetel - backend membuat token acak. "
+        "Token untukdevelopment ini: %s",
+        API_TOKEN,
+    )
+else:
+    if len(API_TOKEN) < 16:
+        _LOG.warning(
+            "SYNAPSE_API_TOKEN terlalu pendek (<16 karakter) - disarankan pakai "
+            "token acak yang panjang."
+        )
+
+# Fernet key untuk encrypt/decrypt token (simpan di env FERNET_KEY)
+_FERNET_KEY = os.environ.get("FERNET_KEY", "").strip()
+if not _FERNET_KEY:
+    _LOG.warning("FERNET_KEY tidak disetel - generate random key (token tidak persisten)")
+    _fernet = Fernet(Fernet.generate_key())
+else:
+    _fernet = Fernet(_FERNET_KEY.encode() if len(_FERNET_KEY) == 32 else base64.urlsafe_b64decode(_FERNET_KEY + "=" * (-len(_FERNET_KEY) % 4)))
+
+
+def encrypt_token(token: str) -> str:
+    """Encrypt token untuk storage."""
+    return _fernet.encrypt(token.encode()).decode()
+
+
+def decrypt_token(encrypted: str) -> str:
+    """Decrypt token dari storage."""
+    return _fernet.decrypt(encrypted.encode()).decode()
+
 
 _token_header_scheme = APIKeyHeader(name=TOKEN_HEADER, auto_error=False)
 
