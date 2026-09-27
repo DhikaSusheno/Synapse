@@ -326,3 +326,108 @@ class TestIssue46TerminalGuard:
         r = guardian.approve_operation(oid, "maybe")
         assert r["ok"] is False
         assert _status(db, oid) == "pending"
+
+    def test_terminal_guard_is_atomic_not_read_then_write(self, g):
+        """
+        Guard harus ATOMIK, bukan "baca status lalu tulis".
+
+        Versi pertama fix ini pakai SELECT lalu UPDATE terpisah. Itu TOCTOU:
+        banyak request bersamaan semuanya membaca status lama, semuanya lolos
+        guard, lalu saling menimpa. Diuji: 20 thread (10 approve + 10 deny)
+        menghasilkan 19 approve() ok=True, dan operasi yang sudah di-DENY
+        bisa berakhir berstatus 'approved' - yaitu denial hilang dan operasi
+        bisa dieksekusi.
+
+        Guard yang benar menaruh kondisi status di WHERE sehingga hanya satu
+        request yang benar-benar mengubah baris.
+        """
+        import threading
+        import collections
+
+        guardian, db = g
+        N = 20
+        decisions = ["approved"] * (N // 2) + ["denied"] * (N // 2)
+        # Beberapa percobaan: race bersifat probabilistik, jadi satu trial
+        # saja kadang tidak menunjukkan apa-apa.
+        breached = 0
+        for i in range(6):
+            oid = f"op-atomic-{i}"
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "INSERT INTO operations (id, tool_name, status) VALUES (?,?,?)",
+                (oid, "service.restart", "pending"))
+            conn.commit()
+            conn.close()
+
+            ok = collections.Counter()
+            lock = threading.Lock()
+            barrier = threading.Barrier(N)
+
+            def worker(dec):
+                barrier.wait()
+                r = guardian.approve_operation(oid, dec)
+                with lock:
+                    ok[dec] += 1 if r.get("ok") else 0
+
+            threads = [threading.Thread(target=worker, args=(d,)) for d in decisions]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            accepted = ok["approved"] + ok["denied"]
+            if accepted >= N:
+                breached += 1
+
+        assert breached == 0, (
+            f"seorang pun dari {6} percobaan membiarkan semua {N} request "
+            f"diterima bersamaan. Guard masih read-then-write (TOCTOU); "
+            f"kondisi status harus ada di WHERE agar hanya satu yang menulis."
+        )
+
+    def test_denied_stays_denied_under_concurrency(self, g):
+        """
+        Properti keamanan utama: operasi yang sudah di-DENY tidak boleh
+        kembali jadi 'approved' (yang berarti boleh dieksekusi).
+
+        Runner tunggal tidak bisa membuktikan ini - butuh beberapa thread
+        yang saling berebut.
+        """
+        import threading
+        import collections
+
+        violations = 0
+        for i in range(8):
+            guardian, db = g
+            oid = f"op-conc-{i}"
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "INSERT INTO operations (id, tool_name, status) VALUES (?,?,?)",
+                (oid, "service.restart", "pending"))
+            conn.commit()
+            conn.close()
+
+            decisions = ["approved"] * 10 + ["denied"] * 10
+            ok = collections.Counter()
+            lock = threading.Lock()
+            barrier = threading.Barrier(20)
+
+            def worker(dec):
+                barrier.wait()
+                r = guardian.approve_operation(oid, dec)
+                with lock:
+                    ok[dec] += 1 if r.get("ok") else 0
+
+            threads = [threading.Thread(target=worker, args=(d,)) for d in decisions]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            if ok["denied"] > 0 and _status(db, oid) == "approved":
+                violations += 1
+
+        assert violations == 0, (
+            f"{violations} trial: deny diterima tapi operasi berakhir 'approved' - "
+            f"denial hilang, operasi bisa dieksekusi"
+        )

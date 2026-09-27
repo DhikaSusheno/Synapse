@@ -1256,46 +1256,75 @@ def approve_operation(operation_id: str, decision: str, note: str = "") -> dict:
     if decision not in ("approved", "denied"):
         return {"ok": False, "error": "decision harus 'approved' atau 'denied'"}
 
-    conn = sqlite3.connect(_db_path())
+    conn = sqlite3.connect(_db_path(), isolation_level=None)
     conn.row_factory = sqlite3.Row
-    op = conn.execute(
-        "SELECT id, status, tool_name FROM operations WHERE id = ?", (operation_id,)
-    ).fetchone()
+    try:
+        # BEGIN IMMEDIATE mengambil lock RESERVED sekarang, bukan saat commit,
+        # jadi hanya satu writer yang boleh masuk ke bagian check-then-write
+        # di bawah ini. Tanpa ini, N request approve/deny bersamaan semuanya
+        # membaca status lama, semuanya lolos guard, lalu saling menimpa.
+        # Diletakkan DI DALAM try supaya connection tetap di-close kalau
+        # lock-nya gagal dibuat (mis. database sedang terkunci).
+        conn.execute("BEGIN IMMEDIATE")
+        op = conn.execute(
+            "SELECT id, status, tool_name FROM operations WHERE id = ?", (operation_id,)
+        ).fetchone()
 
-    if not op:
+        if not op:
+            conn.execute("ROLLBACK")
+            return {"ok": False, "error": f"Operation {operation_id} tidak ditemukan"}
+
+        new_status = "approved" if decision == "approved" else "denied"
+
+        # ISSUE-46 FIX: check DAN write dalam satu statement. Guard-nya
+        # bukan "baca status lalu tulis" (TOCTOU: dua request bisa sama-sama
+        # membaca status lama sebelum ada yang menulis), tapi kondisi status
+        # di WHERE sehingga hanya satu yang benar-benar bisa mengubah baris.
+        #
+        # Rantai exploit yang diverifikasi sebelum fix:
+        #   propose -> execute (verified) -> approve (approved) -> execute
+        # mengulang operasi yang sudah selesai dan membuatnya dieksekusi dua kali.
+        cur = conn.execute(
+            "UPDATE operations SET status=? WHERE id=? AND status NOT IN "
+            f"({','.join('?' * len(TERMINAL_STATUSES))})",
+            (new_status, operation_id, *sorted(TERMINAL_STATUSES)),
+        )
+
+        if cur.rowcount == 0:
+            # Baris tidak berubah: entah sudah terminal, atau request lain
+            # menang duluan. Baca status terbaru untuk pesan yang akurat.
+            current = conn.execute(
+                "SELECT status FROM operations WHERE id = ?", (operation_id,)
+            ).fetchone()
+            conn.execute("ROLLBACK")
+            now = current["status"] if current else "unknown"
+            return {
+                "ok": False,
+                "error": (
+                    f"Operasi sudah berstatus terminal '{now}' "
+                    f"dan tidak bisa diubah lagi."
+                ),
+                "status": now,
+                "terminal": True,
+            }
+
+        conn.execute(
+            """INSERT INTO approvals (operation_id, decision, decided_at, note)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(operation_id) DO UPDATE
+                 SET decision=excluded.decision,
+                     decided_at=excluded.decided_at,
+                     note=excluded.note""",
+            (operation_id, decision, datetime.utcnow().isoformat(), note),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         conn.close()
-        return {"ok": False, "error": f"Operation {operation_id} tidak ditemukan"}
-
-    # ISSUE-46 FIX: jangan approve/deny operasi yang sudah terminal.
-    # Tanpa guard ini, approve pada operasi 'verified' me-reset statusnya
-    # ke 'approved', CAS di execute_operation() lolos, dan operasinya
-    # dieksekusi dua kali. Diverifikasi sebelum fix ini dibuat.
-    if op["status"] in TERMINAL_STATUSES:
-        conn.close()
-        return {
-            "ok": False,
-            "error": (
-                f"Operasi sudah berstatus terminal '{op['status']}' "
-                f"dan tidak bisa diubah lagi."
-            ),
-            "status": op["status"],
-            "terminal": True,
-        }
-
-    conn.execute(
-        """INSERT INTO approvals (operation_id, decision, decided_at, note)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(operation_id) DO UPDATE
-             SET decision=excluded.decision,
-                 decided_at=excluded.decided_at,
-                 note=excluded.note""",
-        (operation_id, decision, datetime.utcnow().isoformat(), note),
-    )
-    new_status = "approved" if decision == "approved" else "denied"
-    conn.execute(
-        "UPDATE operations SET status=? WHERE id=?", (new_status, operation_id)
-    )
-    conn.commit()
+        raise
     conn.close()
 
     _emit(
