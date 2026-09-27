@@ -29,31 +29,41 @@ _LOG = logging.getLogger("synapse.auth")
 
 TOKEN_HEADER = "X-Synapse-Token"
 
-PUBLIC_PATHS = {
+# Path yang TIDAK memerlukan token.
+#
+# Sempit by design. Frontend tidak butuh satu pun entri di sini: semua
+# request-nya lewat route handler proxy app/backend/[...path], yang
+# menyuntikkan SYNAPSE_API_TOKEN dari sisi server. .env.local.example juga
+# menyuruh memakai NEXT_PUBLIC_BACKEND_URL=/backend, bukan backend langsung.
+#
+# Daftar lama (sebelum #62) membuat 19 entri publik, termasuk /graph/* yang
+# membocorkan seluruh graph dan /api/github/auth/pat yang menulis kredensial.
+# Enam entri di antaranya berisi placeholder FastAPI seperti
+# "/api/github/repos/{owner}/{repo}/contents" - path tersebut tidak pernah
+# cocok karena request nyata mengirim path yang sudah disubstitusi, jadi
+# config-nya terlihat memberi akses publik tapi efeknya justru mengunci.
+PUBLIC_PATHS = frozenset({
     "/health",
     "/docs",
     "/redoc",
     "/openapi.json",
     "/docs/oauth2-redirect",
-    # GitHub Integration (public for OAuth flow)
-    "/api/github/auth/url",
-    "/api/github/callback",
-    "/api/github/auth/pat",
-    "/api/github/user",
-    "/api/github/repos",
-    "/api/github/repos/",
-    "/api/github/repos/{owner}/{repo}/tree",
-    "/api/github/repos/{owner}/{repo}/contents",
-    # LLM Provider Registry (read-only public)
-    "/api/llm/providers",
-    "/api/llm/providers/",
-    "/api/llm/providers/{provider_id}",
-    "/api/llm/providers/{provider_id}/models",
-    # Graph (read-only)
-    "/graph/nodes",
-    "/graph/edges",
-    "/graph/summary",
-}
+})
+
+
+def _extra_public_paths() -> frozenset:
+    """
+    Path tambahan yang diminta lewat env `SYNAPSE_PUBLIC_PATHS`.
+
+    Dipisah pisah dari PUBLIC_PATHS supaya jelas mana yang default aman dan
+    mana yang opt-in. Dipisah juga dari parameter route: is_public_path()
+    bekerja pada path konkret, bukan pada template FastAPI.
+    """
+    raw = os.environ.get("SYNAPSE_PUBLIC_PATHS", "").strip()
+    if not raw:
+        return frozenset()
+    items = {p.strip().rstrip("/") or "/" for p in raw.split(",") if p.strip()}
+    return frozenset(items)
 
 _ENV_TOKEN = os.environ.get("SYNAPSE_API_TOKEN", "").strip()
 API_TOKEN: str = _ENV_TOKEN if _ENV_TOKEN else secrets.token_urlsafe(32)
@@ -126,7 +136,16 @@ def allowed_origins() -> List[str]:
 
 
 def is_public_path(path: str) -> bool:
-    return path in PUBLIC_PATHS
+    """
+    True kalau path boleh diakses tanpa token.
+
+    Trailing slash dinormalisasi supaya `/health/` dan `/health` dianggap sama,
+    karena FastAPI bisa menerima keduanya lewat redirect.
+    """
+    if not path:
+        return False
+    normalized = path.rstrip("/") or "/"
+    return normalized in PUBLIC_PATHS or normalized in _extra_public_paths()
 
 
 def _extract_token(request: Request) -> Optional[str]:

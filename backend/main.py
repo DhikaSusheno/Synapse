@@ -688,7 +688,7 @@ def github_callback(code: str, state: str = "", redirect_uri: str = "http://loca
            (id, type, access_token, scope, user_login, user_avatar, updated_at)
            VALUES (?, 'oauth', ?, ?, ?, ?, ?)""",
         (f"oauth:{user['login']}", encrypt_token(access_token), "repo,read:org,read:user", 
-         user["login"], user.get("avatar_url", ""), datetime.utcnow().isoformat())
+         user["login"], user.get("avatar_url", ""), guardian._utcnow_iso())
     )
     conn.commit()
     conn.close()
@@ -721,7 +721,7 @@ def github_pat(req: GitHubPATRequest):
            (id, type, access_token, scope, user_login, user_avatar, updated_at)
            VALUES (?, 'pat', ?, ?, ?, ?, ?)""",
         (f"pat:{user['login']}", encrypt_token(req.pat), ",".join(scopes), 
-         user["login"], user.get("avatar_url", ""), datetime.utcnow().isoformat())
+         user["login"], user.get("avatar_url", ""), guardian._utcnow_iso())
     )
     conn.commit()
     conn.close()
@@ -910,7 +910,7 @@ def create_llm_provider(req: LLMProviderCreate):
                 encrypt_token(req.api_key) if req.api_key else None,
                 json.dumps(req.models), req.default_model or req.models[0] if req.models else "",
                 req.max_tokens, int(req.supports_tools), int(req.supports_vision),
-                int(req.enabled), datetime.utcnow().isoformat(), datetime.utcnow().isoformat()
+                int(req.enabled), guardian._utcnow_iso(), guardian._utcnow_iso()
             )
         )
         conn.commit()
@@ -970,7 +970,7 @@ def update_llm_provider(provider_id: str, req: LLMProviderUpdate):
     
     if updates:
         updates.append("updated_at = ?")
-        params.append(datetime.utcnow().isoformat())
+        params.append(guardian._utcnow_iso())
         params.append(provider_id)
         conn.execute(f"UPDATE llm_providers SET {', '.join(updates)} WHERE id = ?", params)
         conn.commit()
@@ -1246,7 +1246,7 @@ def upsert_project_llm_config(project_id: str, req: ProjectLLMConfigRequest):
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req.project_id, req.provider_id, req.model, req.temperature, req.max_tokens,
-            req.system_prompt, int(req.rag_enabled), req.rag_top_k, datetime.utcnow().isoformat()
+            req.system_prompt, int(req.rag_enabled), req.rag_top_k, guardian._utcnow_iso()
         )
     )
     conn.commit()
@@ -1337,7 +1337,7 @@ async def rag_ingest(req: RAGIngestRequest):
         chunk_id = hashlib.md5(emb["chunk"].encode()).hexdigest()
         conn.execute(
             "INSERT OR REPLACE INTO rag_chunks (id, chunk, embedding, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-            (chunk_id, emb["chunk"], json.dumps(emb["embedding"]), json.dumps({"provider": req.provider_id, "model": model}), _dt.utcnow().isoformat())
+            (chunk_id, emb["chunk"], json.dumps(emb["embedding"]), json.dumps({"provider": req.provider_id, "model": model}), guardian._utcnow_iso())
         )
     conn.commit()
     conn.close()
