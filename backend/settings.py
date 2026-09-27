@@ -153,6 +153,71 @@ def _is_allowed(target: str) -> bool:
     return False
 
 
+# Nama file/folder yang tidak boleh dibaca endpoint mana pun.
+#
+# Ini penting karena allowlist root saja tidak cukup: file .env berada DI
+# DALAM repo, jadi tetap lolos kalau hanya dicek against allowed_roots().
+# Isinya memuat SYNAPSE_API_TOKEN dan FERNET_KEY, dan FERNET_KEY mengizinkan
+# decrypt_token() membuka semua kredensial yang tersimpan di database.
+SENSITIVE_NAMES = frozenset(
+    {
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".env.development",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        ".npmrc",
+        ".netrc",
+        ".pgpass",
+        "credentials.json",
+        "service-account.json",
+    }
+)
+SENSITIVE_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".keystore", ".db", ".sqlite", ".sqlite3")
+
+
+def _is_sensitive(real_path: str) -> bool:
+    """True kalau path menunjuk file kredensial atau database."""
+    base = os.path.basename(real_path).lower()
+    if base in SENSITIVE_NAMES or base.startswith(".env."):
+        return True
+    if base.endswith(SENSITIVE_SUFFIXES):
+        return True
+    # Direktori /.ssh/, /.aws/ dan sejenisnya di dalam root yang diizinkan
+    parts = {p.lower() for p in os.path.normpath(real_path).split(os.sep)}
+    if parts & {".ssh", ".aws", ".gnupg", ".kube"}:
+        return True
+    return False
+
+
+def is_readable_path(target: str) -> bool:
+    """
+    True kalau `target` boleh dibaca endpoint Synapse.
+
+    Dua lapis, dan keduanya wajib:
+      1. path harus berada di dalam allowed_roots() (repo + workspace)
+      2. path tidak boleh menunjuk file kredensial atau database
+
+    Dipakai bersama oleh endpoint yang menerima path dari request -
+    /api/rag/ingest, /review_change, /understand_repo - supaya semuanya
+    tunduk pada aturan yang sama.
+    """
+    if not target or not str(target).strip():
+        return False
+    try:
+        real = os.path.realpath(os.path.expanduser(str(target)))
+    except (OSError, ValueError):
+        return False
+    if not _is_allowed(real):
+        return False
+    if _is_sensitive(real):
+        return False
+    return True
+
+
 def browse(path: str = "") -> Dict[str, Any]:
     raw = (path or "").strip()
     target = os.path.join(REPO_ROOT, raw) if raw else REPO_ROOT

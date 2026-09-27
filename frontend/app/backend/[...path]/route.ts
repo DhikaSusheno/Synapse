@@ -8,11 +8,46 @@
 //
 // Karena lewat server yang sama, request juga menjadi same-origin sehingga
 // CORS tidak relevan untuk jalur ini.
+//
+// #63: menyuntikkan token tanpa syarat itu mengubah proxy ini menjadi
+// "pintu masuk gratis" ke API terproteksi. Siapa pun yang bisa menjangkau
+// port Next.js bisa memanggil /backend/* dengan kredensial server, termasuk
+//_graph/export, /api/github/*, dan /api/llm/providers* yang menyimpan
+// token pihak ketiga dalam BODY respons.
+//
+// Yang diperbaiki di sini:
+//   1. Request cross-site dari browser ditolak lewat Sec-Fetch-Site. Tanpa
+//      ini, halaman web mana pun bisa membuat browser korban menjalankan
+//      POST ke /backend/* (CORS hanya memblokir pembacaan respons, bukan
+//      eksekusinya - jadi ini tetap CSRF yang nyata).
+//   2. Header Authorization milik klien TIDAK diteruskan, supaya pemanggil
+//      tidak bisa menyamarkan diri sebagai backend.
+//   3. Kalau SYNAPSE_API_TOKEN kosong, proxy menolak dengan 503 alih-alih
+//      meneruskan request tanpa token.
+//   4. Tiap segmen path di-encode, supaya ".." atau "/" yang tersembunyi
+//      tidak bisa mengubah tujuan request di backend.
+//
+// CATATAN AKHIR: ini menutup vektor browser. Klien non-browser (curl, skrip
+// lokal, proses lain di jaringan) yang bisa menjangkau port ini tetap bisa
+// memakai proxy, karena token diinjeksi server. Itu sifat intrinsik proxy
+// penyuntik-token dan tidak bisa diperbaiki di file ini. Mitigasinya di
+// level deploy:ikat Next.js ke localhost, atau set
+// SYNAPSE_PROXY_ALLOWED_ORIGINS untuk daftar origin yang memang diizinkan.
 
 import { NextRequest } from "next/server";
 
 const BACKEND = process.env.BACKEND_URL ?? "http://localhost:8000";
 const TOKEN = process.env.SYNAPSE_API_TOKEN ?? "";
+
+// Opsional. Kalau diisi (dipisah koma), Origin/STOLEN wajib salah satu dari
+// daftar ini. Kalau kosong, tidak ada pembatasan Origin - andalkan
+// Sec-Fetch-Site saja.
+const ALLOWED_ORIGINS = new Set(
+  (process.env.SYNAPSE_PROXY_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean)
+);
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -30,21 +65,81 @@ const HOP_BY_HOP = new Set([
   "content-length",
 ]);
 
+// Header milik klien yang TIDAK boleh diteruskan ke backend. Authorization
+// ditolak eksplisit: kalau diteruskan, backend menerima dua header token
+// dengan nilai berbeda dan hasilnya bergantung pada urutan penulisan.
+const CLIENT_HEADERS_DENIED = new Set(["authorization", "x-synapse-token"]);
+
+// Nilai Sec-Fetch-Site yang menandakan request datang dari aplikasi ini
+// sendiri, jadi aman untuk diinjeksi token.
+const SAFE_FETCH_SITES = new Set(["same-origin", "same-site", "none"]);
+
 type RouteContext = { params: Promise<{ path?: string[] }> };
 
+function jsonError(status: number, error: string, hint?: string): Response {
+  return new Response(JSON.stringify({ error, ...(hint ? { hint } : {}) }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/** Tolak request yang jelas berasal dari origin lain, atau dari browser foreign. */
+function rejectCrossSite(request: NextRequest): Response | null {
+  const fetchSite = request.headers.get("sec-fetch-site");
+  if (fetchSite && !SAFE_FETCH_SITES.has(fetchSite.toLowerCase())) {
+    return jsonError(
+      403,
+      "Cross-site request ditolak",
+      "Proxy hanya melayani request dari aplikasi Synapse itu sendiri"
+    );
+  }
+
+  if (ALLOWED_ORIGINS.size > 0) {
+    const origin = request.headers.get("origin");
+    // Origin hanya dikirim browser pada request non-GET. Untuk GET, andalkan
+    // Sec-Fetch-Site yang sudah dicek di atas.
+    if (origin && !ALLOWED_ORIGINS.has(origin)) {
+      return jsonError(403, "Origin tidak diizinkan", `Origin: ${origin}`);
+    }
+  }
+
+  return null;
+}
+
 async function proxy(request: NextRequest, context: RouteContext): Promise<Response> {
+  // #63: gagal-cepat kalau server tidak punya token. Tanpa guard ini proxy
+  // meneruskan request apa adanya ke backend dan hopeful tidak di-401.
+  if (!TOKEN) {
+    return jsonError(
+      503,
+      "SYNAPSE_API_TOKEN belum di-set di server",
+      "Proxy tidak akan meneruskan request tanpa kredensial"
+    );
+  }
+
+  const blocked = rejectCrossSite(request);
+  if (blocked) return blocked;
+
   // Next 15 membuat params berupa Promise. Menunggu di sini wajib; kalau
   // diakses sinkron, segments selalu kosong dan semua request jatuh ke root.
-  const segments = (await context.params)?.path ?? [];
+  const rawSegments = (await context.params)?.path ?? [];
+  // Encode tiap segmen: Next.js sudah men-decode-nya, jadi encode ulang
+  // mencegah segmen berisi ".." atau "/" menembus sebagai struktur path.
+  const segments = rawSegments.map((s) => encodeURIComponent(s));
   const target = `${BACKEND}/${segments.join("/")}${request.nextUrl.search}`;
 
-  const headers: Record<string, string> = {};
-  if (TOKEN) headers["X-Synapse-Token"] = TOKEN;
+  const headers: Record<string, string> = {
+    "X-Synapse-Token": TOKEN,
+  };
 
   request.headers.forEach((value, key) => {
-    if (!HOP_BY_HOP.has(key.toLowerCase())) headers[key] = value;
+    const lower = key.toLowerCase();
+    if (HOP_BY_HOP.has(lower) || CLIENT_HEADERS_DENIED.has(lower)) return;
+    headers[key] = value;
   });
-  if (TOKEN) headers["X-Synapse-Token"] = TOKEN;
+  // Ditulis terakhir supaya selalu menang atas header klien, apa pun yang
+  // dikirim pemanggil. (Versi lama menyuntik token di dua titik, dan urutan
+  // penulisan tidak dijamin.)
 
   const method = request.method.toUpperCase();
   const hasBody = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
@@ -60,23 +155,18 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<Respo
       redirect: "manual",
     });
   } catch {
-    return new Response(
-      JSON.stringify({
-        error: "Backend tidak dapat dijangkau",
-        backend: BACKEND,
-        hint: "Pastikan uvicorn jalan dan BACKEND_URL benar",
-      }),
-      { status: 503, headers: { "Content-Type": "application/json" } },
+    return jsonError(
+      503,
+      "Backend tidak dapat dijangkau",
+      `Pastikan uvicorn jalan dan BACKEND_URL benar (${BACKEND})`
     );
   }
 
   if (upstream.status === 401) {
-    return new Response(
-      JSON.stringify({
-        error: "Token API backend ditolak",
-        hint: "Cocokkan SYNAPSE_API_TOKEN di .env.local dengan SYNAPSE_API_TOKEN milik backend",
-      }),
-      { status: 502, headers: { "Content-Type": "application/json" } },
+    return jsonError(
+      502,
+      "Token API backend ditolak",
+      "Cocokkan SYNAPSE_API_TOKEN di .env.local dengan SYNAPSE_API_TOKEN milik backend"
     );
   }
 

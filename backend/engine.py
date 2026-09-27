@@ -75,6 +75,12 @@ from storage import (
     upsert_relation,
 )
 
+# #66: sumber kebenaran untuk "path mana yang boleh dibaca" ada di settings.py.
+# Sengaja alias yang sama seperti di main.py supaya tidak ada dua mekanisme
+# berbeda yang bisa menyimpang. settings.py tidak mengimpor engine, jadi
+# tidak ada circular import.
+import settings as settings_store
+
 __all__ = [
     "ingest_repository",
     "ask_about",
@@ -878,12 +884,26 @@ def ingest_repository(repo_path: str) -> dict:
       edges                     sisi graph yang dibuat
       undocumented_files        file kode yang tidak disinggung dokumen mana pun
       high_complexity_symbols   simbol dengan complexity >= 5
+
+    Keamanan: repo_path datang dari request. Tanpa batas root, rglob("*")
+    bisa diarahkan ke C:\\Users atau root drive, dan karena _repo_root disimpan
+    global, /repo_health dan /complexity_report ikut melaporkan data turunan
+    direktori tersebut. Karena itu root wajib lolos
+    settings_store.is_readable_path() sebelum dibaca.
     """
     root = Path(repo_path).expanduser().resolve()
     if not root.exists():
         return {"ok": False, "error": f"Path tidak ditemukan: {repo_path}"}
     if not root.is_dir():
         return {"ok": False, "error": f"Bukan directory: {repo_path}"}
+    if not settings_store.is_readable_path(str(root)):
+        return {
+            "ok": False,
+            "error": (
+                f"Path tidak boleh dipindai: {str(root)!r}. Hanya direktori di "
+                "dalam workspace yang diizinkan yang boleh di-ingest."
+            ),
+        }
 
     started = datetime.now()
     global _repo_root
@@ -1208,9 +1228,18 @@ def review_change(path_or_diff: str) -> dict:
     """
     Skor 4 dimensi untuk sebuah file ATAU potongan diff/patch.
 
-    Deteksi input: kalau string-nya menunjuk file yang ada, dibaca dari disk;
-    selain itu diperlakukan sebagai diff inline. Diff dikenali dari baris
-    yang diawali +/- dan hanya baris '+' yang dinilai.
+    Deteksi input: kalau string-nya menunjuk file yang ada DAN boleh dibaca,
+    dibaca dari disk; selain itu diperlakukan sebagai diff inline. Diff
+    dikenali dari baris yang diawali +/- dan hanya baris '+' yang dinilai.
+
+    Keamanan: path_or_diff datang dari request, jadi Path.expanduser() +
+    read_text() tanpa batas root membuat endpoint ini arbitrary file read -
+    termasuk .env dan private key. Karena itu candidate harus lolos
+    settings_store.is_readable_path() dulu, dan kalau path-nya menunjuk file
+    yang ADA tapi di luar allowlist, tolak eksplisit. Jangan diam-diam
+    diperlakukan sebagai diff inline, karena itu menyembunyikan akses yang
+    ditolak dan mengembalikan skor menyesatkan untuk file yang tidak pernah
+    dibaca.
     """
     g = _get_graph()
 
@@ -1222,6 +1251,16 @@ def review_change(path_or_diff: str) -> dict:
             is_file = candidate.is_file()
         except OSError:
             is_file = False
+
+    if is_file and not settings_store.is_readable_path(str(candidate)):
+        return {
+            "ok": False,
+            "error": (
+                f"Path tidak boleh dibaca: {str(candidate)!r}. Hanya file di "
+                "dalam workspace yang diizinkan yang boleh dinilai; file "
+                "kredensial dan database ditolak."
+            ),
+        }
 
     if is_file:
         try:
