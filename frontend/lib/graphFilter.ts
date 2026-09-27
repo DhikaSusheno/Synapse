@@ -19,8 +19,14 @@ const TYPE_MAP: Record<Exclude<NodeTypeFilter, "All">, GraphNode["type"]> = {
   Doc: "doc",
 };
 
-function endId(end: string | GraphNode): string {
-  return typeof end === "string" ? end : end.id;
+// ponytail: TIDAK percaya tipe di sini. react-force-graph-2d menulis ulang
+// link.source / link.target di tempat (string -> objek node) dan mengisinya
+// `undefined` kalau node-nya tidak ada di graph. Edge dari backend juga bisa
+// datang tanpa source_id/target_id. Kalau end tidak bisa jadi id, kembalikan
+// "" supaya edge-nya dibuang, bukan melempar TypeError.
+function endId(end: string | GraphNode | null | undefined): string {
+  if (typeof end === "string") return end;
+  return typeof end?.id === "string" ? end.id : "";
 }
 
 export function filterGraph(
@@ -42,8 +48,14 @@ export function filterGraph(
 
   const keptIds = new Set(keep.map((n) => n.id));
   // Edge yang salah satu ujungnya tersaring harus ikut hilang, kalau tidak
-  // force-graph akan menggambar edge menuju node yang tidak ada.
-  const keptLinks = links.filter((l) => keptIds.has(endId(l.source)) && keptIds.has(endId(l.target)));
+  // force-graph akan menggambar edge menuju node yang tidak ada. Edge dengan
+  // ujung hilang/undefined ikut dibuang di sini juga.
+  const keptLinks = links.filter((l) => {
+    if (!l) return false;
+    const s = endId(l.source);
+    const t = endId(l.target);
+    return s !== "" && t !== "" && keptIds.has(s) && keptIds.has(t);
+  });
 
   return { nodes: keep, links: keptLinks };
 }

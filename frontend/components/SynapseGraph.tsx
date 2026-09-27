@@ -170,12 +170,17 @@ function useInitialGraph(
           );
         }
         if (Array.isArray(data.edges) && data.edges.length > 0) {
+          // Buang edge tanpa kedua ujung sebelum kena force-graph. Edge yatim
+          // akan ditulis ulang jadi undefined oleh react-force-graph-2d dan
+          // jadi bom waktu di filterGraph.
           setLinks(
-            data.edges.map((e: BackendEdge) => ({
-              source: e.source_id,
-              target: e.target_id,
-              relationship: e.relationship,
-            }))
+            data.edges
+              .filter((e: BackendEdge) => e?.source_id && e?.target_id)
+              .map((e: BackendEdge) => ({
+                source: e.source_id,
+                target: e.target_id,
+                relationship: e.relationship,
+              }))
           );
         }
       } catch {

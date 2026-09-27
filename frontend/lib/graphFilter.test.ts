@@ -71,3 +71,52 @@ test("edge dengan endpoint berupa objek (setelah force-graph init) ikut difilter
   const r = filterGraph(NODES, [{ source: NODES[2], target: NODES[0], relationship: "REFERENCES" }], "File", "");
   assert.deepEqual(r.links, []);
 });
+
+// --- Regresi: #1 di produksi. force-graph menulis ulang link.source/target jadi
+// undefined kalau node-nya hilang, lalu filterGraph meledak di endId(). ---
+
+test("edge dengan source undefined dibuang, tidak melempar", () => {
+  const broken = [{ source: undefined, target: "s1", relationship: "REFERENCES" }] as unknown as GraphLink[];
+  const r = filterGraph(NODES, broken, "All", "");
+  assert.deepEqual(r.links, []);
+});
+
+test("edge dengan target undefined dibuang, tidak melempar", () => {
+  const broken = [{ source: "f1", target: undefined, relationship: "REFERENCES" }] as unknown as GraphLink[];
+  const r = filterGraph(NODES, broken, "All", "");
+  assert.deepEqual(r.links, []);
+});
+
+test("edge dengan kedua ujung undefined dibuang, tidak melempar", () => {
+  const broken = [{ source: undefined, target: undefined, relationship: "REFERENCES" }] as unknown as GraphLink[];
+  const r = filterGraph(NODES, broken, "All", "");
+  assert.deepEqual(r.links, []);
+});
+
+test("edge null dibuang, tidak melempar", () => {
+  const broken = [null, { source: "f1", target: "s1", relationship: "REFERENCES" }] as unknown as GraphLink[];
+  const r = filterGraph(NODES, broken, "All", "");
+  assert.deepEqual(r.links.length, 1);
+});
+
+test("edge dengan id yang tidak ada di nodes (yatim) dibuang", () => {
+  const orphan = [{ source: "f1", target: "hantu", relationship: "REFERENCES" }] as unknown as GraphLink[];
+  const r = filterGraph(NODES, orphan, "All", "");
+  assert.deepEqual(r.links, []);
+});
+
+test("endpoint objek tanpa field id dibuang, tidak melempar", () => {
+  const noId = [{ source: {}, target: NODES[0], relationship: "REFERENCES" }] as unknown as GraphLink[];
+  const r = filterGraph(NODES, noId, "All", "");
+  assert.deepEqual(r.links, []);
+});
+
+test("edge rusak tidak merusak node yang sehat", () => {
+  const broken = [
+    { source: undefined, target: "s1", relationship: "REFERENCES" },
+    { source: "f1", target: "s1", relationship: "REFERENCES" },
+  ] as unknown as GraphLink[];
+  const r = filterGraph(NODES, broken, "All", "");
+  assert.equal(r.nodes.length, 5);
+  assert.equal(r.links.length, 1);
+});
