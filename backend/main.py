@@ -1281,8 +1281,8 @@ class RAGSearchRequest(BaseModel):
     top_k: int = 5
 
 def _looks_like_path(value: str) -> bool:
-    """
-    Heuristik: apakah string ini\Service-nya path filesystem, atau konten literal?
+    r"""
+    Heuristik: apakah string ini diperlakukan sebagai path filesystem, atau konten literal?
 
     Konten inline yang dikirim frontend bisa saja satu baris pendek tanpa
     newline, jadi tidak bisa/resource diheuristik 100% akurat. Karena itu
