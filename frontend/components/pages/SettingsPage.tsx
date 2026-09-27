@@ -217,27 +217,48 @@ export default function SettingsPage() {
   const [browseOpen, setBrowseOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const sync = () => {
       setStorage(getStorage());
       setDraft(getSettings());
     };
-    const unsubscribe = subscribe(sync);
-    void refreshSettings();
-    return unsubscribe;
+    const unsubscribeSettings = subscribe(sync);
+    
+    const loadInitial = async () => {
+      setLoading(true);
+      try {
+        await refreshSettings();
+      } catch {
+        // ignore errors, cache will be null
+      } finally {
+        setLoading(false);
+      }
+    };
+    void loadInitial();
+    const unsubscribeLive = subscribe(() => {
+      setStorage(getStorage());
+      setDraft(getSettings());
+    });
+    return () => {
+      unsubscribeSettings();
+      unsubscribeLive();
+    };
   }, []);
 
   useEffect(() => {
     if (!USE_LIVE) return;
+    let cancelled = false;
     fetch(`${BACKEND_URL}/health`)
       .then((r) => r.json())
-      .then(setServerHealth)
+      .then((data) => { if (!cancelled) setServerHealth(data); })
       .catch(() => setServerHealth({ status: "offline" }));
     fetch(`${BACKEND_URL}/graph/summary`)
       .then((r) => r.json())
-      .then(setGraphSummary)
+      .then((data) => { if (!cancelled) setGraphSummary(data); })
       .catch(() => setGraphSummary(null));
+    return () => { /* cleanup */ };
   }, []);
 
   const set = useCallback(<K extends EditableKey>(key: K, value: PlatformSettings[K]) => {
@@ -301,6 +322,20 @@ export default function SettingsPage() {
     );
   }
 
+  if (loading) {
+    return (
+      <div className="flex-1 overflow-y-auto bg-[#080d14] p-5 space-y-4">
+        <div>
+          <h1 className="text-xl font-bold text-white">Settings</h1>
+          <p className="mt-0.5 text-sm text-slate-400">Configure Synapse platform</p>
+        </div>
+        <p className="rounded-xl border border-slate-800/60 bg-[#0d1117] p-5 text-sm text-slate-400 animate-pulse">
+          Menghubungkan ke backend...
+        </p>
+      </div>
+    );
+  }
+
   if (!draft || !saved) {
     return (
       <div className="flex-1 overflow-y-auto bg-[#080d14] p-5 space-y-4">
@@ -309,7 +344,7 @@ export default function SettingsPage() {
           <p className="mt-0.5 text-sm text-slate-400">Configure Synapse platform</p>
         </div>
         <p className="rounded-xl border border-slate-800/60 bg-[#0d1117] p-5 text-sm text-slate-400">
-          {notice?.text ?? "Menghubungkan ke backend..."}
+          {notice?.text ?? "Gagal memuat pengaturan. Coba refresh halaman."}
         </p>
       </div>
     );
