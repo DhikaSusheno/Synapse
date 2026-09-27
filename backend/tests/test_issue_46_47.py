@@ -146,6 +146,17 @@ class TestIssue47TsQueries:
         (repo / "app.py").write_text("def pyfunc():\n    return 1\n", encoding="utf-8")
         (repo / "comp.js").write_text(JS_SOURCE, encoding="utf-8")
 
+        # #66: ingest_repository() kini menolak path di luar allowed roots.
+        # Test ini sebelumnya lolos karena tmp_path ada di luar repo, yaitu
+        # karena behavior yang sekarang justru ditutup. Daftarkan tmp_path
+        # sebagai root yang diizinkan supaya test tetap menguji hal yang
+        # sebenarnya dituju - persistensi entitas JS ke database - bukan
+        # kebocoran path.
+        import settings as settings_store
+        monkeypatch.setattr(
+            settings_store, "allowed_roots", lambda: [str(tmp_path)]
+        )
+
         res = engine.ingest_repository(str(repo))
         assert res["ok"], res
         assert res["stats"]["symbols"] > 0, res["stats"]

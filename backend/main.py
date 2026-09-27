@@ -55,6 +55,15 @@ import auth
 import settings as settings_store
 
 # ---------------------------------------------------------------------------
+# Batas ukuran ingest
+# ---------------------------------------------------------------------------
+# Endpoint /api/rag/ingest membaca file dari disk dan meneruskannya ke provider
+# LLM. Tanpa plafon, satu request bisa menarik file sebesar pun ke memory dan
+# membakar kuota token. 2 MiB jauh di atas file sumber kode normal.
+MAX_INGEST_FILE_BYTES = 2 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -1271,6 +1280,73 @@ class RAGSearchRequest(BaseModel):
     query: str
     top_k: int = 5
 
+def _looks_like_path(value: str) -> bool:
+    """
+    Heuristik: apakah string ini\Service-nya path filesystem, atau konten literal?
+
+    Konten inline yang dikirim frontend bisa saja satu baris pendek tanpa
+    newline, jadi tidak bisa/resource diheuristik 100% akurat. Karena itu
+    jalur yang ambigu TIDAK di-fallback diam-diam: kalau path-nya benar-benar
+    ada tapi terlarang, endpoint tetap menolak. Lihat _resolve_ingest_entry.
+    """
+    return (
+        len(value) < 4096
+        and "\n" not in value
+        and not value.lstrip().startswith(("{", "[", "<", "#", "-", "/*"))
+    )
+
+
+def _resolve_ingest_entry(entry: str) -> str:
+    """
+    Ubah satu entri RAGIngestRequest.files menjadi konten teks.
+
+    req.files menerima dua bentuk: path filesystem ATAU konten langsung.
+    Bentuk path wajib lolos settings_store.is_readable_path() sebelum dibuka,
+    kalau tidak endpoint ini membaca file apa pun di mesin - termasuk .env
+    yang berisi FERNET_KEY - lalu MENGIRIM isinya ke provider LLM pihak
+    ketiga. Jadi ini exfiltrasi, bukan sekadar file read.
+
+    Perilaku yang dipertahankan: entri yang jelas-jelas bukan path (multiline,
+    diawali '{' atau '<' dan sejenisnya) dipakai apa adanya.
+    """
+    if not _looks_like_path(entry):
+        return entry
+
+    expanded = os.path.expanduser(entry)
+
+    if not settings_store.is_readable_path(entry):
+        if os.path.exists(expanded):
+            # Ada di disk tapi di luar allowlist, atau file sensitif.
+            # Bug lama menutupi ini dengan `except:` yang diam-diam memakai
+            # string path sebagai konten, sehingga file terlarang ikut
+            # ter-embed di vector store. Sekarang ditolak eksplisit.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Path tidak boleh dibaca: {entry!r}. File di luar workspace "
+                    "yang diizinkan, atau file kredensial (env, private key, "
+                    "database), ditolak."
+                ),
+            )
+        # Bukan path yang ada -> perlakukan sebagai konten literal.
+        return entry
+
+    try:
+        with open(expanded, "r", encoding="utf-8") as handle:
+            content = handle.read(MAX_INGEST_FILE_BYTES + 1)
+    except (OSError, UnicodeDecodeError) as exc:
+        # Binary file dan permission error harus kelihatan, bukan jadi konten.
+        raise HTTPException(
+            status_code=400, detail=f"Gagal membaca {entry!r}: {exc}"
+        ) from exc
+
+    if len(content) > MAX_INGEST_FILE_BYTES:
+        raise HTTPException(
+            status_code=413, detail=f"File terlalu besar untuk di-ingest: {entry!r}"
+        )
+    return content
+
+
 @app.post("/api/rag/ingest", tags=["RAG"])
 async def rag_ingest(req: RAGIngestRequest):
     """Ingest files into RAG vector store."""
@@ -1279,7 +1355,13 @@ async def rag_ingest(req: RAGIngestRequest):
     import hashlib
     import httpx
     from auth import decrypt_token
-    
+
+    # Validasi SELURUH entri lebih dulu, sebelum query DB, decrypt_token, atau
+    # panggilan jaringan apa pun. Kalau validasi dilakukan setelahnya,
+    # request berbahaya bisa lolos, atau pun tertutup 404 "Provider not found"
+    # sehingga penolakan aslinya tidak pernah terlihat.
+    resolved = [_resolve_ingest_entry(entry) for entry in req.files]
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     provider = conn.execute("SELECT * FROM llm_providers WHERE id = ? AND enabled = 1", (req.provider_id,)).fetchone()
@@ -1292,14 +1374,7 @@ async def rag_ingest(req: RAGIngestRequest):
     
     # Generate embeddings
     chunks = []
-    for file_path in req.files:
-        # Simple chunking by lines
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except:
-            content = file_path  # treat as content if not file
-        
+    for content in resolved:
         lines = content.split('\n')
         chunk = []
         for line in lines:
