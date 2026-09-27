@@ -82,8 +82,6 @@ elif len(API_TOKEN) < 16:
 
 # Fernet key untuk encrypt/decrypt token (simpan di env FERNET_KEY)
 _FERNET_KEY = os.environ.get("FERNET_KEY", "").strip()
-# Fernet key untuk encrypt/decrypt token (simpan di env FERNET_KEY)
-_FERNET_KEY = os.environ.get("FERNET_KEY", "").strip()
 if not _FERNET_KEY:
     _LOG.warning("FERNET_KEY tidak disetel - generate random key (token tidak persisten)")
     _fernet = Fernet(Fernet.generate_key())

@@ -6,6 +6,7 @@
 import { useEffect, useState } from "react";
 import { buildFileTree, type TreeNode } from "@/lib/derive";
 import { num, arr, str } from "@/lib/coerce";
+import { LLMChatPanel } from "@/components/LLMChatPanel";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "/backend";
 const USE_LIVE    = process.env.NEXT_PUBLIC_USE_LIVE_SSE === "true";
@@ -340,79 +341,14 @@ export default function CortexPage() {
           <span className="text-[10px] px-2.5 py-1 rounded-full bg-purple-500/20 text-purple-400 border border-purple-500/30 font-bold">REVIEW MODE</span>
         </div>
 
-        {/* Explain Topic */}
-        <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-4 space-y-3">
-          <div className="text-sm font-semibold text-white">Explain Topic</div>
-          <div className="flex gap-2">
-            <input
-              value={explainTopic}
-              onChange={(e) => setExplainTopic(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && runExplain()}
-              className="flex-1 bg-slate-800/60 border border-slate-700/60 rounded-lg px-3 py-2 text-xs text-slate-300 outline-none placeholder-slate-600"
-              placeholder="How does the guardian module work?"
-            />
-            <button onClick={runExplain} disabled={explainLoading}
-              className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold disabled:opacity-50 transition-colors">
-              {explainLoading ? "â€¦" : "Explain"}
-            </button>
-          </div>
-
-          {explainResult && (
-            <div className="space-y-3 pt-2 border-t border-slate-800/60">
-              <div>
-                <div className="text-[10px] text-slate-500 uppercase tracking-wide mb-1">Definition</div>
-                <p className="text-xs text-slate-300">{explainResult.definition}</p>
-              </div>
-              <div>
-                <div className="text-[10px] text-slate-500 uppercase tracking-wide mb-1">Mental Model</div>
-                <p className="text-xs text-slate-400 italic">{explainResult.mental_model}</p>
-              </div>
-              {explainResult.complexity_note && (
-                <div className="text-xs text-yellow-400">{explainResult.complexity_note}</div>
-              )}
-              {explainResult.example && (
-                <div>
-                  <div className="text-[10px] text-slate-500 uppercase tracking-wide mb-1">Example</div>
-                  <pre className="text-[10px] text-slate-300 bg-slate-900 rounded-lg p-3 overflow-x-auto">{explainResult.example}</pre>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* Review Artifact */}
-        <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-4 space-y-3">
-          <div className="text-sm font-semibold text-white">Review Artifact</div>
-          <div className="flex gap-2">
-            <input
-              value={artifactPath}
-              onChange={(e) => setArtifactPath(e.target.value)}
-              className="flex-1 bg-slate-800/60 border border-slate-700/60 rounded-lg px-3 py-2 text-xs text-slate-300 outline-none placeholder-slate-600 font-mono"
-              placeholder="backend/guardian.py or paste diff..."
-            />
-            <button onClick={runReview} disabled={reviewLoading}
-              className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold disabled:opacity-50 transition-colors">
-              {reviewLoading ? "â€¦" : "Run Review"}
-            </button>
-          </div>
-
-          {reviewResult && (
-            <div className="space-y-2 pt-2 border-t border-slate-800/60">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-xs text-slate-400">Verdict:</span>
-                <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
-                  reviewResult.verdict === "pass" ? "bg-green-500/20 text-green-400" :
-                  reviewResult.verdict === "block" ? "bg-red-500/20 text-red-400" :
-                  "bg-yellow-500/20 text-yellow-400"
-                }`}>{reviewResult.verdict.toUpperCase()}</span>
-              </div>
-              <ScoreBar label="Completeness" value={reviewResult.completeness} />
-              <ScoreBar label="Clarity" value={reviewResult.clarity} />
-              <ScoreBar label="Correctness vs Spec" value={reviewResult.correctness_vs_spec} />
-              <ScoreBar label="Risk" value={reviewResult.risk} />
-            </div>
-          )}
-        </div>
+        {/* LLM Chat Panel - Explain, Review, Refactor */}
+        <LLMChatPanel
+          providerId="openai:gpt-4o"
+          model="gpt-4o"
+          onExplain={runExplain}
+          onReview={runReview}
+          onRefactor={runSuggestRefactor}
+        />
 
         {/* Repo Health â€” GET /repo_health */}
         <div className="bg-[#0d1117] rounded-xl border border-slate-800/60 p-4 space-y-3">
