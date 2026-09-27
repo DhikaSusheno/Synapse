@@ -87,6 +87,60 @@ def init_db() -> None:
         decided_at   TEXT DEFAULT (datetime('now')),
         note         TEXT DEFAULT ''
     );
+
+    -- GitHub Integration tables
+    CREATE TABLE IF NOT EXISTS github_connections (
+        id            TEXT PRIMARY KEY,
+        type          TEXT NOT NULL,          -- 'oauth' | 'pat'
+        access_token  TEXT NOT NULL,          -- encrypted
+        scope         TEXT,                   -- comma-separated scopes
+        user_login    TEXT,
+        user_avatar   TEXT,
+        created_at    TEXT DEFAULT (datetime('now')),
+        updated_at    TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS repo_refs (
+        id              TEXT PRIMARY KEY,          -- 'github:owner/repo#branch' or 'local:path'
+        source          TEXT NOT NULL,             -- 'github' | 'local'
+        github_owner    TEXT,
+        github_repo     TEXT,
+        github_branch   TEXT,
+        local_path      TEXT,
+        name            TEXT NOT NULL,
+        last_synced     TEXT,
+        created_at      TEXT DEFAULT (datetime('now'))
+    );
+
+    -- LLM Provider registry
+    CREATE TABLE IF NOT EXISTS llm_providers (
+        id              TEXT PRIMARY KEY,
+        name            TEXT NOT NULL,             -- 'openai', 'anthropic', 'ibm', 'nvidia', 'deepseek', 'ollama', 'custom'
+        type            TEXT NOT NULL,             -- 'openai', 'anthropic', 'ibm', 'nvidia', 'deepseek', 'ollama', 'openai-compatible'
+        base_url        TEXT,                      -- for custom/ollama
+        api_key         TEXT,                      -- encrypted
+        models          TEXT,                      -- JSON array of model names
+        default_model   TEXT,
+        max_tokens      INTEGER DEFAULT 4096,
+        supports_tools  INTEGER DEFAULT 1,
+        supports_vision INTEGER DEFAULT 0,
+        enabled         INTEGER DEFAULT 1,
+        created_at      TEXT DEFAULT (datetime('now')),
+        updated_at      TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS project_llm_configs (
+        project_id      TEXT PRIMARY KEY,
+        provider_id     TEXT NOT NULL,
+        model           TEXT NOT NULL,
+        temperature     REAL DEFAULT 0.2,
+        max_tokens      INTEGER DEFAULT 4096,
+        system_prompt   TEXT,
+        rag_enabled     INTEGER DEFAULT 1,
+        rag_top_k       INTEGER DEFAULT 5,
+        updated_at      TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (provider_id) REFERENCES llm_providers(id)
+    );
     """)
 
     conn.commit()

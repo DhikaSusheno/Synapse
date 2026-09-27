@@ -618,6 +618,788 @@ def get_graph_summary():
 
 
 # ---------------------------------------------------------------------------
+# GitHub Integration
+# ---------------------------------------------------------------------------
+
+class GitHubOAuthStartRequest(BaseModel):
+    redirect_uri: str = "http://localhost:3000/auth/github/callback"
+
+class GitHubPATRequest(BaseModel):
+    pat: str
+    scopes: list[str] = ["repo", "read:org", "read:user"]
+
+@app.get("/api/github/auth/url", tags=["GitHub"])
+def github_oauth_url(redirect_uri: str = "http://localhost:3000/auth/github/callback"):
+    """Get GitHub OAuth authorization URL."""
+    import os
+    client_id = os.getenv("GITHUB_CLIENT_ID")
+    if not client_id:
+        raise HTTPException(status_code=500, detail="GITHUB_CLIENT_ID not configured")
+    scope = "repo read:org read:user"
+    url = f"https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&scope={scope}&state=synapse"
+    return {"url": url, "state": "synapse"}
+
+@app.get("/api/github/callback", tags=["GitHub"])
+def github_callback(code: str, state: str = "", redirect_uri: str = "http://localhost:3000/auth/github/callback"):
+    """Handle GitHub OAuth callback, exchange code for access token."""
+    import os
+    import requests
+    client_id = os.getenv("GITHUB_CLIENT_ID")
+    client_secret = os.getenv("GITHUB_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=500, detail="GitHub OAuth not configured")
+    
+    # Exchange code for token
+    resp = requests.post(
+        "https://github.com/login/oauth/access_token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        },
+        headers={"Accept": "application/json"},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"OAuth failed: {resp.text}")
+    
+    token_data = resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="No access token in response")
+    
+    # Get user info
+    user_resp = requests.get(
+        "https://api.github.com/user",
+        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"},
+    )
+    if user_resp.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to fetch user info")
+    
+    user = user_resp.json()
+    
+    # Store connection
+    import sqlite3
+    from datetime import datetime
+    from auth import encrypt_token
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT OR REPLACE INTO github_connections 
+           (id, type, access_token, scope, user_login, user_avatar, updated_at)
+           VALUES (?, 'oauth', ?, ?, ?, ?, ?)""",
+        (f"oauth:{user['login']}", encrypt_token(access_token), "repo,read:org,read:user", 
+         user["login"], user.get("avatar_url", ""), datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    
+    return {"ok": True, "user": {"login": user["login"], "avatar": user.get("avatar_url", "")}, "redirect": "http://localhost:3000/settings?tab=github"}
+
+@app.post("/api/github/auth/pat", tags=["GitHub"])
+def github_pat(req: GitHubPATRequest):
+    """Validate and store GitHub Personal Access Token."""
+    import requests
+    import sqlite3
+    from datetime import datetime
+    from auth import encrypt_token
+    
+    # Validate token
+    resp = requests.get(
+        "https://api.github.com/user",
+        headers={"Authorization": f"Bearer {req.pat}", "Accept": "application/vnd.github+json"},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid PAT")
+    
+    user = resp.json()
+    scopes = req.scopes
+    
+    conn = sqlite3.connect(DB_PATH)
+    from auth import encrypt_token
+    conn.execute(
+        """INSERT OR REPLACE INTO github_connections 
+           (id, type, access_token, scope, user_login, user_avatar, updated_at)
+           VALUES (?, 'pat', ?, ?, ?, ?, ?)""",
+        (f"pat:{user['login']}", encrypt_token(req.pat), ",".join(scopes), 
+         user["login"], user.get("avatar_url", ""), datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    
+    return {"ok": True, "user": {"login": user["login"], "avatar": user.get("avatar_url", "")}}
+
+@app.get("/api/github/user", tags=["GitHub"])
+def github_user():
+    """Get current authenticated GitHub user."""
+    import sqlite3
+    from auth import decrypt_token
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"ok": False, "connected": False}
+    token = decrypt_token(row["access_token"])
+    import requests
+    resp = requests.get(
+        "https://api.github.com/user",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+    )
+    if resp.status_code != 200:
+        return {"ok": False, "connected": False, "error": "Token expired or invalid"}
+    return {"ok": True, "connected": True, "user": resp.json(), "type": row["type"]}
+
+@app.get("/api/github/repos", tags=["GitHub"])
+def github_repos(per_page: int = 100, page: int = 1):
+    """List repositories accessible by the authenticated user."""
+    import sqlite3
+    from auth import decrypt_token
+    import requests
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=401, detail="No GitHub connection")
+    
+    token = decrypt_token(row["access_token"])
+    import requests
+    resp = requests.get(
+        f"https://api.github.com/user/repos?per_page={per_page}&page={page}&sort=updated",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="Failed to fetch repos")
+    return {"ok": True, "repos": resp.json()}
+
+@app.get("/api/github/repos/{owner}/{repo}/tree", tags=["GitHub"])
+def github_repo_tree(owner: str, repo: str, branch: str = "main", recursive: bool = True):
+    """Get repository file tree."""
+    import sqlite3
+    from auth import decrypt_token
+    import requests
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=401, detail="No GitHub connection")
+    
+    token = decrypt_token(row["access_token"])
+    import requests
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive={1 if recursive else 0}"
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch tree: {resp.text}")
+    return resp.json()
+
+@app.get("/api/github/repos/{owner}/{repo}/contents", tags=["GitHub"])
+def github_file_content(owner: str, repo: str, path: str, branch: str = "main"):
+    """Get file content from repository."""
+    import sqlite3
+    from auth import decrypt_token
+    import requests
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM github_connections ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=401, detail="No GitHub connection")
+    
+    token = decrypt_token(row["access_token"])
+    import requests
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch file: {resp.text}")
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# LLM Provider Registry
+# ---------------------------------------------------------------------------
+
+class LLMProviderCreate(BaseModel):
+    name: str
+    type: Literal["openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama", "openai-compatible"]
+    base_url: str | None = None
+    api_key: str | None = None
+    models: list[str] = []
+    default_model: str = ""
+    max_tokens: int = 4096
+    supports_tools: bool = True
+    supports_vision: bool = False
+
+class LLMProviderUpdate(BaseModel):
+    name: str | None = None
+    type: Literal["openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama", "openai-compatible"] | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    models: list[str] | None = None
+    default_model: str | None = None
+    max_tokens: int | None = None
+    supports_tools: bool | None = None
+    supports_vision: bool | None = None
+    enabled: bool | None = None
+
+@app.get("/api/llm/providers", tags=["LLM"])
+def list_llm_providers():
+    """List all configured LLM providers."""
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, name, type, base_url, models, default_model, max_tokens, supports_tools, supports_vision, enabled, created_at, updated_at FROM llm_providers ORDER BY created_at"
+    ).fetchall()
+    conn.close()
+    providers = []
+    for row in rows:
+        import json
+        providers.append({
+            "id": row["id"],
+            "name": row["name"],
+            "type": row["type"],
+            "base_url": row["base_url"],
+            "models": json.loads(row["models"]) if row["models"] else [],
+            "default_model": row["default_model"],
+            "max_tokens": row["max_tokens"],
+            "supports_tools": bool(row["supports_tools"]),
+            "supports_vision": bool(row["supports_vision"]),
+            "enabled": bool(row["enabled"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        })
+    return {"ok": True, "providers": providers}
+
+@app.post("/api/llm/providers", tags=["LLM"])
+def create_llm_provider(req: LLMProviderCreate):
+    """Create a new LLM provider configuration."""
+    import sqlite3
+    import json
+    from auth import encrypt_token
+    from datetime import datetime
+    
+    conn = sqlite3.connect(DB_PATH)
+    provider_id = f"{req.type}:{req.name}"
+    try:
+        conn.execute(
+            """INSERT INTO llm_providers 
+               (id, name, type, base_url, api_key, models, default_model, max_tokens, 
+                supports_tools, supports_vision, enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                provider_id, req.name, req.type, req.base_url,
+                encrypt_token(req.api_key) if req.api_key else None,
+                json.dumps(req.models), req.default_model or req.models[0] if req.models else "",
+                req.max_tokens, int(req.supports_tools), int(req.supports_vision),
+                int(req.enabled), datetime.utcnow().isoformat(), datetime.utcnow().isoformat()
+            )
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Provider already exists")
+    finally:
+        conn.close()
+    return {"ok": True, "id": provider_id}
+
+@app.patch("/api/llm/providers/{provider_id}", tags=["LLM"])
+def update_llm_provider(provider_id: str, req: LLMProviderUpdate):
+    """Update an LLM provider configuration."""
+    import sqlite3
+    import json
+    from auth import encrypt_token
+    from datetime import datetime
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    existing = conn.execute("SELECT * FROM llm_providers WHERE id = ?", (provider_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Provider not found")
+    
+    updates = []
+    params = []
+    if req.name is not None:
+        updates.append("name = ?")
+        params.append(req.name)
+    if req.type is not None:
+        updates.append("type = ?")
+        params.append(req.type)
+    if req.base_url is not None:
+        updates.append("base_url = ?")
+        params.append(req.base_url)
+    if req.api_key is not None:
+        updates.append("api_key = ?")
+        params.append(encrypt_token(req.api_key))
+    if req.models is not None:
+        updates.append("models = ?")
+        params.append(json.dumps(req.models))
+    if req.default_model is not None:
+        updates.append("default_model = ?")
+        params.append(req.default_model)
+    if req.max_tokens is not None:
+        updates.append("max_tokens = ?")
+        params.append(req.max_tokens)
+    if req.supports_tools is not None:
+        updates.append("supports_tools = ?")
+        params.append(int(req.supports_tools))
+    if req.supports_vision is not None:
+        updates.append("supports_vision = ?")
+        params.append(int(req.supports_vision))
+    if req.enabled is not None:
+        updates.append("enabled = ?")
+        params.append(int(req.enabled))
+    
+    if updates:
+        updates.append("updated_at = ?")
+        params.append(datetime.utcnow().isoformat())
+        params.append(provider_id)
+        conn.execute(f"UPDATE llm_providers SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+    
+    conn.close()
+    return {"ok": True, "id": provider_id}
+
+@app.delete("/api/llm/providers/{provider_id}", tags=["LLM"])
+def delete_llm_provider(provider_id: str):
+    """Delete a custom LLM provider (built-in providers cannot be deleted)."""
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    existing = conn.execute("SELECT * FROM llm_providers WHERE id = ?", (provider_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Provider not found")
+    # Allow deletion of custom providers only
+    if existing["type"] in ["openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama"]:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Cannot delete built-in provider")
+    conn.execute("DELETE FROM llm_providers WHERE id = ?", (provider_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": provider_id}
+
+@app.get("/api/llm/providers/{provider_id}/models", tags=["LLM"])
+def list_provider_models(provider_id: str):
+    """List available models for a provider."""
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT models, default_model FROM llm_providers WHERE id = ?", (provider_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    import json
+    models = json.loads(row["models"]) if row["models"] else []
+    return {"ok": True, "provider_id": provider_id, "models": models, "default": row["default_model"]}
+
+
+# ---------------------------------------------------------------------------
+# LLM Chat & Tools
+# ---------------------------------------------------------------------------
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str | None = None
+    tool_calls: list | None = None
+    tool_call_id: str | None = None
+
+class ChatCompletionRequest(BaseModel):
+    provider_id: str
+    model: str
+    messages: list[ChatMessage]
+    temperature: float = 0.2
+    max_tokens: int = 4096
+    stream: bool = False
+    tools: list[dict] | None = None
+    tool_choice: str | None = None
+
+@app.post("/api/llm/chat", tags=["LLM"])
+async def llm_chat(req: ChatCompletionRequest):
+    """Chat completion with LLM provider."""
+    import sqlite3
+    import json
+    import asyncio
+    import httpx
+    from auth import decrypt_token
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    provider = conn.execute("SELECT * FROM llm_providers WHERE id = ? AND enabled = 1", (req.provider_id,)).fetchone()
+    conn.close()
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider not found or disabled")
+    
+    api_key = decrypt_token(provider["api_key"]) if provider["api_key"] else None
+    if not api_key and provider["type"] != "ollama":
+        raise HTTPException(status_code=400, detail="Provider not configured with API key")
+    
+    model = req.model or provider["default_model"]
+    
+    if provider["type"] == "ollama":
+        # Ollama local
+        base_url = provider["base_url"] or "http://localhost:11434"
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            payload = {
+                "model": model,
+                "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+                "stream": req.stream,
+                "options": {"temperature": req.temperature, "num_predict": req.max_tokens},
+            }
+            if req.stream:
+                async def stream_response():
+                    async with client.stream("POST", f"{base_url}/api/chat", json=payload, timeout=60.0) as resp:
+                        async for line in resp.aiter_lines():
+                            if line:
+                                yield f"data: {line}\n\n"
+                return StreamingResponse(stream_response(), media_type="text/event-stream")
+            else:
+                resp = await client.post(f"{base_url}/api/chat", json=payload, timeout=60.0)
+                return resp.json()
+    else:
+        # OpenAI-compatible (OpenAI, Anthropic, etc.)
+        base_url = provider["base_url"] or ("https://api.openai.com/v1" if provider["type"] == "openai" else 
+                      "https://api.anthropic.com/v1" if provider["type"] == "anthropic" else
+                      "https://integrate.api.nvidia.com/v1" if provider["type"] == "nvidia" else
+                      "https://api.deepseek.com/v1" if provider["type"] == "deepseek" else
+                      "https://api.openai.com/v1")
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if provider["type"] == "anthropic":
+            headers["anthropic-version"] = "2023-06-01"
+        
+        payload = {
+            "model": model,
+            "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+            "temperature": req.temperature,
+            "max_tokens": req.max_tokens,
+            "stream": req.stream,
+        }
+        if req.tools:
+            payload["tools"] = req.tools
+            payload["tool_choice"] = req.tool_choice or "auto"
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            if req.stream:
+                async def stream_response():
+                    async with client.stream("POST", f"{base_url}/chat/completions", json=payload, headers=headers, timeout=60.0) as resp:
+                        async for line in resp.aiter_lines():
+                            if line:
+                                yield f"data: {line}\n\n"
+                return StreamingResponse(stream_response(), media_type="text/event-stream")
+            else:
+                resp = await client.post(f"{base_url}/chat/completions", json=payload, headers=headers, timeout=60.0)
+                return resp.json()
+
+
+class ExplainRequest(BaseModel):
+    provider_id: str
+    model: str | None = None
+    topic: str
+    context_limit: int = 5
+
+class ReviewRequest(BaseModel):
+    provider_id: str
+    model: str | None = None
+    path_or_diff: str
+    context: str | None = None
+
+class RefactorRequest(BaseModel):
+    provider_id: str
+    model: str | None = None
+    node_name: str
+
+@app.post("/api/llm/explain", tags=["LLM"])
+async def llm_explain(req: ExplainRequest):
+    """Explain a topic using LLM with graph context."""
+    import sqlite3
+    import json
+    from datetime import datetime
+    # Get graph context for topic
+    context = engine.ask_about(req.topic)
+    if not context.get("ok"):
+        return context
+    
+    # Build prompt with graph context
+    system_prompt = f"""You are a senior software engineer explaining code from a knowledge graph.
+Topic: {req.topic}
+Graph Context: {json.dumps(context, indent=2)}
+Provide: definition -> mental model -> example -> complexity note -> how to use -> related nodes"""
+    
+    # Use LLM chat
+    from main import llm_chat  # import locally to avoid circular
+    return await llm_chat(ChatCompletionRequest(
+        provider_id=req.provider_id,
+        model=req.model,
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Explain: {req.topic}"}],
+        temperature=0.3,
+        max_tokens=2048,
+    ))
+
+@app.post("/api/llm/review", tags=["LLM"])
+async def llm_review(req: ReviewRequest):
+    """Review artifact using LLM with graph context."""
+    import sqlite3
+    import json
+    # Get graph context
+    context = engine.review_change(req.path_or_diff)
+    
+    system_prompt = f"""You are a senior code reviewer. Review the artifact using the knowledge graph.
+Artifact: {req.path_or_diff}
+Graph Context: {json.dumps(context, indent=2)}
+Score: completeness, clarity, correctness_vs_spec, risk (0-10 each)
+Verdict: pass | needs_work | block"""
+    
+    from main import llm_chat
+    return await llm_chat(ChatCompletionRequest(
+        provider_id=req.provider_id,
+        model=req.model,
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": "Review this artifact"}],
+        temperature=0.2,
+        max_tokens=2048,
+    ))
+
+@app.post("/api/llm/refactor", tags=["LLM"])
+async def llm_refactor(req: RefactorRequest):
+    """Suggest refactor using LLM with graph context."""
+    import sqlite3
+    import json
+    context = engine.propose_refactor(req.node_name)
+    if not context.get("ok"):
+        return context
+    
+    system_prompt = f"""You are a senior architect. Suggest refactors for this entity.
+Node: {req.node_name}
+Graph Context: {json.dumps(context, indent=2)}
+Provide: type (split_file_or_function/god_object/extract_method/etc), priority, message, example"""
+    
+    from main import llm_chat
+    return await llm_chat(ChatCompletionRequest(
+        provider_id=req.provider_id,
+        model=req.model,
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Suggest refactors for {req.node_name}"}],
+        temperature=0.3,
+        max_tokens=2048,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# Project LLM Config
+# ---------------------------------------------------------------------------
+
+class ProjectLLMConfigRequest(BaseModel):
+    project_id: str
+    provider_id: str
+    model: str
+    temperature: float = 0.2
+    max_tokens: int = 4096
+    system_prompt: str | None = None
+    rag_enabled: bool = True
+    rag_top_k: int = 5
+
+@app.get("/api/projects/{project_id}/llm-config", tags=["LLM"])
+def get_project_llm_config(project_id: str):
+    """Get LLM configuration for a project."""
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM project_llm_configs WHERE project_id = ?", (project_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"ok": True, "config": None}
+    return {"ok": True, "config": dict(row)}
+
+@app.put("/api/projects/{project_id}/llm-config", tags=["LLM"])
+def upsert_project_llm_config(project_id: str, req: ProjectLLMConfigRequest):
+    """Create or update LLM configuration for a project."""
+    import sqlite3
+    import json
+    from datetime import datetime
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT OR REPLACE INTO project_llm_configs
+           (project_id, provider_id, model, temperature, max_tokens, system_prompt, rag_enabled, rag_top_k, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            req.project_id, req.provider_id, req.model, req.temperature, req.max_tokens,
+            req.system_prompt, int(req.rag_enabled), req.rag_top_k, datetime.utcnow().isoformat()
+        )
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "project_id": project_id}
+
+# ---------------------------------------------------------------------------
+# RAG Endpoints
+# ---------------------------------------------------------------------------
+
+class RAGIngestRequest(BaseModel):
+    provider_id: str
+    model: str | None = None
+    files: list[str]  # file paths or contents
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+
+class RAGSearchRequest(BaseModel):
+    provider_id: str
+    model: str | None = None
+    query: str
+    top_k: int = 5
+
+@app.post("/api/rag/ingest", tags=["RAG"])
+async def rag_ingest(req: RAGIngestRequest):
+    """Ingest files into RAG vector store."""
+    import sqlite3
+    import json
+    import hashlib
+    import httpx
+    from auth import decrypt_token
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    provider = conn.execute("SELECT * FROM llm_providers WHERE id = ? AND enabled = 1", (req.provider_id,)).fetchone()
+    conn.close()
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider not found or disabled")
+    
+    api_key = decrypt_token(req.api_key) if req.api_key else None
+    model = req.model or "text-embedding-3-small"
+    
+    # Generate embeddings
+    chunks = []
+    for file_path in req.files:
+        # Simple chunking by lines
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except:
+            content = file_path  # treat as content if not file
+        
+        lines = content.split('\n')
+        chunk = []
+        for line in lines:
+            chunk.append(line)
+            if len('\n'.join(chunk)) >= req.chunk_size:
+                chunks.append('\n'.join(chunk))
+                # overlap
+                overlap = chunk[-req.chunk_overlap//50:] if req.chunk_overlap else []
+                chunk = overlap
+        if chunk:
+            chunks.append('\n'.join(chunk))
+    
+    # Generate embeddings
+    embeddings = []
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for chunk in chunks:
+            payload = {"model": model, "input": chunk}
+            headers = {"Authorization": f"Bearer {decrypt_token(provider['api_key'])}", "Content-Type": "application/json"}
+            base_url = provider["base_url"] or "https://api.openai.com/v1"
+            resp = await client.post(f"{base_url}/embeddings", json=payload, headers={"Authorization": f"Bearer {decrypt_token(provider['api_key'])}", "Content-Type": "application/json"}, timeout=30.0)
+            if resp.status_code == 200:
+                embeddings.append({"chunk": chunk, "embedding": resp.json()["data"][0]["embedding"]})
+    
+    # Store in DB (simple approach - store in rag_chunks table)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS rag_chunks (
+        id TEXT PRIMARY KEY,
+        chunk TEXT NOT NULL,
+        embedding TEXT NOT NULL,  -- JSON array
+        metadata TEXT,  -- JSON
+        created_at TEXT DEFAULT (datetime('now'))
+    )""")
+    for emb in embeddings:
+        chunk_id = hashlib.md5(emb["chunk"].encode()).hexdigest()
+        conn.execute(
+            "INSERT OR REPLACE INTO rag_chunks (id, chunk, embedding, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+            (chunk_id, emb["chunk"], json.dumps(emb["embedding"]), json.dumps({"provider": req.provider_id, "model": model}), datetime.utcnow().isoformat())
+        )
+    conn.commit()
+    conn.close()
+    
+    return {"ok": True, "chunks": len(embeddings)}
+
+@app.post("/api/rag/search", tags=["RAG"])
+async def rag_search(req: RAGSearchRequest):
+    """Search RAG vector store for relevant chunks."""
+    import sqlite3
+    import json
+    import numpy as np
+    import httpx
+    from auth import decrypt_token
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    provider = conn.execute("SELECT * FROM llm_providers WHERE id = ? AND enabled = 1", (req.provider_id,)).fetchone()
+    conn.close()
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider not found or disabled")
+    
+    # Generate query embedding
+    model = req.model or "text-embedding-3-small"
+    api_key = decrypt_token(provider["api_key"])
+    base_url = provider["base_url"] or "https://api.openai.com/v1"
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{provider['base_url'] or 'https://api.openai.com/v1'}/embeddings",
+            json={"model": model, "input": req.query},
+            headers={"Authorization": f"Bearer {decrypt_token(provider['api_key'])}", "Content-Type": "application/json"},
+            timeout=30.0
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to generate query embedding")
+        query_embedding = np.array(resp.json()["data"][0]["embedding"])
+    
+    # Search in DB
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT id, chunk, embedding, metadata FROM rag_chunks").fetchall()
+    conn.close()
+    
+    if not rows:
+        return {"ok": True, "results": []}
+    
+    # Compute cosine similarity
+    results = []
+    for row in rows:
+        emb = np.array(json.loads(row["embedding"]))
+        sim = np.dot(query_embedding, emb) / (np.linalg.norm(query_embedding) * np.linalg.norm(emb))
+        if sim > 0.3:  # threshold
+            results.append({
+                "id": row["id"],
+                "chunk": row["chunk"][:500],
+                "similarity": float(sim),
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+            })
+    
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+    return {"ok": True, "results": results[:req.top_k]}
+
+
+# ---------------------------------------------------------------------------
 # System
 # ---------------------------------------------------------------------------
 
