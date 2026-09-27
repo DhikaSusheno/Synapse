@@ -709,7 +709,7 @@ def github_oauth_url(redirect_uri: str = "http://localhost:3000/auth/github/call
     import os
     client_id = os.getenv("GITHUB_CLIENT_ID")
     if not client_id:
-        raise HTTPException(status_code=500, detail="GITHUB_CLIENT_ID not configured")
+        raise HTTPException(status_code=503, detail="GITHUB_CLIENT_ID not configured")
     scope = "repo read:org read:user"
     url = f"https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&scope={scope}&state=synapse"
     return {"url": url, "state": "synapse"}
@@ -722,7 +722,7 @@ def github_callback(code: str, state: str = "", redirect_uri: str = "http://loca
     client_id = os.getenv("GITHUB_CLIENT_ID")
     client_secret = os.getenv("GITHUB_CLIENT_SECRET")
     if not client_id or not client_secret:
-        raise HTTPException(status_code=500, detail="GitHub OAuth not configured")
+        raise HTTPException(status_code=503, detail="GitHub OAuth not configured")
     
     # Exchange code for token
     resp = requests.post(
@@ -779,6 +779,12 @@ def github_pat(req: GitHubPATRequest):
     import sqlite3
     from datetime import datetime
     from auth import encrypt_token
+    
+    # Token ditaruh di header Authorization. Karakter non-ASCII atau newline
+    # membuat requests melempar UnicodeEncodeError / InvalidHeader yang tidak
+    # tertangkap -> 500. GitHub token selalu ASCII, jadi tolak lebih dulu
+    # dengan 400 yang jelas. Lihat _validate_header_token().
+    _validate_header_token(req.pat, "pat")
     
     # Validate token
     resp = requests.get(
@@ -918,6 +924,119 @@ def github_file_content(owner: str, repo: str, path: str, branch: str = "main"):
 # LLM Provider Registry
 # ---------------------------------------------------------------------------
 
+# Host endpoint cloud-metadata. Menunjuk base_url LLM ke sini tidak pernah
+# sah, dan ini target SSRF paling umum (kredensial instance bocor keluar).
+_BLOCKED_LLM_HOSTS = frozenset({
+    "169.254.169.254",      # AWS / Azure / GCP / OpenStack IMDS
+    "metadata.google.internal",
+    "metadata.goog",
+    "100.100.100.200",      # Alibaba Cloud
+    "fd00:ec2::254",        # AWS IMDSv6
+})
+
+# Panjang wajar untuk base_url. Cukup untuk URL provider, terlalu panjang
+# hampir pasti input jahat atau tidak sengaja.
+_MAX_BASE_URL_LEN = 2048
+
+
+def _validate_llm_base_url(base_url: str | None) -> str | None:
+    """
+    Validasi base_url milik LLM provider sebelum disimpan maupun sebelum dipakai.
+
+    Kenapa perlu: base_url diisi user, lalu dipakai server untuk melakukan
+    request HTTP keluar sambil menempelkan API key yang sudah didekripsi di
+    header Authorization. Tanpa validasi, siapa pun yang bisa memanggil
+    /api/llm/providers bisa membuat server menembak jaringan internal
+    (SSRF) sekaligus mengirim key itu ke host yang dia pilih, karena respons
+    internal juga dikembalikan ke pemanggil.
+
+    Yang DICEGAH di sini (tanpa merusak use case sah):
+      - skema selain http/https (file://, gopher://, ...)
+      - URL tanpa host
+      - userinfo di URL (http://evil@host) yang dipakai menipu pembaca
+      - karakter kontrol/spasi di URL, yang membuat header HTTP rusak
+      - host cloud-metadata
+
+    Yang SENGAJA TIDAK dicegah: alamat privat seperti localhost atau
+    127.0.0.1. Ollama (http://localhost:11434) dan server OpenAI-compatible
+    self-hosted (vLLM, LM Studio, LiteLLM) adalah use case normal untuk
+    aplikasi ini. Memblokirnya akan merusak fitur, bukan menutup risiko.
+    """
+    if base_url is None:
+        return None
+    if not isinstance(base_url, str):
+        raise HTTPException(status_code=400, detail="base_url must be a string")
+    # URL kosong ekuivalen "pakai default endpoint provider".
+    if not base_url.strip():
+        return None
+    if len(base_url) > _MAX_BASE_URL_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"base_url too long (max {_MAX_BASE_URL_LEN} characters)",
+        )
+    # Karakter kontrol membuat httpx/requests gagal saat menulis header, dan
+    # bisa dipakai menyisipkan header baru.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in base_url):
+        raise HTTPException(
+            status_code=400,
+            detail="base_url must not contain whitespace or control characters",
+        )
+
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base_url: {exc}")
+
+    if parts.scheme.lower() not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail="base_url must use http or https",
+        )
+    if not parts.hostname:
+        raise HTTPException(status_code=400, detail="base_url must include a host")
+    if parts.username or parts.password:
+        raise HTTPException(
+            status_code=400,
+            detail="base_url must not embed credentials",
+        )
+    if parts.hostname.lower() in _BLOCKED_LLM_HOSTS:
+        raise HTTPException(
+            status_code=400,
+            detail="base_url host is not allowed",
+        )
+    return base_url
+
+
+def _validate_header_token(value: str, field: str) -> str:
+    """
+    Pastikan nilai yang akan ditaruh di HTTP header hanya berisi karakter yang
+    benar-benar bisa di-encode sebagai header.
+
+    requests/httpx mengubah header ke Latin-1. Kalau input user memuat
+    karakter di luar itu, atau newline/CR, pemanggilannya melempar
+    UnicodeEncodeError / InvalidHeader yang tidak tertangkap -> HTTP 500
+    "Internal Server Error" untuk input yang sebenarnya cuma salah. GitHub
+    token selalu ASCII, jadi menolak non-ASCII tidak merusak apa pun.
+    """
+    for ch in value:
+        code = ord(ch)
+        if code < 0x21 or code > 0x7E:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{field} contains characters that cannot be sent in an "
+                    "HTTP header; use printable ASCII only"
+                ),
+            )
+    if len(value) > 4096:
+        raise HTTPException(
+            status_code=400, detail=f"{field} is too long (max 4096 characters)"
+        )
+    return value
+
+
 class LLMProviderCreate(BaseModel):
     name: str
     type: Literal["openai", "anthropic", "ibm", "nvidia", "deepseek", "ollama", "openai-compatible"]
@@ -979,6 +1098,9 @@ def create_llm_provider(req: LLMProviderCreate):
     from auth import encrypt_token
     from datetime import datetime
     
+    # Validasi SEBELUM menyentuh DB: URL yang tidak sah jangan sampai tersimpan.
+    _validate_llm_base_url(req.base_url)
+    
     conn = _db_conn(DB_PATH)
     provider_id = f"{req.type}:{req.name}"
     try:
@@ -1026,6 +1148,7 @@ def update_llm_provider(provider_id: str, req: LLMProviderUpdate):
         updates.append("type = ?")
         params.append(req.type)
     if req.base_url is not None:
+        _validate_llm_base_url(req.base_url)
         updates.append("base_url = ?")
         params.append(req.base_url)
     if req.api_key is not None:
@@ -1160,7 +1283,7 @@ async def llm_chat(req: ChatCompletionRequest):
     
     if provider["type"] == "ollama":
         # Ollama local
-        base_url = provider["base_url"] or "http://localhost:11434"
+        base_url = _validate_llm_base_url(provider["base_url"]) or "http://localhost:11434"
         async with httpx.AsyncClient(timeout=60.0) as client:
             payload = {
                 "model": model,
@@ -1180,7 +1303,7 @@ async def llm_chat(req: ChatCompletionRequest):
                 return resp.json()
     else:
         # OpenAI-compatible (OpenAI, Anthropic, etc.)
-        base_url = provider["base_url"] or ("https://api.openai.com/v1" if provider["type"] == "openai" else 
+        base_url = _validate_llm_base_url(provider["base_url"]) or ("https://api.openai.com/v1" if provider["type"] == "openai" else 
                       "https://api.anthropic.com/v1" if provider["type"] == "anthropic" else
                       "https://integrate.api.nvidia.com/v1" if provider["type"] == "nvidia" else
                       "https://api.deepseek.com/v1" if provider["type"] == "deepseek" else
@@ -1551,12 +1674,14 @@ async def rag_ingest(req: RAGIngestRequest):
 
     # Generate embeddings
     embeddings = []
+    # Decrypt sekali, bukan per chunk, dan base_url divalidasi sebelum dipakai.
+    provider_key = decrypt_token(provider["api_key"]) if provider["api_key"] else None
+    base_url = _validate_llm_base_url(provider["base_url"]) or "https://api.openai.com/v1"
+    headers = {"Authorization": f"Bearer {provider_key}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30.0) as client:
         for chunk in chunks:
             payload = {"model": model, "input": chunk}
-            headers = {"Authorization": f"Bearer {decrypt_token(provider['api_key'])}", "Content-Type": "application/json"}
-            base_url = provider["base_url"] or "https://api.openai.com/v1"
-            resp = await client.post(f"{base_url}/embeddings", json=payload, headers={"Authorization": f"Bearer {decrypt_token(provider['api_key'])}", "Content-Type": "application/json"}, timeout=30.0)
+            resp = await client.post(f"{base_url}/embeddings", json=payload, headers=headers, timeout=30.0)
             if resp.status_code == 200:
                 embeddings.append({"chunk": chunk, "embedding": resp.json()["data"][0]["embedding"]})
     
@@ -1585,13 +1710,13 @@ async def rag_search(req: RAGSearchRequest):
     # Generate query embedding
     model = req.model or "text-embedding-3-small"
     api_key = decrypt_token(provider["api_key"])
-    base_url = provider["base_url"] or "https://api.openai.com/v1"
+    base_url = _validate_llm_base_url(provider["base_url"]) or "https://api.openai.com/v1"
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            f"{provider['base_url'] or 'https://api.openai.com/v1'}/embeddings",
+            f"{base_url}/embeddings",
             json={"model": model, "input": req.query},
-            headers={"Authorization": f"Bearer {decrypt_token(provider['api_key'])}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             timeout=30.0
         )
         if resp.status_code != 200:
