@@ -103,6 +103,16 @@ halaman tujuan.
 graph. Itu disengaja: halaman ini harus bisa dibaca tanpa login dan tanpa
 backend hidup.
 
+**Scroll:** `<body>` memakai `h-screen overflow-hidden` supaya dashboard tidak
+bergeser saat banner muncul. Landing page karena itu **wajib** jadi scroll
+container-nya sendiri — root-nya `h-full overflow-y-auto`. Tanpa itu, konten
+5+ layar terpotong dan tidak ada scrollbar. Halaman dashboard tidak boleh
+meniru pola ini; mereka sudah punya `overflow-y-auto` sendiri di dalam.
+
+**Anchor:** header landing `sticky top-0` setinggi `h-14` (56px). Semua
+section yang punya `id` wajib pakai `scroll-mt-14`, kalau tidak header akan
+menutupi judul section begitu anchor diklik.
+
 ---
 
 ## Navigation Pages (9 halaman)

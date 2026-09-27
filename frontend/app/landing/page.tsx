@@ -193,7 +193,7 @@ export default function LandingPage() {
         </section>
 
         {/* ---------- Problem ---------- */}
-        <section id="problem" className="py-20 border-b border-slate-800/60">
+        <section id="problem" className="scroll-mt-14 py-20 border-b border-slate-800/60">
           <h2 className="text-2xl font-bold text-white">The problem</h2>
           <p className="mt-2 text-sm text-slate-400 max-w-2xl">
             Agent sudah bagus menulis kode. Yang belum ada adalah cara melihat dan menghentikan
@@ -210,7 +210,7 @@ export default function LandingPage() {
         </section>
 
         {/* ---------- How it works ---------- */}
-        <section id="how" className="py-20 border-b border-slate-800/60">
+        <section id="how" className="scroll-mt-14 py-20 border-b border-slate-800/60">
           <h2 className="text-2xl font-bold text-white">How it works</h2>
           <p className="mt-2 text-sm text-slate-400 max-w-2xl">
             Satu siklus tertutup: memahami konteks, mengusulkan perubahan, menahan yang
@@ -237,7 +237,7 @@ export default function LandingPage() {
         </section>
 
         {/* ---------- Agents ---------- */}
-        <section id="agents" className="py-20 border-b border-slate-800/60">
+        <section id="agents" className="scroll-mt-14 py-20 border-b border-slate-800/60">
           <h2 className="text-2xl font-bold text-white">The three agents</h2>
           <p className="mt-2 text-sm text-slate-400 max-w-2xl">
             Tanggung jawabnya dipisah supaya tidak tumpang tindih.
@@ -256,7 +256,7 @@ export default function LandingPage() {
         </section>
 
         {/* ---------- Demo script ---------- */}
-        <section id="demo" className="py-20 border-b border-slate-800/60">
+        <section id="demo" className="scroll-mt-14 py-20 border-b border-slate-800/60">
           <h2 className="text-2xl font-bold text-white">Demo path</h2>
           <p className="mt-2 text-sm text-slate-400 max-w-2xl">
             Tiga langkah yang cukup untuk melihat sistem bekerja dari ujung ke ujung.
